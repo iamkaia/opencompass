@@ -284,3 +284,125 @@ def extract_non_reasoning_content(
                                  re.DOTALL)
     non_reasoning_content = reasoning_regex.sub('', text).strip()
     return non_reasoning_content
+
+
+
+
+
+
+from opencompass.registry import TEXT_POSTPROCESSORS
+
+# ====== 1. utility: normalize ======
+def normalize(text: str):
+    text = text.strip().lower()
+    # 移除標點符號
+    text = re.sub(r"[^\w\s]", "", text)
+    return text
+
+
+# ====== 2. sentiment lexicon ======
+positive_words = ["positive", "good", "great", "excellent", "amazing", "wonderful", "nice"]
+negative_words = ["negative", "bad", "terrible", "awful", "horrible", "poor"]
+
+'''
+@TEXT_POSTPROCESSORS.register_module('sst2_postprocess')
+def sst2_postprocess(text: str):
+    
+    """
+    輸入一段模型的 predictions 文字
+    輸出:
+        "1" → positive
+        "0" → negative
+        None → ambiguous（算錯）
+    """
+    p = normalize(text)
+
+    # --- exact match (最準確) ---
+    if p == "positive":
+        return "1"
+    if p == "negative":
+        return "0"
+    
+    # --- negation-aware rules ---
+    if "not positive" in p or "not good" in p:
+        return "0"
+    if "not negative" in p or "not bad" in p:
+        return "1"
+
+    # --- lexicon fallback ---
+    pos = any(w in p for w in positive_words)
+    neg = any(w in p for w in negative_words)
+
+    if pos and not neg:
+        return "1"
+    if neg and not pos:
+        return "0"
+    # ambiguous
+    
+    return ''
+'''
+
+@TEXT_POSTPROCESSORS.register_module('sst2_postprocess')
+def sst2_postprocess(text: str):
+    """
+    Return:
+      "1" for positive
+      "0" for negative
+      ""  for ambiguous
+    """
+    if text is None:
+        return ""
+
+    t = str(text).strip().lower()
+
+    # 1) 先把 chat template / inst 包裝砍掉（保險）
+    #    取最後一段輸出（通常 label 在最後）
+    #    e.g. "... [/INST] positive" -> "positive"
+    if "[/inst]" in t:
+        t = t.split("[/inst]")[-1].strip()
+    if "</s>" in t:
+        t = t.split("</s>")[0].strip()
+
+    # 2) 最重要：抓最後出現的 positive/negative（避免前面 prompt 出現這些字）
+    m = re.findall(r"\b(positive|negative)\b", t)
+    if m:
+        last = m[-1]
+        return "1" if last == "positive" else "0"
+
+    # 3) 兼容選項格式：-positive. / -negative.
+    m2 = re.findall(r"-(positive|negative)\.", t)
+    if m2:
+        last = m2[-1]
+        return "1" if last == "positive" else "0"
+
+    # 4) 你原本的 negation/lexicon fallback（可留）
+    #    但建議放在最後，避免亂判
+    if "not positive" in t or "not good" in t:
+        return "0"
+    if "not negative" in t or "not bad" in t:
+        return "1"
+
+    return ""
+
+@TEXT_POSTPROCESSORS.register_module('sst2_postprocess_in_routed')
+def sst2_postprocess_in_routed(text: str):
+    
+    """
+    輸入一段模型的 predictions 文字
+    輸出:
+        "1" → positive
+        "0" → negative
+        None → ambiguous（算錯）
+    """
+    p = normalize(text)
+
+    return p
+
+@TEXT_POSTPROCESSORS.register_module('mcqa_choice_postprocess')
+def mcqa_choice_postprocess(text: str):
+    t = text.strip().upper()
+    # 找第一個 A/B/C/D
+    for ch in t:
+        if ch in ["A", "B", "C", "D"]:
+            return ch
+    return ""

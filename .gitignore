@@ -1,10 +1,19 @@
 .DS_Store
 output_*/
 outputs/
+fused_models/
+fused_models_*/
+old_logs/
 scripts/
+logs_*/
+0204_logs/
 icl_inference_output/
 .vscode/
 tmp/
+./Llama-2-7b-chat-hf/
+Llama-2-7b-chat-hf/
+saves_compare_v1/
+saves_latest/
 configs/eval_subjective_alignbench_test.py
 configs/openai_key.py
 configs/secrets.py
@@ -23,6 +32,7 @@ __pycache__/
 *.py[cod]
 *$py.class
 *.ipynb
+*.logs
 
 # C extensions
 *.so

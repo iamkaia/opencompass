@@ -9,30 +9,38 @@ iwslt2017_reader_cfg = dict(
     input_columns='en', output_column='fr', train_split='validation')
 
 iwslt2017_infer_cfg = dict(
-    ice_template=dict(
+    prompt_template=dict(
         type=PromptTemplate,
         template=dict(
-            begin='</E>',
             round=[
-                dict(role='HUMAN', prompt='Please translate the following English statements to French:\n{en}'),
-                dict(role='BOT', prompt='{fr}'),
+                dict(role='HUMAN', prompt='Please translate the following English statements to French:\n{en}'),  ###iwslt2017似乎沒有寫prompt要怎麼寫
             ]
-        ),
-        ice_token='</E>'),
-    retriever=dict(type=BM25Retriever, ice_num=1),
-    inferencer=dict(type=GenInferencer))
+        )
+    ),
+    retriever=dict(type="ZeroRetriever"),
+    inferencer=dict(
+        type="GenInferencer",
+        generation_kwargs=dict(
+            do_sample=False,
+            num_beams=2,
+            max_new_tokens=128,
+        )
+    )
+)
+
 
 iwslt2017_eval_cfg = dict(
     evaluator=dict(type=BleuEvaluator),
     pred_role='BOT',
     pred_postprocessor=dict(type=general_cn_postprocess),
-    dataset_postprocessor=dict(type=general_cn_postprocess))
+    dataset_postprocessor=dict(type=general_cn_postprocess)
+)
 
 iwslt2017_datasets = [
     dict(
         type=IWSLT2017Dataset,
         path='iwslt2017',
-        name='iwslt2017-en-fr',
+        name='iwslt2017-en-fr',  ###原本是en-de
         reader_cfg=iwslt2017_reader_cfg,
         infer_cfg=iwslt2017_infer_cfg,
         eval_cfg=iwslt2017_eval_cfg)

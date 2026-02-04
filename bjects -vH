@@ -1,0 +1,72 @@
+[33mcommit 13557403c4df49ef0dd8237afd136bd92fea647f[m[33m ([m[1;36mHEAD -> [m[1;32mmain[m[33m)[m
+Author: kaia <kaia.ai13@nycu.edu.tw>
+Date:   Wed Feb 4 08:47:24 2026 +0800
+
+    0204
+
+ .gitignore                                                                                     |    5 [32m+[m
+ debug_sst2_acc.py                                                                              |  358 [32m++++++++++++[m
+ eval_1124.py                                                                                   |   22 [31m-[m
+ fused_models/compare_fused_weights.py                                                          |  143 [32m+++++[m
+ fused_models/recall_fused_iwslt2017/README.md                                                  |  207 [32m+++++++[m
+ fused_models/recall_fused_iwslt2017/adapter_model.safetensors                                  |  Bin [31m0[m -> [32m80013120[m bytes
+ fused_models/recall_fused_iwslt2017/chat_template.jinja                                        |    1 [32m+[m
+ fused_models/recall_fused_iwslt2017/tokenizer.model                                            |  Bin [31m0[m -> [32m499723[m bytes
+ fused_models/recall_fused_medmcqa/README.md                                                    |  207 [32m+++++++[m
+ fused_models/recall_fused_medmcqa/adapter_model.safetensors                                    |  Bin [31m0[m -> [32m80013120[m bytes
+ fused_models/recall_fused_medmcqa/chat_template.jinja                                          |    1 [32m+[m
+ fused_models/recall_fused_medmcqa/tokenizer.model                                              |  Bin [31m0[m -> [32m499723[m bytes
+ fused_models/recall_fused_race/README.md                                                       |  207 [32m+++++++[m
+ fused_models/recall_fused_race/adapter_model.safetensors                                       |  Bin [31m0[m -> [32m80013120[m bytes
+ fused_models/recall_fused_race/chat_template.jinja                                             |    1 [32m+[m
+ fused_models/recall_fused_race/tokenizer.model                                                 |  Bin [31m0[m -> [32m499723[m bytes
+ fused_models/recall_fused_squad20/README.md                                                    |  207 [32m+++++++[m
+ fused_models/recall_fused_squad20/adapter_model.safetensors                                    |  Bin [31m0[m -> [32m80013120[m bytes
+ fused_models/recall_fused_squad20/chat_template.jinja                                          |    1 [32m+[m
+ fused_models/recall_fused_squad20/tokenizer.model                                              |  Bin [31m0[m -> [32m499723[m bytes
+ fused_models/recall_fused_sst2/README.md                                                       |  207 [32m+++++++[m
+ fused_models/recall_fused_sst2/adapter_model.safetensors                                       |  Bin [31m0[m -> [32m80013120[m bytes
+ fused_models/recall_fused_sst2/chat_template.jinja                                             |    1 [32m+[m
+ fused_models/recall_fused_sst2/tokenizer.model                                                 |  Bin [31m0[m -> [32m499723[m bytes
+ fused_models_1218_v2/compare_fused_weights.py                                                  |  142 [32m+++++[m
+ fused_models_1218_v2/recall_fused_iwslt2017/README.md                                          |  207 [32m+++++++[m
+ fused_models_1218_v2/recall_fused_iwslt2017/adapter_model.safetensors                          |  Bin [31m0[m -> [32m80013120[m bytes
+ fused_models_1218_v2/recall_fused_iwslt2017/chat_template.jinja                                |    1 [32m+[m
+ fused_models_1218_v2/recall_fused_iwslt2017/tokenizer.model                                    |  Bin [31m0[m -> [32m499723[m bytes
+ fused_models_1218_v2/recall_fused_medmcqa/README.md                                            |  207 [32m+++++++[m
+ fused_models_1218_v2/recall_fused_medmcqa/adapter_model.safetensors                            |  Bin [31m0[m -> [32m80013120[m bytes
+ fused_models_1218_v2/recall_fused_medmcqa/chat_template.jinja                                  |    1 [32m+[m
+ fused_models_1218_v2/recall_fused_medmcqa/tokenizer.model                                      |  Bin [31m0[m -> [32m499723[m bytes
+ fused_models_1218_v2/recall_fused_race/README.md                                               |  207 [32m+++++++[m
+ fused_models_1218_v2/recall_fused_race/adapter_model.safetensors                               |  Bin [31m0[m -> [32m80013120[m bytes
+ fused_models_1218_v2/recall_fused_race/chat_template.jinja                                     |    1 [32m+[m
+ fused_models_1218_v2/recall_fused_race/tokenizer.model                                         |  Bin [31m0[m -> [32m499723[m bytes
+ fused_models_1218_v2/recall_fused_squad20/README.md                                            |  207 [32m+++++++[m
+ fused_models_1218_v2/recall_fused_squad20/adapter_model.safetensors                            |  Bin [31m0[m -> [32m80013120[m bytes
+ fused_models_1218_v2/recall_fused_squad20/chat_template.jinja                                  |    1 [32m+[m
+ fused_models_1218_v2/recall_fused_squad20/tokenizer.model                                      |  Bin [31m0[m -> [32m499723[m bytes
+ fused_models_1218_v2/recall_fused_sst2/README.md                                               |  207 [32m+++++++[m
+ fused_models_1218_v2/recall_fused_sst2/adapter_model.safetensors                               |  Bin [31m0[m -> [32m80013120[m bytes
+ fused_models_1218_v2/recall_fused_sst2/chat_template.jinja                                     |    1 [32m+[m
+ fused_models_1218_v2/recall_fused_sst2/tokenizer.model                                         |  Bin [31m0[m -> [32m499723[m bytes
+ layer_router_full_ckpt/chat_template.jinja                                                     |    0
+ layer_router_full_ckpt/checkpoint-25000/model.safetensors                                      |  Bin [31m0[m -> [32m5591642112[m bytes
+ layer_router_full_ckpt/checkpoint-25000/training_args.bin                                      |    0
+ layer_router_full_ckpt/model.safetensors                                                       |    0
+ layer_router_full_ckpt/tokenizer.model                                                         |    0
+ layer_router_full_ckpt/training_args.bin                                                       |    0
+ myenv.yml                                                                                      |  160 [32m++++++[m
+ opencompass/configs/datasets/glue/routed_sst2.py                                               |   59 [32m++[m
+ opencompass/configs/datasets/glue/sst2_gen.py                                                  |   70 [32m++[m[31m-[m
+ opencompass/configs/datasets/iwslt2017/iwslt2017_gen_d0ebd1.py                                 |   10 [32m+[m[31m-[m
+ opencompass/configs/datasets/iwslt2017/iwslt2017_gen_sft_prompt.py                             |   47 [32m++[m
+ opencompass/configs/datasets/iwslt2017/routed_iwslt2017.py                                     |   51 [32m++[m
+ opencompass/configs/datasets/medmcqa/medmcqa_gen_60c8f5.py                                     |    3 [32m+[m
+ opencompass/configs/datasets/medmcqa/medmcqa_gen_sft_prompt.py                                 |   64 [32m+++[m
+ opencompass/configs/datasets/medmcqa/routed_medmcqa.py                                         |   56 [32m++[m
+ opencompass/configs/datasets/race/race_gen_sft_prompt.py                                       |   63 [32m++[m
+ opencompass/configs/datasets/race/routed_race.py                                               |   58 [32m++[m
+ opencompass/configs/datasets/squad20/routed_squad20.py                                         |   43 [32m++[m
+ opencompass/configs/datasets/squad20/squad20_gen_1710bc.py                                     |    2 [32m+[m[31m-[m
+ opencompass/configs/datasets/squad20/squad20_gen_sft_prompt.py                                 |   42 [32m++[m
+ opencompass/configs/models/hf_llama/hf_fused_iwslt.py

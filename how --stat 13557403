@@ -1,0 +1,10 @@
+[33mcommit 45f30dc959e146706729689807a1b129ef14e7aa[m
+Author: kaia <kaia.ai13@nycu.edu.tw>
+Date:   Mon Nov 24 23:53:32 2025 +0800
+
+    early time
+
+ eval_1124.py                                             | 22 [32m++++++++++++++++++++++[m
+ opencompass/configs/datasets/glue/sst2_gen.py            | 47 [32m+++++++++++++++++++++++++++++++++++++++++++++++[m
+ opencompass/configs/models/hf_llama/hf_llama2_7b_chat.py |  2 [32m+[m[31m-[m
+ 3 files changed, 70 insertions(+), 1 deletion(-)
