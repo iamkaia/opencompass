@@ -158,3 +158,8 @@ fused_models/
 *.jsonl
 .cache/
 wandb/
+
+# training checkpoints / weights
+layer_router_full_ckpt/
+task_classifier_ckpt/
+*.safetensors
