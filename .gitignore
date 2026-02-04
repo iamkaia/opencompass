@@ -143,3 +143,18 @@ turbomind/
 
 # aliyun
 core.*
+
+# local models / checkpoints / artifacts
+Llama-2-7b-chat-hf/
+saves/
+saves_latest/
+fused_models/
+*.pt
+*.bin
+*.safetensors
+*.ckpt
+*.pth
+*.log
+*.jsonl
+.cache/
+wandb/
