@@ -1,5 +1,5 @@
 .DS_Store
-output_*/
+outputs_*/
 outputs/
 fused_models/
 fused_models_*/
