@@ -18,7 +18,7 @@ def _parse(item, prompt_mode):
         [f'{chr(65 + i)}. {opt}' for i, opt in enumerate(options_list)])
 
     # 将选项附加到问题末尾
-    item['question'] = f"{item['question']}\n{options_str}"
+    # item['question'] = f"{item['question']}\n{options_str}" ##sft_prompt這行要刪掉
 
     item['label'] = chr(65 + item['cop'])
     item['subject_name'] = item['subject_name'].replace('_', ' ')
@@ -27,6 +27,17 @@ def _parse(item, prompt_mode):
     item['end'] = chr(65 + len(options_list) - 1)  # 使用实际选项数量
     return item
 
+# ✅ 這就是你要在 load() 裡用到的 preprocess（一定要放在同一檔案上方）
+def preprocess(example):
+    q = example['question']
+
+    # 把題幹中原本的 A./B./C./D. 選項行刪掉
+    q = re.sub(r'^[ \t]*[A-D][\.\:][^\n]*\n?', '', q, flags=re.MULTILINE)
+    # 把前面的 "Question:" label 拿掉（有些題目有）
+    q = re.sub(r'^Question:\s*', '', q, flags=re.IGNORECASE)
+
+    example['question'] = q.strip()
+    return example
 
 @LOAD_DATASET.register_module()
 class MedmcqaDataset(BaseDataset):
@@ -39,12 +50,17 @@ class MedmcqaDataset(BaseDataset):
 
         if prompt_mode == 'zero-shot':
             dataset = dataset.map(lambda item: _parse(item, prompt_mode))
+            dataset = dataset.map(preprocess)
         elif prompt_mode == 'few-shot':
             pass  # TODO: Implement few-shot prompt
+
+        print(dataset[0]['question'])
 
         return dataset
 
 
+'''
+##default
 class MedmcqaEvaluator(BaseEvaluator):
 
     def score(self, predictions, references, test_set):
@@ -73,7 +89,40 @@ class MedmcqaEvaluator(BaseEvaluator):
             details.append(detail)
         result = {'accuracy': 100 * correct / count, 'details': details}
         return result
+'''
+###sft_prompt
+class MedmcqaEvaluator(BaseEvaluator):
 
+    def score(self, predictions, references, test_set):
+        method = test_set['prompt_mode'][0]
+
+        if len(predictions) != len(references):
+            return {'error': 'preds and refrs have different length'}
+        correct = 0
+        count = 0
+        details = []
+        for idx, (i, j) in enumerate(zip(predictions, references)):
+            i = answer_cleansing(method, i, test_set['options'][idx],
+                                 test_set['label'][idx])
+
+            # index → letter
+            gold = chr(ord('A') + j)
+
+            detail = {
+                'pred': i,
+                'answer': gold,
+                'correct': False,
+                'subject_name': test_set['subject_name'][idx],
+                'topic_name': test_set['topic_name'][idx],
+                'choice_type': test_set['choice_type'][idx]
+            }
+            count += 1
+            if i == gold:
+                correct += 1
+                detail['correct'] = True
+            details.append(detail)
+        result = {'accuracy': 100 * correct / count, 'details': details}
+        return result
 
 @TEXT_POSTPROCESSORS.register_module()
 def answer_cleansing(

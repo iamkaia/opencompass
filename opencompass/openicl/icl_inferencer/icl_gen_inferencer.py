@@ -138,6 +138,13 @@ class GenInferencer(BaseInferencer):
         num_sample = 0
         for datum in tqdm(dataloader, disable=not self.is_main_process):
             if ds_reader.output_column:
+
+                # --- FIX: make datum always be a list of (entry, gold) pairs ---
+                # Sometimes datum is (entry, gold) when batch_size=1
+                if isinstance(datum, tuple) and len(datum) == 2:
+                    datum = [datum]
+
+
                 entry, golds = list(zip(*datum))
             else:
                 entry = datum

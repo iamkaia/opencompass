@@ -19,6 +19,7 @@ reader_cfg = dict(
     output_column='label',
 )
 
+
 # Inference configuration
 infer_cfg = dict(
     prompt_template=dict(
@@ -38,6 +39,8 @@ infer_cfg = dict(
     retriever=dict(type=ZeroRetriever),
     inferencer=dict(type=GenInferencer),
 )
+
+
 
 # Evaluation configuration
 eval_cfg = dict(

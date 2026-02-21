@@ -1,47 +1,55 @@
-# configs/datasets/glue/sst2_gen.py
+from opencompass.openicl.icl_prompt_template import PromptTemplate
+from opencompass.openicl.icl_retriever import ZeroRetriever
+from opencompass.openicl.icl_inferencer import GenInferencer
+from opencompass.openicl.icl_evaluator import AccEvaluator
+from opencompass.datasets.sst2_ab import SST2_convert_np
+from opencompass.utils.text_postprocessors import  sst2_postprocess
 
-from opencompass.registry import LOAD_DATASET
-from datasets import load_dataset
 
-# ---- Dataset Loader ----
-@LOAD_DATASET.register_module()
-def load_sst2(split='validation'):
-    dataset = load_dataset('glue', 'sst2', split=split)
-    return dataset
-
-# ---- Reader Config ----
-sst2_reader_cfg = dict(
+reader_cfg = dict(
     input_columns=['sentence'],
-    output_column='label'
+    output_column='label',      # HF SST-2: "0" / "1"
+    test_split='validation'
 )
 
-# ---- Prompt / Infer Config ----
-sst2_infer_cfg = dict(
-    type='GenInferencer',
+infer_cfg = dict(
     prompt_template=dict(
-        type='PromptTemplate',
-        template="""Classify the sentiment of the sentence as positive or negative.
-
-Sentence: {sentence}
-Answer:"""
+        type=PromptTemplate,
+        template=dict(
+            round=[
+                dict(
+                    role='HUMAN',
+                    prompt="""Statement: {sentence} What’s sentiment should the above sentence be?\nOPTIONS:-negative.-positive. Answer:"""
+                ),
+                dict(
+                    role='BOT',
+                    prompt=''   # ⭐ 關鍵：留空，讓模型填 ###不知道其他幾個原版有沒有留?
+                )
+            ]
+        )
     ),
-    max_out_len=32,
+    retriever=dict(type=ZeroRetriever),
+    inferencer=dict(type=GenInferencer), ####不能加max_out_len, model會只輸出奇怪的字
 )
 
-# ---- Evaluation ----
-sst2_eval_cfg = dict(
-    evaluator=dict(type='AccEvaluator')
+eval_cfg = dict(
+    evaluator=dict(
+        type=AccEvaluator,
+    ),
+    pred_role='BOT',
+    pred_postprocessor=dict(
+        type=sst2_postprocess, #####抓預測字的東西
+    ),
 )
 
-# ---- Dataset name registry ----
 sst2_datasets = [
     dict(
-        type='sst2',
         abbr='sst2',
+        type=SST2_convert_np, ####使0/1轉成negetive/positive
         path='glue',
-        subset='sst2',
-        reader_cfg=sst2_reader_cfg,
-        infer_cfg=sst2_infer_cfg,
-        eval_cfg=sst2_eval_cfg,
+        name='sst2',
+        reader_cfg=reader_cfg,
+        infer_cfg=infer_cfg,
+        eval_cfg=eval_cfg,
     )
 ]

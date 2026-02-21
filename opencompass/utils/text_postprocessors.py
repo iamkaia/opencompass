@@ -284,3 +284,91 @@ def extract_non_reasoning_content(
                                  re.DOTALL)
     non_reasoning_content = reasoning_regex.sub('', text).strip()
     return non_reasoning_content
+
+
+'''
+from opencompass.registry import TEXT_POSTPROCESSORS
+
+# ====== 1. utility: normalize ======
+def normalize(text: str):
+    text = text.strip().lower()
+    # 移除標點符號
+    text = re.sub(r"[^\w\s]", "", text)
+    return text
+
+
+# ====== 2. sentiment lexicon ======
+positive_words = ["positive", "good", "great", "excellent", "amazing", "wonderful", "nice"]
+negative_words = ["negative", "bad", "terrible", "awful", "horrible", "poor"]
+
+
+@TEXT_POSTPROCESSORS.register_module('sst2_postprocess')
+def sst2_postprocess(text: str):
+    
+    """
+    輸入一段模型的 predictions 文字
+    輸出:
+        "1" → positive
+        "0" → negative
+        None → ambiguous（算錯）
+    """
+    p = normalize(text)
+
+    # --- exact match (最準確) ---
+    if p == "positive":
+        return "1"
+    if p == "negative":
+        return "0"
+
+    # --- negation-aware rules ---
+    if "not positive" in p or "not good" in p:
+        return "0"
+    if "not negative" in p or "not bad" in p:
+        return "1"
+
+    # --- lexicon fallback ---
+    pos = any(w in p for w in positive_words)
+    neg = any(w in p for w in negative_words)
+
+    if pos and not neg:
+        return "1"
+    if neg and not pos:
+        return "0"
+
+    # ambiguous
+    return ''
+'''
+
+import re
+from opencompass.registry import TEXT_POSTPROCESSORS
+
+def normalize(text: str):
+    text = text.strip().lower()
+    text = re.sub(r"[^\w\s]", " ", text)
+    return text
+
+
+@TEXT_POSTPROCESSORS.register_module('sst2_postprocess')
+def sst2_postprocess(text: str):
+
+    p = normalize(text)
+
+    # ===== 1️⃣ 先抓最乾淨的 single-word 回答 =====
+    if re.fullmatch(r"\s*positive\s*", p):
+        return "1"
+    if re.fullmatch(r"\s*negative\s*", p):
+        return "0"
+
+    # ===== 2️⃣ 抓明確句型（LLM 最常見）=====
+    if re.search(r"\b(sentiment|tone|feeling)\b.*\bpositive\b", p):
+        return "1"
+    if re.search(r"\b(sentiment|tone|feeling)\b.*\bnegative\b", p):
+        return "0"
+
+    # ===== 3️⃣ 最後抓最後一個出現的 label（經驗上最準）=====
+    labels = re.findall(r"\b(positive|negative)\b", p)
+    if labels:
+        return "1" if labels[-1] == "positive" else "0"
+
+    return ''
+
