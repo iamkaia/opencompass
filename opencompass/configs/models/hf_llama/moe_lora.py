@@ -1,4 +1,4 @@
-'''
+
 from opencompass.models.router_moe_llama import RouterMoELlama
 
 models = [
@@ -14,14 +14,16 @@ models = [
             squad2="./saves/llama2-7b-chat-hf/lora/sft_squad20",
             sst2="./saves/llama2-7b-chat-hf/lora/sft_sst2",
         ),
-        batch_size=8,
-        max_out_len=2048,
+        dtype='float16',
+        r=8,
+        alpha=32,  # 會被 adapter_config 覆蓋，但保留一致性
+        batch_size=128,###原本是8
+        max_out_len=128,
         run_cfg=dict(num_gpus=1),
     )
 ]
+
 '''
-
-
 from opencompass.models.router_moe_llama_layer_prefill import RouterMoELlama
 models = [
     dict(
@@ -51,7 +53,7 @@ models = [
         run_cfg=dict(num_gpus=1),
     )
 ]
-
+'''
 
 '''
 from opencompass.models.router_moe_llama_layer import RouterMoELlama

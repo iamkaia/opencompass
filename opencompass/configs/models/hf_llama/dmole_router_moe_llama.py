@@ -27,7 +27,8 @@ models = [
         dtype='float16',
         r=8,
         alpha=32, ###16跟32在哪裡啊？原本是32
-        max_seq_len=128,
+        batch_size=128,
+        max_out_len=128,
     )
 ]
 
