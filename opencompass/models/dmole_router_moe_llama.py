@@ -15,6 +15,32 @@ from collections import Counter
 from safetensors.torch import load_file as safe_load
 from transformers import AutoModelForCausalLM
 from opencompass.models import HuggingFacewithChatTemplate
+import os, json, time
+from collections import Counter
+
+def _ensure_dir(p: str):
+    os.makedirs(p, exist_ok=True)
+
+def _append_jsonl(path: str, obj: dict):
+    _ensure_dir(os.path.dirname(path))
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(obj, ensure_ascii=False) + "\n")
+
+def _norm_task(t):
+    if t is None:
+        return None
+    t = str(t).strip()
+    if t == "squad2":
+        t = "squad2.0"
+    return t
+
+def _get_routing_log_path(output_json_filepath, abbr):
+    if output_json_filepath:
+        pred_dir = os.path.dirname(output_json_filepath)
+        return os.path.join(pred_dir, "routing_log.jsonl")
+    safe = abbr.replace("/", "_")
+    return f"routing_logs/routing_{safe}.jsonl"
+
 
 
 # =========================
@@ -318,46 +344,105 @@ class DMoLERouterMoELlama(HuggingFacewithChatTemplate):
         for li, layer in enumerate(self.model.model.layers):
             set_layer_expert(layer, plan[li])
 
+    
     # --------- generate (OpenCompass compatible) ---------
     @torch.no_grad()
     def generate(self, prompts, **gen_kwargs):
+
+        # -------- metadata --------
+        gt_task = gen_kwargs.pop("gt_task", None)
+        output_json_filepath = gen_kwargs.pop("output_json_filepath", None)
+        
+        # ❗ 只 pop 一次（不能放在 for 裡）
+        max_out_len = gen_kwargs.pop("max_out_len", None)
+        if max_out_len is not None:
+            gen_kwargs["max_new_tokens"] = int(max_out_len)
+        
         if not isinstance(prompts, list):
             prompts = [prompts]
-
+        
         outs = []
+        
         for entry in prompts:
+        
             prompt_str = self._entry_to_prompt_str(entry)
-
+        
             enc = self.tokenizer(
                 prompt_str,
                 return_tensors="pt",
                 truncation=True,
                 max_length=self.max_seq_len,
             ).to(self.model.device)
-
-            # OpenCompass passes max_out_len, but HF generate() doesn't accept it
-            max_out_len = gen_kwargs.pop("max_out_len", None)
-            if max_out_len is not None:
-                gen_kwargs["max_new_tokens"] = int(max_out_len)
-
+            
             gen_kwargs.setdefault("pad_token_id", self.tokenizer.pad_token_id)
             gen_kwargs.setdefault("eos_token_id", self.tokenizer.eos_token_id)
 
-            # Prefill-only routing plan
+            # -------- Prefill-only routing plan --------
             plan = self._build_plan_prefill(enc["input_ids"])
             self._apply_plan(plan)
-
+        
+            # ================= ROUTING LOG =================
+        
+            gt = _norm_task(gt_task)
+            gt_eid = LABEL2ID.get(gt, None) if gt is not None else None
+        
+            plan_int = [int(x) for x in plan]
+            valid = [x for x in plan_int if x >= 0]
+        
+            # LoRA coverage（非 -1 的比例）
+            coverage = None
+            if plan_int:
+                coverage = sum(1 for x in plan_int if x != -1) / len(plan_int)
+        
+            # Majority vote（安全寫法）
+            if valid:
+                maj_eid = Counter(valid).most_common(1)[0][0]
+                maj_task = ID2LABEL.get(maj_eid, None)
+            else:
+                maj_eid = None
+                maj_task = None
+        
+            ok_major = (gt == maj_task) if (gt is not None and maj_task is not None) else None
+        
+            match_rate = None
+            if gt_eid is not None and valid:
+                match_rate = sum(1 for x in valid if x == gt_eid) / len(valid)
+        
+            rec = {
+                "ts": time.time(),
+                "kind": "dmole",
+                "gt_task": gt,
+                "major_task": maj_task,
+                "major_eid": maj_eid,
+                "route_ok_major": ok_major,
+                "match_rate": match_rate,
+                "coverage": coverage,
+                "plan": plan_int,
+            }
+        
+            log_path = _get_routing_log_path(output_json_filepath, self.abbr)
+            _append_jsonl(log_path, rec)
+        
+            # ==============================================
+        
+            # (可選) 原本的 debug plan log
             if self.log_plans:
                 try:
-                    rec = {"plan": plan, "plan_tasks": [ID2LABEL[i] if i >= 0 else "base" for i in plan]}
+                    rec2 = {
+                        "plan": plan_int,
+                        "plan_tasks": [
+                            ID2LABEL[i] if i >= 0 else "base"
+                            for i in plan_int
+                        ],
+                    }
                     with open(self.plan_log_path, "a", encoding="utf-8") as f:
-                        f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+                        f.write(json.dumps(rec2, ensure_ascii=False) + "\n")
                 except Exception:
                     pass
 
+            # -------- 真正生成 --------
             out = self.model.generate(**enc, **gen_kwargs)
             text = self.tokenizer.decode(out[0], skip_special_tokens=True)
             outs.append(text)
-
+        
         return outs
-

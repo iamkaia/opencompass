@@ -249,10 +249,37 @@ class RouterMoELlama(HuggingFacewithChatTemplate):
 
     @torch.no_grad()
     def generate(self, prompts, **gen_kwargs):
+        gt_task = gen_kwargs.pop("gt_task", None)   # ✅ 取出 GT task
+        output_json_filepath = gen_kwargs.pop("output_json_filepath", None)
+        #print("gt_task from kwargs:", gt_task)
         if not isinstance(prompts, list):
             prompts = [prompts]
-
         max_out_len = gen_kwargs.pop("max_out_len", None)
+
+        import os, json, time
+        from collections import Counter
+        
+        def _ensure_dir(p: str):
+            os.makedirs(p, exist_ok=True)
+        
+        def _append_jsonl(path: str, obj: dict):
+            _ensure_dir(os.path.dirname(path))
+            with open(path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(obj, ensure_ascii=False) + "\n")
+        
+        def _norm_task(t):
+            if t is None: return None
+            t = str(t).strip()
+            # Normalize name diffs (edit if you have other variants):
+            if t == "squad2": t = "squad2.0"
+            return t
+        
+        def _get_routing_log_path(output_json_filepath: str | None, abbr: str):
+            if output_json_filepath:
+                pred_dir = os.path.dirname(output_json_filepath)
+                return os.path.join(pred_dir, "routing_log.jsonl")
+            safe = abbr.replace("/", "_")
+            return f"routing_logs/routing_{safe}.jsonl"
 
         outputs = []
         for item in prompts:
@@ -264,6 +291,25 @@ class RouterMoELlama(HuggingFacewithChatTemplate):
             eid = int(self.router(**rt).logits.argmax(dim=-1).item())
 
             self.route_counter[eid] += 1
+            
+            #-----------------------------------------
+            # --- routing log record ---
+            gt = _norm_task(gt_task)
+            routed = ID2LABEL.get(eid, str(eid))
+            ok = (gt == routed) if gt is not None else None
+            
+            rec = {
+                "ts": time.time(),
+                "kind": "external",
+                "gt_task": gt,
+                "routed_task": routed,
+                "eid": eid,
+                "route_ok": ok,
+            }
+            log_path = _get_routing_log_path(output_json_filepath, self.abbr)
+            _append_jsonl(log_path, rec)
+
+            #-----------------------------------------
 
             # log per-sample routing (append)
             try:
