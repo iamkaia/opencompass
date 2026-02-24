@@ -34,12 +34,30 @@ def _norm_task(t):
         t = "squad2.0"
     return t
 
-def _get_routing_log_path(output_json_filepath, abbr):
+def _get_routing_log_path(output_json_filepath, abbr, gt_task=None):
+    """
+    output_json_filepath: outputs/.../predictions/<abbr>/<dataset>.json
+    gt_task: e.g. 'sst2' (recommended)
+    """
     if output_json_filepath:
         pred_dir = os.path.dirname(output_json_filepath)
-        return os.path.join(pred_dir, "routing_log.jsonl")
+
+        # dataset stem 優先用 gt_task，其次用 output_json_filepath 的檔名
+        if gt_task:
+            ds = str(gt_task).strip()
+            if ds.endswith(".json"):
+                ds = ds[:-5]
+        else:
+            ds = os.path.splitext(os.path.basename(output_json_filepath))[0]  # sst2
+
+        # 避免奇怪字元
+        ds = ds.replace("/", "_")
+        return os.path.join(pred_dir, f"routing_log__{ds}.jsonl")
+
     safe = abbr.replace("/", "_")
-    return f"routing_logs/routing_{safe}.jsonl"
+    ds = str(gt_task).strip() if gt_task else "unknown"
+    ds = ds.replace("/", "_")
+    return f"routing_logs/routing_{safe}__{ds}.jsonl"
 
 
 
@@ -420,7 +438,8 @@ class DMoLERouterMoELlama(HuggingFacewithChatTemplate):
                 "plan": plan_int,
             }
         
-            log_path = _get_routing_log_path(output_json_filepath, self.abbr)
+            #log_path = _get_routing_log_path(output_json_filepath, self.abbr)
+            log_path = _get_routing_log_path(output_json_filepath, self.abbr, gt_task=gt)
             _append_jsonl(log_path, rec)
         
             # ==============================================
