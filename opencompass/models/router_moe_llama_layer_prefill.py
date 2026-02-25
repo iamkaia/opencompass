@@ -622,9 +622,15 @@ class RouterMoELlama(HuggingFacewithChatTemplate):
         gen_kwargs.pop("top_p", None)
         gen_kwargs.pop("top_k", None)
 
-        # ---------- generate ----------
         out = self.model.generate(**enc, **gen_kwargs)
-        texts = self.tokenizer.batch_decode(out, skip_special_tokens=True)
+
+        # ✅ 只 decode 每筆「新生成」的 tokens（去掉 prompt）
+        lens = enc["attention_mask"].sum(dim=1).tolist()  # 每筆真實 prompt 長度（排除 padding）
+
+        texts = []
+        for i in range(out.size(0)):
+            gen_only = out[i, int(lens[i]):]
+            texts.append(self.tokenizer.decode(gen_only, skip_special_tokens=True).strip())
 
         # =====================================================
         #                    ROUTING LOG
