@@ -363,7 +363,10 @@ class RouterMoELlama(HuggingFacewithChatTemplate):
             gen_args.setdefault("eos_token_id", self.tokenizer.eos_token_id)
 
             out = self.model.generate(**inp, **gen_args)
-            outputs.append(self.tokenizer.decode(out[0], skip_special_tokens=True))
+            # 只取新生成的 tokens（不要把 prompt decode 回來）
+            prompt_len = inp["input_ids"].shape[1]
+            gen_tokens = out[0, prompt_len:]
+            outputs.append(self.tokenizer.decode(gen_tokens, skip_special_tokens=True).strip())
 
         # write counts (overwrite OK; filename is unique)
         try:
