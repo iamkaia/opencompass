@@ -477,6 +477,10 @@ class HuggingFacewithChatTemplate(BaseModel):
         self.logger.info('Generation Args of Huggingface: ')
         self.logger.info(generation_kwargs)
 
+        # --- strip non-HF kwargs ---
+        generation_kwargs.pop("gt_task", None)
+        generation_kwargs.pop("output_json_filepath", None)
+        
         # step-2: conduct model forward to generate output
         outputs = self.model.generate(**tokens, **generation_kwargs)
         outputs = outputs[:, tokens['input_ids'].shape[1]:]
