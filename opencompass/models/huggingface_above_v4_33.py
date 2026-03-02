@@ -420,73 +420,110 @@ class HuggingFacewithChatTemplate(BaseModel):
         potential_stop_words = [s for s in potential_stop_words if s]
         return potential_stop_words
 
-    def generate(self,
-                 inputs: List[str],
-                 max_out_len: int,
-                 min_out_len: Optional[int] = None,
-                 stopping_criteria: List[str] = [],
-                 **kwargs) -> List[str]:
+    
+    def generate(
+        self,
+        inputs: List[str],
+        max_out_len: int,
+        min_out_len: Optional[int] = None,
+        stopping_criteria: List[str] = [],
+        **kwargs
+    ) -> List[str]:
+
+        # 🔥 先把 OpenCompass 專用欄位清掉（最保險）
+        kwargs.pop("gt_task", None)
+        kwargs.pop("output_json_filepath", None)
+
         messages = _convert_chat_messages(inputs)
         batch_size = len(messages)
 
         tokenize_kwargs = dict(
-            return_tensors='pt',
+            return_tensors="pt",
             padding=True,
             truncation=True,
             add_special_tokens=True,
-            max_length=self.max_seq_len
+            max_length=self.max_seq_len,
         )
+
         if self.fastchat_template:
-            messages = _format_with_fast_chat_template(messages, self.fastchat_template)
+            messages = _format_with_fast_chat_template(
+                messages, self.fastchat_template
+            )
             tokens = self.tokenizer.batch_encode_plus(messages, **tokenize_kwargs)
         else:
-            messages = [self.tokenizer.apply_chat_template(m, add_generation_prompt=True, tokenize=False) for m in messages]
-            tokenize_kwargs['add_special_tokens'] = False
+            messages = [
+                self.tokenizer.apply_chat_template(
+                    m, add_generation_prompt=True, tokenize=False
+                )
+                for m in messages
+            ]
+            tokenize_kwargs["add_special_tokens"] = False
             tokens = self.tokenizer.batch_encode_plus(messages, **tokenize_kwargs)
 
         tokens = {k: v.to(self.model.device) for k, v in tokens.items()}
 
-        if self.mode == 'mid':
-            # Reserve space for the tokens to be generated in the future.
+        # truncate middle if needed
+        if self.mode == "mid":
             max_prompt_len = self.max_seq_len - max_out_len
-
-            # Retain the first 0.5 * max_prompt_len tokens and the last 0.5 * max_prompt_len tokens, discarding the middle ones,
-            # because the prompts' questions are usually at the beginning or the end.
-            # To avoid the warning:
-            # This is a friendly reminder - the current text generation call will exceed the model's predefined maximum length.
-            # Depending on the model, you may observe exceptions, performance degradation, or nothing at all.
             half_max_prompt_len = max_prompt_len // 2
-            if half_max_prompt_len > 0 and tokens['input_ids'].shape[1] > max_prompt_len:
+
+            if half_max_prompt_len > 0 and tokens["input_ids"].shape[1] > max_prompt_len:
                 for key in tokens.keys():
                     if tokens[key].shape[1] > max_prompt_len:
                         field_values = tokens[key]
                         tokens[key] = torch.cat(
-                            (field_values[:, :half_max_prompt_len], field_values[:, -half_max_prompt_len:]), dim=1
+                            (
+                                field_values[:, :half_max_prompt_len],
+                                field_values[:, -half_max_prompt_len:],
+                            ),
+                            dim=1,
                         )
 
+        # ---------------------------
+        # build generation kwargs
+        # ---------------------------
         generation_kwargs = self.generation_kwargs.copy()
         generation_kwargs.update(kwargs)
+
         stopping_criteria = list(set(stopping_criteria + self.stop_words))
         if stopping_criteria:
-            generation_kwargs['stopping_criteria'] = _get_stopping_criteria(stopping_criteria, self.tokenizer, batch_size)
-        if max_out_len is not None:
-            generation_kwargs['max_new_tokens'] = max_out_len
-        if min_out_len is not None:
-            generation_kwargs['min_new_tokens'] = min_out_len
-        generation_kwargs['pad_token_id'] = self.tokenizer.pad_token_id
-        self.logger.info('Generation Args of Huggingface: ')
-        self.logger.info(generation_kwargs)
+            generation_kwargs["stopping_criteria"] = _get_stopping_criteria(
+                stopping_criteria, self.tokenizer, batch_size
+            )
 
-        # --- strip non-HF kwargs ---
+        if max_out_len is not None:
+            generation_kwargs["max_new_tokens"] = int(max_out_len)
+
+        if min_out_len is not None:
+            generation_kwargs["min_new_tokens"] = int(min_out_len)
+
+        generation_kwargs["pad_token_id"] = self.tokenizer.pad_token_id
+        generation_kwargs.setdefault("eos_token_id", self.tokenizer.eos_token_id)
+
+        # 🔥 最後一刻再清一次（防止回流）
         generation_kwargs.pop("gt_task", None)
         generation_kwargs.pop("output_json_filepath", None)
-        
-        # step-2: conduct model forward to generate output
-        outputs = self.model.generate(**tokens, **generation_kwargs)
-        outputs = outputs[:, tokens['input_ids'].shape[1]:]
 
-        # step-3: decode the output
-        decodeds = self.tokenizer.batch_decode(outputs)
+        self.logger.info("Generation Args of Huggingface:")
+        self.logger.info(generation_kwargs)
+
+        # ---------------------------
+        # model forward
+        # ---------------------------
+        print("[SFT] chat-templated sample:", repr(messages[0][:300]))
+        outputs = self.model.generate(**tokens, **generation_kwargs)
+
+        # remove prompt tokens
+        outputs = outputs[:, tokens["input_ids"].shape[1] :]
+
+        # ---------------------------
+        # decode
+        # ---------------------------
+        decodeds = self.tokenizer.batch_decode(
+            outputs,
+            skip_special_tokens=True,
+        )
+
         for stop in stopping_criteria:
             decodeds = [t.split(stop)[0] for t in decodeds]
 
@@ -665,3 +702,4 @@ class HuggingFaceBaseModel(HuggingFacewithChatTemplate):
         m = _convert_base_messages([prompt])[0]
         t = self.tokenizer(m, add_special_tokens=add_special_tokens)
         return len(t['input_ids'])
+

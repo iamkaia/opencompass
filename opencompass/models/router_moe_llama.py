@@ -2,13 +2,14 @@
 import os
 import json
 import time
-from typing import Any, Dict
+from typing import List, Optional, Dict, Any
 
 import torch
 from collections import Counter
 
 from opencompass.models import HuggingFacewithChatTemplate
 from opencompass.models.unified_moe_core import UnifiedMoECore, ID2LABEL
+from opencompass.registry import MODELS
 
 
 def _ensure_dir(p: str):
@@ -54,7 +55,7 @@ def _get_routing_log_path(output_json_filepath, abbr, gt_task=None):
     ds = ds.replace("/", "_")
     return f"routing_logs/routing_{safe}__{ds}.jsonl"
 
-
+@MODELS.register_module()
 class RouterMoELlama(HuggingFacewithChatTemplate):
     """OpenCompass wrapper around UnifiedMoECore (external router only)."""
 
@@ -143,43 +144,60 @@ class RouterMoELlama(HuggingFacewithChatTemplate):
         raise TypeError(f"Unsupported input type for prompt: {type(x)}; value={repr(x)[:300]}")
 
     @torch.no_grad()
-    def generate(self, prompts, **gen_kwargs):
-        gt_task = gen_kwargs.pop("gt_task", None)
-        output_json_filepath = gen_kwargs.pop("output_json_filepath", None)
+    def generate(
+        self,
+        inputs: List[str],
+        max_out_len: int,
+        min_out_len: Optional[int] = None,
+        stopping_criteria: List[str] = [],
+        **kwargs,
+    ):
 
-        if not isinstance(prompts, list):
-            prompts = [prompts]
+        # --------------------------
+        # 1️⃣ 移除 OC meta key
+        # --------------------------
+        kwargs.pop("gt_task", None)
+        kwargs.pop("output_json_filepath", None)
 
-        max_out_len = gen_kwargs.pop("max_out_len", None)
+        # --------------------------
+        # 2️⃣ build gen_kwargs (完全對齊 SFT)
+        # --------------------------
+        gen_kwargs = self.generation_kwargs.copy()
+        gen_kwargs.update(kwargs)
 
-        # Prepare routing log path
-        gt = _norm_task(gt_task)
-        log_path = _get_routing_log_path(output_json_filepath, self.abbr, gt_task=gt)
+        '''
+        # stopping criteria
+        stopping_criteria = list(set(stopping_criteria + self.stop_words))
+        if stopping_criteria:
+            gen_kwargs["stopping_criteria"] = _get_stopping_criteria(
+                stopping_criteria,
+                self.tokenizer,
+                len(inputs),
+            )
+        '''
+        # max tokens（這是關鍵）
+        if max_out_len is not None:
+            gen_kwargs["max_new_tokens"] = int(max_out_len)
 
-        # callback for core routing
-        def on_route(prompt: str, eid: int):
-            routed = ID2LABEL.get(eid, str(eid))
-            ok = (gt == routed) if gt is not None else None
-            rec = {
-                "ts": time.time(),
-                "kind": "external",
-                "gt_task": gt,
-                "routed_task": routed,
-                "eid": eid,
-                "route_ok": ok,
-                "prompt_len_chars": len(prompt),
-            }
-            _append_jsonl(log_path, rec)
+        if min_out_len is not None:
+            gen_kwargs["min_new_tokens"] = int(min_out_len)
 
-        # convert inputs to strings
-        prompt_strs = [self._to_prompt_str(x) for x in prompts]
+        gen_kwargs["pad_token_id"] = self.tokenizer.pad_token_id
+        gen_kwargs.setdefault("eos_token_id", self.tokenizer.eos_token_id)
 
-        # run core blackbox generate
+
+        # --------------------------
+        # 3️⃣ 轉成 prompt string
+        # --------------------------
+        prompt_strs = [self._to_prompt_str(x) for x in inputs]
+
+        # --------------------------
+        # 4️⃣ 呼叫 core
+        # --------------------------
         outputs = self.core.generate(
             prompt_strs,
-            max_new_tokens=int(max_out_len) if max_out_len is not None else None,
             gen_kwargs=gen_kwargs,
-            on_route=on_route,
+            on_route=None,
         )
 
         # write counts snapshot (optional)
@@ -195,3 +213,5 @@ class RouterMoELlama(HuggingFacewithChatTemplate):
             pass
 
         return outputs
+
+
