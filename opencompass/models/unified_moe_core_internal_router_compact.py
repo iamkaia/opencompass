@@ -1,14 +1,12 @@
-# opencompass/models/unified_moe_core_internal_router_compact.py
 import json
 import os
+from collections import Counter
 from typing import Any, Dict, List, Optional, Union
 
 import torch
 import torch.nn as nn
 from safetensors.torch import load_file as safe_load
 from transformers import AutoModel, AutoModelForCausalLM, AutoTokenizer
-
-from opencompass.registry import MODELS
 
 
 TASK_NAMES = ["iwslt2017", "medmcqa", "race", "squad2", "sst2"]
@@ -75,8 +73,16 @@ def set_all_experts(model, eid: int):
             m.set_expert(eid)
 
 
+def _unwrap_layer(layer):
+    while hasattr(layer, "base_layer"):
+        layer = layer.base_layer
+    return layer
+
+
 def set_layer_expert(model, layer_idx: int, eid: int):
     layer = model.model.layers[layer_idx]
+    layer = _unwrap_layer(layer)
+
     for name in ["gate_proj", "up_proj", "down_proj"]:
         mod = getattr(layer.mlp, name)
         if isinstance(mod, HardRoutedLoRALinear):
@@ -197,7 +203,6 @@ class BeforeAttentionRouterWrapper(nn.Module):
 
     @staticmethod
     def gather_last_valid(hidden_states: torch.Tensor) -> torch.Tensor:
-        # generate prefill 階段 batch_size=1，用最後 token 即可
         return hidden_states[:, -1, :]
 
     def forward(self, hidden_states, *args, **kwargs):
@@ -227,21 +232,23 @@ class BeforeAttentionRouterWrapper(nn.Module):
         return self.base_layer(hidden_states, *args, **kwargs)
 
 
-@MODELS.register_module()
 class UnifiedMoECoreInternalRouterCompact:
     def __init__(
         self,
         base_model_path: str,
         router_ckpt_dir: str,
+        router_bert_init: str,
         lora_paths: Dict[str, str],
         dtype: str = "float16",
         r: int = 8,
-        alpha: int = 16,
+        alpha: int = 32,
         router_dim: int = 512,
         device_map: str = "auto",
         max_seq_len: int = 2048,
     ):
         self.max_seq_len = int(max_seq_len)
+        self.route_counter = Counter()
+
         torch_dtype = torch.float16 if dtype == "float16" else torch.bfloat16
 
         with open(os.path.join(router_ckpt_dir, "router_config.json"), "r", encoding="utf-8") as f:
@@ -258,7 +265,7 @@ class UnifiedMoECoreInternalRouterCompact:
 
         self.model = AutoModelForCausalLM.from_pretrained(
             base_model_path,
-            dtype=torch_dtype,
+            torch_dtype=torch_dtype,
             device_map=device_map,
         )
         self.model.eval()
@@ -282,10 +289,11 @@ class UnifiedMoECoreInternalRouterCompact:
             expert_id = task_id + 1
             load_lora_into_expert(self.model, adapter_dir, expert_id)
 
-        self.router_tokenizer = AutoTokenizer.from_pretrained(router_ckpt_dir)
         encoder_dir = os.path.join(router_ckpt_dir, "encoder")
 
+        self.router_tokenizer = AutoTokenizer.from_pretrained(router_bert_init)
         self.bert_encoder = BertExternalEncoder(encoder_dir)
+
         bert_hidden = self.bert_encoder.encoder.config.hidden_size
         llama_hidden = self.model.config.hidden_size
 
@@ -319,10 +327,14 @@ class UnifiedMoECoreInternalRouterCompact:
         self.cached_bert_mask = None
 
         base_first = self.model.model.layers[self.first_layer_idx]
-        self.model.model.layers[self.first_layer_idx] = BeforeAttentionRouterWrapper(base_first, self, which="first")
+        self.model.model.layers[self.first_layer_idx] = BeforeAttentionRouterWrapper(
+            base_first, self, which="first"
+        )
 
         base_mid = self.model.model.layers[self.middle_layer_idx]
-        self.model.model.layers[self.middle_layer_idx] = BeforeAttentionRouterWrapper(base_mid, self, which="mid")
+        self.model.model.layers[self.middle_layer_idx] = BeforeAttentionRouterWrapper(
+            base_mid, self, which="mid"
+        )
 
     def _reset_runtime_cache(self):
         self.cached_first_eid = None
@@ -363,7 +375,10 @@ class UnifiedMoECoreInternalRouterCompact:
             bert_last=self.cached_bert_last,
             bert_attention_mask=self.cached_bert_mask,
         )
-        return int(logits.argmax(dim=-1).item()) + 1
+        eid = int(logits.argmax(dim=-1).item()) + 1
+        task = self.task_names[eid - 1]
+        self.route_counter[f"first::{task}"] += 1
+        return eid
 
     @torch.no_grad()
     def _route_mid_from_vec(self, vec: torch.Tensor) -> int:
@@ -373,10 +388,19 @@ class UnifiedMoECoreInternalRouterCompact:
             bert_last=self.cached_bert_last,
             bert_attention_mask=self.cached_bert_mask,
         )
-        return int(logits.argmax(dim=-1).item()) + 1
+        eid = int(logits.argmax(dim=-1).item()) + 1
+        task = self.task_names[eid - 1]
+        self.route_counter[f"mid::{task}"] += 1
+        return eid
 
     @torch.no_grad()
-    def generate(self, prompts: Union[str, List[str]], max_new_tokens: Optional[int] = None, gen_kwargs: Optional[Dict[str, Any]] = None, **kwargs) -> List[str]:
+    def generate(
+        self,
+        prompts: Union[str, List[str]],
+        max_new_tokens: Optional[int] = None,
+        gen_kwargs: Optional[Dict[str, Any]] = None,
+        **kwargs,
+    ) -> List[str]:
         if isinstance(prompts, str):
             prompts = [prompts]
         if gen_kwargs is None:
@@ -408,7 +432,11 @@ class UnifiedMoECoreInternalRouterCompact:
             out = self.model.generate(**inp, **args)
             prompt_len = inp["input_ids"].shape[1]
             gen_ids = out[0][prompt_len:]
-            text = self.tokenizer.decode(gen_ids, skip_special_tokens=True, clean_up_tokenization_spaces=True)
+            text = self.tokenizer.decode(
+                gen_ids,
+                skip_special_tokens=True,
+                clean_up_tokenization_spaces=True,
+            )
             outputs.append(text)
 
         return outputs
