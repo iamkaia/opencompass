@@ -1,14 +1,13 @@
 # opencompass/models/router_moe_llama.py
-import os
 import json
+import os
 import time
-from typing import List, Optional, Dict, Any
+from typing import List, Optional
 
 import torch
-from collections import Counter
 
 from opencompass.models import HuggingFacewithChatTemplate
-from opencompass.models.unified_moe_core import UnifiedMoECore, ID2LABEL
+from opencompass.models.unified_moe_core import UnifiedMoECore
 from opencompass.registry import MODELS
 
 
@@ -17,62 +16,26 @@ def _ensure_dir(p: str):
         os.makedirs(p, exist_ok=True)
 
 
-def _append_jsonl(path: str, obj: dict):
-    _ensure_dir(os.path.dirname(path))
-    with open(path, "a", encoding="utf-8") as f:
-        f.write(json.dumps(obj, ensure_ascii=False) + "\n")
-
-
-def _norm_task(t):
-    if t is None:
-        return None
-    t = str(t).strip()
-    # keep your normalization here if needed
-    if t == "squad2":
-        t = "squad2.0"
-    return t
-
-
-def _get_routing_log_path(output_json_filepath, abbr, gt_task=None):
-    """
-    Keep the same behavior you already had:
-    - if output_json_filepath exists, log next to prediction file
-    - filename uses gt_task if available
-    """
-    if output_json_filepath:
-        pred_dir = os.path.dirname(output_json_filepath)
-        if gt_task:
-            ds = str(gt_task).strip()
-            if ds.endswith(".json"):
-                ds = ds[:-5]
-        else:
-            ds = os.path.splitext(os.path.basename(output_json_filepath))[0]
-        ds = ds.replace("/", "_")
-        return os.path.join(pred_dir, f"routing_log__{ds}.jsonl")
-
-    safe = abbr.replace("/", "_")
-    ds = str(gt_task).strip() if gt_task else "unknown"
-    ds = ds.replace("/", "_")
-    return f"routing_logs/routing_{safe}__{ds}.jsonl"
-
 @MODELS.register_module()
 class RouterMoELlama(HuggingFacewithChatTemplate):
-    """OpenCompass wrapper around UnifiedMoECore (external router only)."""
+    """
+    OpenCompass wrapper around UnifiedMoECore (two-layer router version).
+    """
 
     is_api = False
 
     def __init__(
         self,
         path,
-        cls_dir,
+        router_ckpt_dir,
         lora_paths,
-        max_out_len=1024,
-        batch_size=1,
+        max_out_len=128,
+        batch_size=128,
         run_cfg=None,
         dtype="float16",
         r=8,
         alpha=16,
-        abbr="router_moe_lora",
+        abbr="router_moe_lora_2layer",
         max_seq_len=2048,
         **kwargs,
     ):
@@ -83,19 +46,23 @@ class RouterMoELlama(HuggingFacewithChatTemplate):
             run_cfg=run_cfg,
             **kwargs,
         )
+
         self.abbr = abbr
 
-        # output dir for debug counts/logs (still OK to keep)
+        self.batch_size = batch_size
+        self.max_out_len = max_out_len
+
         out_dir = os.environ.get("OC_OUTPUT_DIR", None) or os.getcwd()
         os.makedirs(out_dir, exist_ok=True)
         pid = os.getpid()
         ts = time.strftime("%Y%m%d_%H%M%S")
-        self.save_route_counts_path = os.path.join(out_dir, f"routing_counts_{self.abbr}_{ts}_pid{pid}.json")
+        self.save_route_counts_path = os.path.join(
+            out_dir, f"routing_counts_{self.abbr}_{ts}_pid{pid}.json"
+        )
 
-        # create the *core* blackbox model
         self.core = UnifiedMoECore(
             base_model_path=path,
-            cls_dir=cls_dir,
+            router_ckpt_dir=router_ckpt_dir,
             lora_paths=lora_paths,
             dtype=dtype,
             r=r,
@@ -105,18 +72,24 @@ class RouterMoELlama(HuggingFacewithChatTemplate):
         )
 
     def _to_prompt_str(self, x):
-        # keep your original conversion logic (unchanged)
         if isinstance(x, str):
             return x
+
         if isinstance(x, dict):
             for k in ["prompt", "text", "input", "inputs"]:
                 if k in x and isinstance(x[k], str):
                     return x[k]
+
             if "messages" in x:
                 msgs = x["messages"]
                 if hasattr(self.tokenizer, "apply_chat_template"):
-                    return self.tokenizer.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
-                return "\n".join([f"{m.get('role','user')}: {m.get('content','')}" for m in msgs])
+                    return self.tokenizer.apply_chat_template(
+                        msgs, tokenize=False, add_generation_prompt=True
+                    )
+                return "\n".join(
+                    [f"{m.get('role', 'user')}: {m.get('content', '')}" for m in msgs]
+                )
+
         if isinstance(x, (list, tuple)) and x and isinstance(x[0], dict):
             if hasattr(self.tokenizer, "apply_chat_template"):
                 msgs = []
@@ -128,11 +101,16 @@ class RouterMoELlama(HuggingFacewithChatTemplate):
                         role = "assistant"
                     elif role in ["SYSTEM"]:
                         role = "system"
+
                     content = m.get("content", None)
                     if content is None:
                         content = m.get("prompt", "")
                     msgs.append({"role": role, "content": content})
-                return self.tokenizer.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
+
+                return self.tokenizer.apply_chat_template(
+                    msgs, tokenize=False, add_generation_prompt=True
+                )
+
             parts = []
             for m in x:
                 role = m.get("role", "user")
@@ -141,6 +119,7 @@ class RouterMoELlama(HuggingFacewithChatTemplate):
                     txt = m.get("prompt", "")
                 parts.append(f"{role}: {txt}")
             return "\n".join(parts)
+
         raise TypeError(f"Unsupported input type for prompt: {type(x)}; value={repr(x)[:300]}")
 
     @torch.no_grad()
@@ -152,30 +131,12 @@ class RouterMoELlama(HuggingFacewithChatTemplate):
         stopping_criteria: List[str] = [],
         **kwargs,
     ):
-
-        # --------------------------
-        # 1️⃣ 移除 OC meta key
-        # --------------------------
         kwargs.pop("gt_task", None)
         kwargs.pop("output_json_filepath", None)
 
-        # --------------------------
-        # 2️⃣ build gen_kwargs (完全對齊 SFT)
-        # --------------------------
         gen_kwargs = self.generation_kwargs.copy()
         gen_kwargs.update(kwargs)
 
-        '''
-        # stopping criteria
-        stopping_criteria = list(set(stopping_criteria + self.stop_words))
-        if stopping_criteria:
-            gen_kwargs["stopping_criteria"] = _get_stopping_criteria(
-                stopping_criteria,
-                self.tokenizer,
-                len(inputs),
-            )
-        '''
-        # max tokens（這是關鍵）
         if max_out_len is not None:
             gen_kwargs["max_new_tokens"] = int(max_out_len)
 
@@ -185,33 +146,22 @@ class RouterMoELlama(HuggingFacewithChatTemplate):
         gen_kwargs["pad_token_id"] = self.tokenizer.pad_token_id
         gen_kwargs.setdefault("eos_token_id", self.tokenizer.eos_token_id)
 
-
-        # --------------------------
-        # 3️⃣ 轉成 prompt string
-        # --------------------------
         prompt_strs = [self._to_prompt_str(x) for x in inputs]
 
-        # --------------------------
-        # 4️⃣ 呼叫 core
-        # --------------------------
+
         outputs = self.core.generate(
             prompt_strs,
             gen_kwargs=gen_kwargs,
-            on_route=None,
         )
 
-        # write counts snapshot (optional)
+        # 如果 core 有 route_counter 就存；沒有就略過
         try:
-            with open(self.save_route_counts_path, "w", encoding="utf-8") as f:
-                json.dump(
-                    {ID2LABEL.get(k, str(k)): v for k, v in self.core.route_counter.items()},
-                    f,
-                    indent=2,
-                    ensure_ascii=False,
-                )
+            route_counter = getattr(self.core, "route_counter", None)
+            if route_counter is not None:
+                with open(self.save_route_counts_path, "w", encoding="utf-8") as f:
+                    json.dump(route_counter, f, indent=2, ensure_ascii=False)
         except Exception:
             pass
 
         return outputs
-
 
