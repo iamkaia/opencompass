@@ -245,16 +245,20 @@ class UnifiedMoECoreInternalRouterCompact:
         router_dim: int = 512,
         device_map: str = "auto",
         max_seq_len: int = 2048,
+        force_first_task: Optional[str] = None,
+        force_mid_task: Optional[str] = None,
     ):
         self.max_seq_len = int(max_seq_len)
         self.route_counter = Counter()
-
+        self.force_first_task = force_first_task
+        self.force_mid_task = force_mid_task
         torch_dtype = torch.float16 if dtype == "float16" else torch.bfloat16
 
         with open(os.path.join(router_ckpt_dir, "router_config.json"), "r", encoding="utf-8") as f:
             cfg = json.load(f)
 
         self.task_names = cfg["task_names"]
+        self.task_to_eid = {task: i + 1 for i, task in enumerate(self.task_names)}
         self.first_layer_idx = int(cfg["first_layer_idx"])
         self.middle_layer_idx = int(cfg["middle_layer_idx"])
         self.router_max_len = int(cfg.get("router_max_len", 512))
@@ -367,6 +371,17 @@ class UnifiedMoECoreInternalRouterCompact:
     def _should_route_mid(self, hidden_states: torch.Tensor) -> bool:
         return (hidden_states.size(1) > 1) and (self.cached_mid_eid is None)
 
+    def _forced_task_to_eid(self, task_name: Optional[str]) -> Optional[int]:
+        if task_name is None:
+            return None
+        if task_name not in self.task_to_eid:
+            raise ValueError(
+                f"Unknown forced task: {task_name}. "
+                f"Available tasks: {self.task_names}"
+            )
+        return self.task_to_eid[task_name]
+
+    '''
     @torch.no_grad()
     def _route_first_from_vec(self, vec: torch.Tensor) -> int:
         logits = self.router_first(
@@ -392,22 +407,57 @@ class UnifiedMoECoreInternalRouterCompact:
         task = self.task_names[eid - 1]
         self.route_counter[f"mid::{task}"] += 1
         return eid
+    '''
+    @torch.no_grad()
+    def _route_first_from_vec(self, vec: torch.Tensor) -> int:
+        forced_eid = self._forced_task_to_eid(self.force_first_task)
+        if forced_eid is not None:
+            task = self.task_names[forced_eid - 1]
+            self.route_counter[f"first_forced::{task}"] += 1
+            return forced_eid
+
+        logits = self.router_first(
+            llama_vec=vec,
+            bert_prev=self.cached_bert_prev,
+            bert_last=self.cached_bert_last,
+            bert_attention_mask=self.cached_bert_mask,
+        )
+        eid = int(logits.argmax(dim=-1).item()) + 1
+        task = self.task_names[eid - 1]
+        self.route_counter[f"first::{task}"] += 1
+        return eid
 
     @torch.no_grad()
-    def generate(
-        self,
-        prompts: Union[str, List[str]],
-        max_new_tokens: Optional[int] = None,
-        gen_kwargs: Optional[Dict[str, Any]] = None,
-        **kwargs,
-    ) -> List[str]:
+    def _route_mid_from_vec(self, vec: torch.Tensor) -> int:
+        forced_eid = self._forced_task_to_eid(self.force_mid_task)
+        if forced_eid is not None:
+            task = self.task_names[forced_eid - 1]
+            self.route_counter[f"mid_forced::{task}"] += 1
+            return forced_eid
+
+        logits = self.router_mid(
+            llama_vec=vec,
+            bert_prev=self.cached_bert_prev,
+            bert_last=self.cached_bert_last,
+            bert_attention_mask=self.cached_bert_mask,
+        )
+        eid = int(logits.argmax(dim=-1).item()) + 1
+        task = self.task_names[eid - 1]
+        self.route_counter[f"mid::{task}"] += 1
+        return eid
+
+    @torch.no_grad()
+    def generate(self, prompts, max_new_tokens=None, gen_kwargs=None, **kwargs):
         if isinstance(prompts, str):
             prompts = [prompts]
+
         if gen_kwargs is None:
             gen_kwargs = {}
 
+
         outputs = []
         for prompt in prompts:
+
             self._reset_runtime_cache()
             self._encode_bert_memory(prompt)
 
@@ -429,14 +479,18 @@ class UnifiedMoECoreInternalRouterCompact:
             args["top_p"] = 1.0
             args["num_beams"] = 1
 
+
             out = self.model.generate(**inp, **args)
+
             prompt_len = inp["input_ids"].shape[1]
             gen_ids = out[0][prompt_len:]
+
             text = self.tokenizer.decode(
                 gen_ids,
                 skip_special_tokens=True,
                 clean_up_tokenization_spaces=True,
             )
+
             outputs.append(text)
 
         return outputs

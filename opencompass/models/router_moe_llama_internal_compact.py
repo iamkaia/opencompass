@@ -57,6 +57,8 @@ class RouterMoELlamaInternalCompact(HuggingFacewithChatTemplate):
             router_dim=router_dim,
             device_map="auto",
             max_seq_len=max_seq_len,
+            force_first_task="medmcqa",
+            force_mid_task="medmcqa",
         )
 
     def _to_prompt_str(self, x):
@@ -192,14 +194,7 @@ class RouterMoELlamaInternalCompact(HuggingFacewithChatTemplate):
             json.dump(self._pair_counter, f, ensure_ascii=False, indent=2)
 
     @torch.no_grad()
-    def generate(
-        self,
-        inputs: List[str],
-        max_out_len: int,
-        min_out_len: Optional[int] = None,
-        stopping_criteria: List[str] = [],
-        **kwargs,
-    ):
+    def generate(self, inputs, max_out_len, min_out_len=None, stopping_criteria=[], **kwargs):
         kwargs.pop("gt_task", None)
         output_json_filepath = kwargs.pop("output_json_filepath", None)
 
@@ -215,16 +210,14 @@ class RouterMoELlamaInternalCompact(HuggingFacewithChatTemplate):
         gen_kwargs.setdefault("eos_token_id", self.tokenizer.eos_token_id)
 
         prompt_strs = [self._to_prompt_str(x) for x in inputs]
+
+
         run_dir = self._resolve_run_dir(output_json_filepath)
 
         outputs = []
-
-        # 關鍵：逐筆跑，這樣每筆跑完就能從 core 抓到 first/mid eid
         for prompt in prompt_strs:
-            one_out = self.core.generate(
-                [prompt],
-                gen_kwargs=gen_kwargs,
-            )
+
+            one_out = self.core.generate([prompt], gen_kwargs=gen_kwargs)
 
             if isinstance(one_out, list):
                 outputs.extend(one_out)
@@ -234,11 +227,12 @@ class RouterMoELlamaInternalCompact(HuggingFacewithChatTemplate):
             first_eid = getattr(self.core, "cached_first_eid", None)
             mid_eid = getattr(self.core, "cached_mid_eid", None)
 
+
             self._append_routing_log(
                 run_dir=run_dir,
                 prompt=prompt,
                 first_eid=first_eid,
                 mid_eid=mid_eid,
             )
-
+        
         return outputs
