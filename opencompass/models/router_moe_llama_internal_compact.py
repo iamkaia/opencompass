@@ -1,7 +1,7 @@
 import json
 import os
 from typing import List, Optional
-
+import time
 import torch
 
 from opencompass.models import HuggingFacewithChatTemplate
@@ -153,22 +153,28 @@ class RouterMoELlamaInternalCompact(HuggingFacewithChatTemplate):
         first_eid: Optional[int],
         mid_eid: Optional[int],
     ):
-        routing_dir = os.path.join(run_dir, "routing")
+        routing_root = os.path.join(run_dir, "routing")
+        _ensure_dir(routing_root)
+
+        # 固定一個 run_tag（不要每次都變！）
+        if not hasattr(self, "_run_tag"):
+            self._run_tag = time.strftime("%Y%m%d_%H%M%S")
+
+        routing_dir = os.path.join(routing_root, self._run_tag)
         _ensure_dir(routing_dir)
 
-        #log_path = os.path.join(routing_dir, "routing_logs.jsonl")
         counter_path = os.path.join(routing_dir, "routing_counter.json")
 
         first_task = self._eid_to_task(first_eid)
         mid_task = self._eid_to_task(mid_eid)
         pair_key = f"{first_task}->{mid_task}"
 
-        # aggregate counter 放在 wrapper 裡自己維護
         if not hasattr(self, "_pair_counter"):
             self._pair_counter = {}
+
         self._pair_counter[pair_key] = self._pair_counter.get(pair_key, 0) + 1
 
-        '''
+        '''：
         row = {
             "prompt_preview": prompt[:200],
             "first_eid": first_eid,
@@ -181,6 +187,7 @@ class RouterMoELlamaInternalCompact(HuggingFacewithChatTemplate):
         with open(log_path, "a", encoding="utf-8") as f:
             f.write(json.dumps(row, ensure_ascii=False) + "\n")
         '''
+        #if sum(self._pair_counter.values()) % 50 == 0:
         with open(counter_path, "w", encoding="utf-8") as f:
             json.dump(self._pair_counter, f, ensure_ascii=False, indent=2)
 
