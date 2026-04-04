@@ -9,6 +9,13 @@ from typing import Dict, List
 import torch
 from torch.utils.data import Dataset, DataLoader
 from transformers import AutoModelForCausalLM, AutoTokenizer
+from opencompass.models.unified_moe_core_internal_router_compact import (
+    NULL_EXPERT_ID,
+    load_lora_into_expert,
+    patch_llama_with_hard_routed_lora,
+    set_all_experts,
+    set_layer_range_expert,
+)
 
 
 TASK_NAMES = ["iwslt2017", "medmcqa", "race", "squad2", "sst2"]
@@ -191,13 +198,23 @@ class LlamaVectorExtractor(torch.nn.Module):
       - first_layer_idx attention 前
       - middle_layer_idx attention 前
     """
-    def __init__(self, base_model_path: str, dtype: str, first_layer_idx: int, middle_layer_idx: int):
+    def __init__(
+        self,
+        base_model_path: str,
+        dtype: str,
+        first_layer_idx: int,
+        middle_layer_idx: int,
+        lora_paths: Dict[str, str] | None = None,
+        r: int = 8,
+        alpha: int = 32,
+        apply_task_lora_for_mid: bool = False,
+    ):
         super().__init__()
         torch_dtype = torch.float16 if dtype == "float16" else torch.bfloat16
 
         self.model = AutoModelForCausalLM.from_pretrained(
             base_model_path,
-            dtype=torch_dtype,
+            torch_dtype=torch_dtype,
             device_map=None,
         )
         self.model.eval()
@@ -206,6 +223,26 @@ class LlamaVectorExtractor(torch.nn.Module):
 
         self.first_layer_idx = int(first_layer_idx)
         self.middle_layer_idx = int(middle_layer_idx)
+        self.apply_task_lora_for_mid = bool(apply_task_lora_for_mid)
+        self.task_to_expert_id = {task: TASK2ID[task] + 1 for task in TASK_NAMES}
+
+        if self.apply_task_lora_for_mid:
+            if not lora_paths:
+                raise ValueError("apply_task_lora_for_mid=True requires lora_paths")
+            self.model = patch_llama_with_hard_routed_lora(
+                self.model,
+                num_experts=1 + len(TASK_NAMES),
+                r=int(r),
+                alpha=int(alpha),
+            )
+            for task in TASK_NAMES:
+                if task not in lora_paths:
+                    raise KeyError(f"Missing LoRA path for task: {task}")
+                load_lora_into_expert(
+                    self.model,
+                    lora_paths[task],
+                    self.task_to_expert_id[task],
+                )
 
         self.cached_first_before_attn = None
         self.cached_mid_before_attn = None
@@ -232,9 +269,26 @@ class LlamaVectorExtractor(torch.nn.Module):
         return vec
 
     @torch.no_grad()
-    def extract_vectors(self, input_ids, attention_mask):
+    def extract_vectors(self, input_ids, attention_mask, task_name: str | None = None):
         self.cached_first_before_attn = None
         self.cached_mid_before_attn = None
+
+        if self.apply_task_lora_for_mid:
+            if task_name is None:
+                raise ValueError("task_name is required when apply_task_lora_for_mid=True")
+            if task_name not in self.task_to_expert_id:
+                raise KeyError(f"Unknown task_name={task_name}")
+
+            # Runtime alignment:
+            # 1. first router sees base-model states before any routed LoRA is active.
+            # 2. mid router should see states after first-half layers have used the task expert.
+            set_all_experts(self.model, NULL_EXPERT_ID)
+            set_layer_range_expert(
+                self.model,
+                self.first_layer_idx,
+                self.middle_layer_idx - 1,
+                self.task_to_expert_id[task_name],
+            )
 
         _ = self.model(
             input_ids=input_ids,
@@ -278,6 +332,14 @@ def main():
     parser.add_argument("--max_samples", type=int, default=None)
     parser.add_argument("--balanced", action="store_true")
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--apply_task_lora_for_mid", action="store_true")
+    parser.add_argument("--r", type=int, default=8)
+    parser.add_argument("--alpha", type=int, default=32)
+    parser.add_argument("--lora_iwslt", type=str, default=None)
+    parser.add_argument("--lora_medmcqa", type=str, default=None)
+    parser.add_argument("--lora_race", type=str, default=None)
+    parser.add_argument("--lora_squad2", type=str, default=None)
+    parser.add_argument("--lora_sst2", type=str, default=None)
     args = parser.parse_args()
 
     os.makedirs(args.out_root, exist_ok=True)
@@ -304,11 +366,31 @@ def main():
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token = tokenizer.eos_token
 
+    lora_paths = None
+    if args.apply_task_lora_for_mid:
+        lora_paths = {
+            "iwslt2017": args.lora_iwslt,
+            "medmcqa": args.lora_medmcqa,
+            "race": args.lora_race,
+            "squad2": args.lora_squad2,
+            "sst2": args.lora_sst2,
+        }
+        missing = [task for task, path in lora_paths.items() if not path]
+        if missing:
+            raise ValueError(
+                "apply_task_lora_for_mid=True requires all LoRA paths. "
+                f"Missing: {missing}"
+            )
+
     extractor = LlamaVectorExtractor(
         base_model_path=args.base_model_path,
         dtype=args.dtype,
         first_layer_idx=args.first_layer_idx,
         middle_layer_idx=args.middle_layer_idx,
+        lora_paths=lora_paths,
+        r=args.r,
+        alpha=args.alpha,
+        apply_task_lora_for_mid=args.apply_task_lora_for_mid,
     ).to(device)
 
     split_out_dir = os.path.join(args.out_root, args.split)
@@ -337,13 +419,28 @@ def main():
         input_ids = enc["input_ids"].to(device)
         attention_mask = enc["attention_mask"].to(device)
 
-        with torch.no_grad():
-            first_vec, mid_vec = extractor.extract_vectors(input_ids, attention_mask)
-
-        first_vec = first_vec.to(dtype=torch.float16).cpu()
-        mid_vec = mid_vec.to(dtype=torch.float16).cpu()
-
         bs = len(texts)
+        first_vec = torch.empty(bs, extractor.model.config.hidden_size, dtype=torch.float16)
+        mid_vec = torch.empty(bs, extractor.model.config.hidden_size, dtype=torch.float16)
+
+        # A routed LoRA setup can only choose one expert per forward pass,
+        # so we extract homogeneous task sub-batches and then stitch them back.
+        task_to_indices = defaultdict(list)
+        for i, task in enumerate(batch["task"]):
+            task_to_indices[task].append(i)
+
+        with torch.no_grad():
+            for task, indices in task_to_indices.items():
+                sub_ids = input_ids[indices]
+                sub_mask = attention_mask[indices]
+                sub_first, sub_mid = extractor.extract_vectors(
+                    sub_ids,
+                    sub_mask,
+                    task_name=task if args.apply_task_lora_for_mid else None,
+                )
+                first_vec[indices] = sub_first.to(dtype=torch.float16).cpu()
+                mid_vec[indices] = sub_mid.to(dtype=torch.float16).cpu()
+
         for i in range(bs):
             chunk_items.append(
                 {
@@ -381,6 +478,9 @@ def main():
         "feature_type": "compact_last_valid_token_vector",
         "balanced": args.balanced,
         "seed": args.seed,
+        "apply_task_lora_for_mid": args.apply_task_lora_for_mid,
+        "r": args.r,
+        "alpha": args.alpha,
     }
     with open(os.path.join(args.out_root, "feature_config.json"), "w", encoding="utf-8") as f:
         json.dump(cfg, f, ensure_ascii=False, indent=2)

@@ -57,8 +57,8 @@ class RouterMoELlamaInternalCompact(HuggingFacewithChatTemplate):
             router_dim=router_dim,
             device_map="auto",
             max_seq_len=max_seq_len,
-            force_first_task="medmcqa",
-            force_mid_task="medmcqa",
+            force_first_task=None,
+            force_mid_task=None,
         )
 
     def _to_prompt_str(self, x):
