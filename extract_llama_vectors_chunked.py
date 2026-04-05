@@ -374,21 +374,20 @@ class LlamaVectorExtractor(torch.nn.Module):
         self.cached_mid_before_attn = None
 
         if self.apply_task_lora_for_mid:
-            if task_name is None:
-                raise ValueError("task_name is required when apply_task_lora_for_mid=True")
-            if task_name not in self.task_to_expert_id:
-                raise KeyError(f"Unknown task_name={task_name}")
-
-            # Runtime alignment:
-            # 1. first router sees base-model states before any routed LoRA is active.
-            # 2. mid router should see states after first-half layers have used the task expert.
+            # 先全部 reset 成 base / NULL expert
             set_all_experts(self.model, NULL_EXPERT_ID)
-            set_layer_range_expert(
-                self.model,
-                self.first_layer_idx,
-                self.middle_layer_idx - 1,
-                self.task_to_expert_id[task_name],
-            )
+
+            # 只有在 task_name 有指定時，才把前半段 layer 切到對應 expert
+            if task_name is not None:
+                if task_name not in self.task_to_expert_id:
+                    raise KeyError(f"Unknown task_name={task_name}")
+
+                set_layer_range_expert(
+                    self.model,
+                    self.first_layer_idx,
+                    self.middle_layer_idx - 1,
+                    self.task_to_expert_id[task_name],
+                )
 
         _ = self.model(
             input_ids=input_ids,
@@ -406,6 +405,7 @@ class LlamaVectorExtractor(torch.nn.Module):
         first_vec = self.gather_last_valid(self.cached_first_before_attn, attention_mask)
         mid_vec = self.gather_last_valid(self.cached_mid_before_attn, attention_mask)
         return first_vec, mid_vec
+
 
     @torch.no_grad()
     def predict_first_expert(self, texts: List[str], first_vec: torch.Tensor) -> torch.Tensor:
