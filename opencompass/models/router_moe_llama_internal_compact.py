@@ -147,6 +147,25 @@ class RouterMoELlamaInternalCompact(HuggingFacewithChatTemplate):
             return task_names[idx]
 
         return str(eid)
+    
+    def _append_prompt_log(self, run_dir: str, prompt: str):
+        prompt_root = os.path.join(run_dir, "routing")
+        _ensure_dir(prompt_root)
+
+        if not hasattr(self, "_run_tag"):
+            self._run_tag = time.strftime("%Y%m%d_%H%M%S")
+
+        routing_dir = os.path.join(prompt_root, self._run_tag)
+        _ensure_dir(routing_dir)
+
+        prompt_log_path = os.path.join(routing_dir, "prompts.jsonl")
+
+        row = {
+            "prompt": prompt,
+        }
+        with open(prompt_log_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(row, ensure_ascii=False) + "\n")
+
 
     def _append_routing_log(
         self,
@@ -216,7 +235,10 @@ class RouterMoELlamaInternalCompact(HuggingFacewithChatTemplate):
 
         outputs = []
         for prompt in prompt_strs:
-
+            self._append_prompt_log(
+                run_dir=run_dir,
+                prompt=prompt,
+            )
             one_out = self.core.generate([prompt], gen_kwargs=gen_kwargs)
 
             if isinstance(one_out, list):
