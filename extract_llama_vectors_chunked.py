@@ -7,8 +7,9 @@ from collections import defaultdict
 from typing import Dict, List
 
 import torch
+import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModel, AutoModelForCausalLM, AutoTokenizer
 from opencompass.models.unified_moe_core_internal_router_compact import (
     NULL_EXPERT_ID,
     load_lora_into_expert,
@@ -192,6 +193,61 @@ class Collator:
         }
 
 
+class BertExternalEncoder(nn.Module):
+    def __init__(self, bert_name_or_path: str):
+        super().__init__()
+        self.encoder = AutoModel.from_pretrained(bert_name_or_path)
+
+    def forward(self, input_ids, attention_mask, token_type_ids=None):
+        kwargs = {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "output_hidden_states": True,
+            "return_dict": True,
+        }
+        if token_type_ids is not None:
+            kwargs["token_type_ids"] = token_type_ids
+        out = self.encoder(**kwargs)
+        return out.hidden_states[-2], out.hidden_states[-1]
+
+
+class CompactCrossAttentionRouter(nn.Module):
+    def __init__(self, llama_hidden_size: int, bert_hidden_size: int, router_dim: int, num_tasks: int):
+        super().__init__()
+        self.q_proj = nn.Linear(llama_hidden_size, router_dim)
+        self.k_proj = nn.Linear(bert_hidden_size, router_dim)
+        self.v_proj = nn.Linear(bert_hidden_size, router_dim)
+        self.out_norm = nn.LayerNorm(router_dim * 2)
+        self.classifier = nn.Linear(router_dim * 2, num_tasks)
+
+    def forward(self, llama_vec, bert_prev, bert_last, bert_attention_mask=None):
+        router_dtype = self.q_proj.weight.dtype
+        router_device = self.q_proj.weight.device
+
+        llama_vec = llama_vec.to(device=router_device, dtype=router_dtype)
+        bert_prev = bert_prev.to(device=router_device, dtype=router_dtype)
+        bert_last = bert_last.to(device=router_device, dtype=router_dtype)
+
+        q = self.q_proj(llama_vec).unsqueeze(1)
+        mem = torch.cat([bert_prev, bert_last], dim=1)
+        k = self.k_proj(mem)
+        v = self.v_proj(mem)
+
+        scores = torch.matmul(q, k.transpose(-1, -2)) / (q.size(-1) ** 0.5)
+        if bert_attention_mask is not None:
+            mask = torch.cat([bert_attention_mask, bert_attention_mask], dim=1)
+            mask = (mask == 0).unsqueeze(1).to(device=router_device)
+            scores = scores.masked_fill(mask, float("-inf"))
+
+        attn = torch.softmax(scores, dim=-1)
+        ctx = torch.matmul(attn, v).squeeze(1)
+        qv = q.squeeze(1)
+        feat = torch.cat([qv, ctx], dim=-1)
+        feat = self.out_norm(feat)
+        logits = self.classifier(feat)
+        return logits
+
+
 class LlamaVectorExtractor(torch.nn.Module):
     """
     抽兩個位置的 hidden sequence，再取最後有效 token 向量：
@@ -208,6 +264,10 @@ class LlamaVectorExtractor(torch.nn.Module):
         r: int = 8,
         alpha: int = 32,
         apply_task_lora_for_mid: bool = False,
+        use_router_pred_for_mid: bool = False,
+        router_ckpt_dir: str | None = None,
+        router_bert_init: str | None = None,
+        router_dim: int = 512,
     ):
         super().__init__()
         torch_dtype = torch.float16 if dtype == "float16" else torch.bfloat16
@@ -224,7 +284,11 @@ class LlamaVectorExtractor(torch.nn.Module):
         self.first_layer_idx = int(first_layer_idx)
         self.middle_layer_idx = int(middle_layer_idx)
         self.apply_task_lora_for_mid = bool(apply_task_lora_for_mid)
+        self.use_router_pred_for_mid = bool(use_router_pred_for_mid)
         self.task_to_expert_id = {task: TASK2ID[task] + 1 for task in TASK_NAMES}
+
+        if self.use_router_pred_for_mid and not self.apply_task_lora_for_mid:
+            raise ValueError("use_router_pred_for_mid=True requires apply_task_lora_for_mid=True")
 
         if self.apply_task_lora_for_mid:
             if not lora_paths:
@@ -243,6 +307,42 @@ class LlamaVectorExtractor(torch.nn.Module):
                     lora_paths[task],
                     self.task_to_expert_id[task],
                 )
+
+        self.router_tokenizer = None
+        self.router_device = None
+        self.bert_encoder = None
+        self.router_first = None
+        self.router_mid = None
+        if self.use_router_pred_for_mid:
+            if not router_ckpt_dir or not router_bert_init:
+                raise ValueError(
+                    "use_router_pred_for_mid=True requires router_ckpt_dir and router_bert_init"
+                )
+            self.router_tokenizer = AutoTokenizer.from_pretrained(router_bert_init)
+            encoder_dir = os.path.join(router_ckpt_dir, "encoder")
+            self.bert_encoder = BertExternalEncoder(encoder_dir)
+            bert_hidden = self.bert_encoder.encoder.config.hidden_size
+            llama_hidden = self.model.config.hidden_size
+            self.router_first = CompactCrossAttentionRouter(
+                llama_hidden_size=llama_hidden,
+                bert_hidden_size=bert_hidden,
+                router_dim=int(router_dim),
+                num_tasks=len(TASK_NAMES),
+            )
+            self.router_mid = CompactCrossAttentionRouter(
+                llama_hidden_size=llama_hidden,
+                bert_hidden_size=bert_hidden,
+                router_dim=int(router_dim),
+                num_tasks=len(TASK_NAMES),
+            )
+            state = torch.load(os.path.join(router_ckpt_dir, "router_heads.pt"), map_location="cpu")
+            self.router_first.load_state_dict(state["router_first"])
+            self.router_mid.load_state_dict(state["router_mid"])
+            self.bert_encoder.load_state_dict(state["bert_encoder"], strict=False)
+            self.router_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            self.bert_encoder.to(self.router_device).eval()
+            self.router_first.to(self.router_device).eval()
+            self.router_mid.to(self.router_device).eval()
 
         self.cached_first_before_attn = None
         self.cached_mid_before_attn = None
@@ -307,6 +407,58 @@ class LlamaVectorExtractor(torch.nn.Module):
         mid_vec = self.gather_last_valid(self.cached_mid_before_attn, attention_mask)
         return first_vec, mid_vec
 
+    @torch.no_grad()
+    def predict_first_expert(self, texts: List[str], first_vec: torch.Tensor) -> torch.Tensor:
+        if not self.use_router_pred_for_mid:
+            raise RuntimeError("predict_first_expert called but use_router_pred_for_mid is disabled")
+        bert_enc = self.router_tokenizer(
+            texts,
+            return_tensors="pt",
+            padding=True,
+            truncation=True,
+            max_length=512,
+        )
+        bert_input = {
+            k: v.to(self.router_device)
+            for k, v in bert_enc.items()
+            if k in ["input_ids", "attention_mask", "token_type_ids"]
+        }
+        bert_prev, bert_last = self.bert_encoder(**bert_input)
+        logits = self.router_first(
+            llama_vec=first_vec.to(torch.float32),
+            bert_prev=bert_prev,
+            bert_last=bert_last,
+            bert_attention_mask=bert_input["attention_mask"],
+        )
+        pred = logits.argmax(dim=-1) + 1
+        return pred.to("cpu")
+
+    @torch.no_grad()
+    def predict_mid_expert(self, texts: List[str], mid_vec: torch.Tensor) -> torch.Tensor:
+        if not self.use_router_pred_for_mid:
+            raise RuntimeError("predict_mid_expert called but use_router_pred_for_mid is disabled")
+        bert_enc = self.router_tokenizer(
+            texts,
+            return_tensors="pt",
+            padding=True,
+            truncation=True,
+            max_length=512,
+        )
+        bert_input = {
+            k: v.to(self.router_device)
+            for k, v in bert_enc.items()
+            if k in ["input_ids", "attention_mask", "token_type_ids"]
+        }
+        bert_prev, bert_last = self.bert_encoder(**bert_input)
+        logits = self.router_mid(
+            llama_vec=mid_vec.to(torch.float32),
+            bert_prev=bert_prev,
+            bert_last=bert_last,
+            bert_attention_mask=bert_input["attention_mask"],
+        )
+        pred = logits.argmax(dim=-1) + 1
+        return pred.to("cpu")
+
 
 def flush_chunk(chunk_items, split_out_dir: str, chunk_id: int):
     if len(chunk_items) == 0:
@@ -340,6 +492,10 @@ def main():
     parser.add_argument("--lora_race", type=str, default=None)
     parser.add_argument("--lora_squad2", type=str, default=None)
     parser.add_argument("--lora_sst2", type=str, default=None)
+    parser.add_argument("--use_router_pred_for_mid", action="store_true")
+    parser.add_argument("--router_ckpt_dir", type=str, default=None)
+    parser.add_argument("--router_bert_init", type=str, default=None)
+    parser.add_argument("--router_dim", type=int, default=512)
     args = parser.parse_args()
 
     os.makedirs(args.out_root, exist_ok=True)
@@ -391,6 +547,10 @@ def main():
         r=args.r,
         alpha=args.alpha,
         apply_task_lora_for_mid=args.apply_task_lora_for_mid,
+        use_router_pred_for_mid=args.use_router_pred_for_mid,
+        router_ckpt_dir=args.router_ckpt_dir,
+        router_bert_init=args.router_bert_init,
+        router_dim=args.router_dim,
     ).to(device)
 
     split_out_dir = os.path.join(args.out_root, args.split)
@@ -420,26 +580,48 @@ def main():
         attention_mask = enc["attention_mask"].to(device)
 
         bs = len(texts)
-        first_vec = torch.empty(bs, extractor.model.config.hidden_size, dtype=torch.float16)
-        mid_vec = torch.empty(bs, extractor.model.config.hidden_size, dtype=torch.float16)
-
-        # A routed LoRA setup can only choose one expert per forward pass,
-        # so we extract homogeneous task sub-batches and then stitch them back.
-        task_to_indices = defaultdict(list)
-        for i, task in enumerate(batch["task"]):
-            task_to_indices[task].append(i)
-
         with torch.no_grad():
-            for task, indices in task_to_indices.items():
-                sub_ids = input_ids[indices]
-                sub_mask = attention_mask[indices]
-                sub_first, sub_mid = extractor.extract_vectors(
-                    sub_ids,
-                    sub_mask,
-                    task_name=task if args.apply_task_lora_for_mid else None,
-                )
-                first_vec[indices] = sub_first.to(dtype=torch.float16).cpu()
-                mid_vec[indices] = sub_mid.to(dtype=torch.float16).cpu()
+            if args.use_router_pred_for_mid:
+                base_first, _ = extractor.extract_vectors(input_ids, attention_mask, task_name=None)
+                first_vec = base_first.to(dtype=torch.float16).cpu()
+                pred_expert_ids = extractor.predict_first_expert(texts, base_first)
+
+                mid_vec = torch.empty(bs, extractor.model.config.hidden_size, dtype=torch.float16)
+                expert_to_indices = defaultdict(list)
+                for i, eid in enumerate(pred_expert_ids.tolist()):
+                    expert_to_indices[int(eid)].append(i)
+
+                inv_expert_to_task = {v: k for k, v in extractor.task_to_expert_id.items()}
+                for expert_id, indices in expert_to_indices.items():
+                    sub_ids = input_ids[indices]
+                    sub_mask = attention_mask[indices]
+                    task_name = inv_expert_to_task[expert_id]
+                    _, sub_mid = extractor.extract_vectors(
+                        sub_ids,
+                        sub_mask,
+                        task_name=task_name,
+                    )
+                    mid_vec[indices] = sub_mid.to(dtype=torch.float16).cpu()
+            else:
+                first_vec = torch.empty(bs, extractor.model.config.hidden_size, dtype=torch.float16)
+                mid_vec = torch.empty(bs, extractor.model.config.hidden_size, dtype=torch.float16)
+
+                # A routed LoRA setup can only choose one expert per forward pass,
+                # so we extract homogeneous task sub-batches and then stitch them back.
+                task_to_indices = defaultdict(list)
+                for i, task in enumerate(batch["task"]):
+                    task_to_indices[task].append(i)
+
+                for task, indices in task_to_indices.items():
+                    sub_ids = input_ids[indices]
+                    sub_mask = attention_mask[indices]
+                    sub_first, sub_mid = extractor.extract_vectors(
+                        sub_ids,
+                        sub_mask,
+                        task_name=task if args.apply_task_lora_for_mid else None,
+                    )
+                    first_vec[indices] = sub_first.to(dtype=torch.float16).cpu()
+                    mid_vec[indices] = sub_mid.to(dtype=torch.float16).cpu()
 
         for i in range(bs):
             chunk_items.append(
@@ -479,6 +661,7 @@ def main():
         "balanced": args.balanced,
         "seed": args.seed,
         "apply_task_lora_for_mid": args.apply_task_lora_for_mid,
+        "use_router_pred_for_mid": args.use_router_pred_for_mid,
         "r": args.r,
         "alpha": args.alpha,
     }
