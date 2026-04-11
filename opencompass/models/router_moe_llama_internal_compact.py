@@ -27,9 +27,15 @@ def _normalize_dataset_name(name: Optional[str]) -> str:
     return name.replace("/", "_") or "unknown"
 
 
-def _dataset_name_from_context(output_json_filepath: Optional[str], gt_task: Optional[str]) -> str:
+def _dataset_name_from_context(
+    output_json_filepath: Optional[str],
+    output_json_filename: Optional[str],
+    gt_task: Optional[str],
+) -> str:
     if gt_task:
         return _normalize_dataset_name(gt_task)
+    if output_json_filename:
+        return _normalize_dataset_name(output_json_filename)
     if output_json_filepath:
         return _normalize_dataset_name(os.path.splitext(os.path.basename(output_json_filepath))[0])
     return "unknown"
@@ -222,6 +228,7 @@ class RouterMoELlamaInternalCompact(HuggingFacewithChatTemplate):
     def generate(self, inputs, max_out_len, min_out_len=None, stopping_criteria=[], **kwargs):
         gt_task = kwargs.pop("gt_task", None)
         output_json_filepath = kwargs.pop("output_json_filepath", None)
+        output_json_filename = kwargs.pop("output_json_filename", None)
 
         gen_kwargs = self.generation_kwargs.copy()
         gen_kwargs.update(kwargs)
@@ -238,7 +245,11 @@ class RouterMoELlamaInternalCompact(HuggingFacewithChatTemplate):
 
 
         run_dir = self._resolve_run_dir(output_json_filepath)
-        dataset_name = _dataset_name_from_context(output_json_filepath, gt_task)
+        dataset_name = _dataset_name_from_context(
+            output_json_filepath=output_json_filepath,
+            output_json_filename=output_json_filename,
+            gt_task=gt_task,
+        )
         previous_dataset_name = getattr(self, "_active_dataset_name", None)
         if previous_dataset_name is not None and previous_dataset_name != dataset_name:
             self._flush_dataset_routing_summary(previous_dataset_name)

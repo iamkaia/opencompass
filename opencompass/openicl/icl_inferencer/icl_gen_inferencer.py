@@ -159,7 +159,11 @@ class GenInferencer(BaseInferencer):
             with torch.no_grad():
                 parsed_entries = self.model.parse_template(entry, mode='gen')
                 results = self.model.generate_from_template(
-                    entry, max_out_len=self.max_out_len, **extra_gen_kwargs)
+                    entry,
+                    max_out_len=self.max_out_len,
+                    output_json_filepath=output_json_filepath,
+                    output_json_filename=output_json_filename,
+                    **extra_gen_kwargs)
                 generated = results
 
             num_return_sequences = getattr(self.model, 'generation_kwargs',
