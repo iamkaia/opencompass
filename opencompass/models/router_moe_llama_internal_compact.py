@@ -3,6 +3,8 @@ import os
 from typing import List, Optional
 import time
 import torch
+from collections import Counter
+import atexit
 
 from opencompass.models import HuggingFacewithChatTemplate
 from opencompass.models.unified_moe_core_internal_router_compact import (
@@ -14,6 +16,23 @@ from opencompass.registry import MODELS
 def _ensure_dir(path: str):
     if path:
         os.makedirs(path, exist_ok=True)
+
+
+def _normalize_dataset_name(name: Optional[str]) -> str:
+    if name is None:
+        return "unknown"
+    name = str(name).strip()
+    if name.endswith(".json"):
+        name = name[:-5]
+    return name.replace("/", "_") or "unknown"
+
+
+def _dataset_name_from_context(output_json_filepath: Optional[str], gt_task: Optional[str]) -> str:
+    if gt_task:
+        return _normalize_dataset_name(gt_task)
+    if output_json_filepath:
+        return _normalize_dataset_name(os.path.splitext(os.path.basename(output_json_filepath))[0])
+    return "unknown"
 
 
 @MODELS.register_module()
@@ -60,6 +79,9 @@ class RouterMoELlamaInternalCompact(HuggingFacewithChatTemplate):
             force_first_task=None,
             force_mid_task=None,
         )
+        self._active_dataset_name = None
+        self._printed_dataset_totals = {}
+        atexit.register(self._flush_all_dataset_routing_summaries)
 
     def _to_prompt_str(self, x):
         if isinstance(x, str):
@@ -148,73 +170,57 @@ class RouterMoELlamaInternalCompact(HuggingFacewithChatTemplate):
 
         return str(eid)
     
-    def _append_prompt_log(self, run_dir: str, prompt: str):
-        prompt_root = os.path.join(run_dir, "routing")
-        _ensure_dir(prompt_root)
-
-        if not hasattr(self, "_run_tag"):
-            self._run_tag = time.strftime("%Y%m%d_%H%M%S")
-
-        routing_dir = os.path.join(prompt_root, self._run_tag)
-        _ensure_dir(routing_dir)
-
-        prompt_log_path = os.path.join(routing_dir, "prompts.jsonl")
-
-        row = {
-            "prompt": prompt,
-        }
-        with open(prompt_log_path, "a", encoding="utf-8") as f:
-            f.write(json.dumps(row, ensure_ascii=False) + "\n")
+    def _append_prompt_log(self, run_dir: str, prompt: str, dataset_name: str):
+        return None
 
 
     def _append_routing_log(
         self,
         run_dir: str,
+        dataset_name: str,
         prompt: str,
         first_eid: Optional[int],
         mid_eid: Optional[int],
     ):
-        routing_root = os.path.join(run_dir, "routing")
-        _ensure_dir(routing_root)
-
-        # 固定一個 run_tag（不要每次都變！）
-        if not hasattr(self, "_run_tag"):
-            self._run_tag = time.strftime("%Y%m%d_%H%M%S")
-
-        routing_dir = os.path.join(routing_root, self._run_tag)
-        _ensure_dir(routing_dir)
-
-        counter_path = os.path.join(routing_dir, "routing_counter.json")
-
         first_task = self._eid_to_task(first_eid)
         mid_task = self._eid_to_task(mid_eid)
         pair_key = f"{first_task}->{mid_task}"
 
-        if not hasattr(self, "_pair_counter"):
-            self._pair_counter = {}
+        if not hasattr(self, "_dataset_pair_counter"):
+            self._dataset_pair_counter = {}
 
-        self._pair_counter[pair_key] = self._pair_counter.get(pair_key, 0) + 1
+        if dataset_name not in self._dataset_pair_counter:
+            self._dataset_pair_counter[dataset_name] = Counter()
+        self._dataset_pair_counter[dataset_name][pair_key] += 1
 
-        '''：
-        row = {
-            "prompt_preview": prompt[:200],
-            "first_eid": first_eid,
-            "mid_eid": mid_eid,
-            "first_task": first_task,
-            "mid_task": mid_task,
-            "pair": pair_key,
-        }
+    def _flush_dataset_routing_summary(self, dataset_name: str):
+        if not hasattr(self, "_dataset_pair_counter"):
+            return
+        counter = self._dataset_pair_counter.get(dataset_name)
+        if not counter:
+            return
+        total = sum(counter.values())
+        if self._printed_dataset_totals.get(dataset_name) == total:
+            return
+        self._printed_dataset_totals[dataset_name] = total
+        summary = ", ".join(
+            f"{pair}:{count}/{total} ({count / total:.1%})"
+            for pair, count in counter.most_common()
+        )
+        print(
+            f"[ROUTING][dataset={dataset_name}] sample_count={total} pair_distribution={summary}",
+            flush=True,
+        )
 
-        with open(log_path, "a", encoding="utf-8") as f:
-            f.write(json.dumps(row, ensure_ascii=False) + "\n")
-        '''
-        #if sum(self._pair_counter.values()) % 50 == 0:
-        with open(counter_path, "w", encoding="utf-8") as f:
-            json.dump(self._pair_counter, f, ensure_ascii=False, indent=2)
+    def _flush_all_dataset_routing_summaries(self):
+        if not hasattr(self, "_dataset_pair_counter"):
+            return
+        for dataset_name in sorted(self._dataset_pair_counter):
+            self._flush_dataset_routing_summary(dataset_name)
 
     @torch.no_grad()
     def generate(self, inputs, max_out_len, min_out_len=None, stopping_criteria=[], **kwargs):
-        kwargs.pop("gt_task", None)
+        gt_task = kwargs.pop("gt_task", None)
         output_json_filepath = kwargs.pop("output_json_filepath", None)
 
         gen_kwargs = self.generation_kwargs.copy()
@@ -232,12 +238,18 @@ class RouterMoELlamaInternalCompact(HuggingFacewithChatTemplate):
 
 
         run_dir = self._resolve_run_dir(output_json_filepath)
+        dataset_name = _dataset_name_from_context(output_json_filepath, gt_task)
+        previous_dataset_name = getattr(self, "_active_dataset_name", None)
+        if previous_dataset_name is not None and previous_dataset_name != dataset_name:
+            self._flush_dataset_routing_summary(previous_dataset_name)
+        self._active_dataset_name = dataset_name
 
         outputs = []
         for prompt in prompt_strs:
             self._append_prompt_log(
                 run_dir=run_dir,
                 prompt=prompt,
+                dataset_name=dataset_name,
             )
             one_out = self.core.generate([prompt], gen_kwargs=gen_kwargs)
 
@@ -252,9 +264,10 @@ class RouterMoELlamaInternalCompact(HuggingFacewithChatTemplate):
 
             self._append_routing_log(
                 run_dir=run_dir,
+                dataset_name=dataset_name,
                 prompt=prompt,
                 first_eid=first_eid,
                 mid_eid=mid_eid,
             )
-        
+
         return outputs
