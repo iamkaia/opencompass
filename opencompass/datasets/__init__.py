@@ -140,6 +140,7 @@ from .qasper import *  # noqa: F401, F403
 from .qaspercut import *  # noqa: F401, F403
 from .QuALITY import *  # noqa: F401, F403
 from .race import *  # noqa: F401, F403
+from .router_quick_eval import *  # noqa: F401, F403
 from .rbench import *  # noqa: F401, F403
 from .realtoxicprompts import *  # noqa: F401, F403
 from .reasonbench import ReasonBenchDataset  # noqa: F401, F403
