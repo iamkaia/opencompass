@@ -187,11 +187,15 @@ class PromptVectorExtractor(nn.Module):
         model: AutoModelForCausalLM,
         first_layer_idx: int,
         middle_layer_idx: int,
+        pooling: str = "last_token",
+        pooling_last_k: int = 4,
     ):
         super().__init__()
         self.model = model
         self.first_layer_idx = int(first_layer_idx)
         self.middle_layer_idx = int(middle_layer_idx)
+        self.pooling = str(pooling)
+        self.pooling_last_k = int(pooling_last_k)
         self.cached_first = None
         self.cached_mid = None
         self._install_hooks()
@@ -215,6 +219,34 @@ class PromptVectorExtractor(nn.Module):
         batch_idx = torch.arange(hidden_states.size(0), device=hidden_states.device)
         return hidden_states[batch_idx, last_idx, :]
 
+    @staticmethod
+    def gather_mean_valid(hidden_states: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
+        mask = attention_mask.unsqueeze(-1).to(hidden_states.dtype)
+        denom = mask.sum(dim=1).clamp_min(1.0)
+        return (hidden_states * mask).sum(dim=1) / denom
+
+    @staticmethod
+    def gather_last_k_mean(hidden_states: torch.Tensor, attention_mask: torch.Tensor, k: int) -> torch.Tensor:
+        k = max(int(k), 1)
+        outputs = []
+        lengths = attention_mask.sum(dim=1)
+        for i in range(hidden_states.size(0)):
+            valid_len = int(lengths[i].item())
+            if valid_len <= 0:
+                outputs.append(hidden_states[i, 0])
+                continue
+            start = max(0, valid_len - k)
+            outputs.append(hidden_states[i, start:valid_len].mean(dim=0))
+        return torch.stack(outputs, dim=0)
+
+    def gather_pooled(self, hidden_states: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
+        if self.pooling == "last_token":
+            return self.gather_last_valid(hidden_states, attention_mask)
+        if self.pooling == "mean":
+            return self.gather_mean_valid(hidden_states, attention_mask)
+        if self.pooling == "lastk_mean":
+            return self.gather_last_k_mean(hidden_states, attention_mask, self.pooling_last_k)
+        raise ValueError(f"Unknown pooling mode: {self.pooling}")
     @torch.no_grad()
     def extract(self, input_ids: torch.Tensor, attention_mask: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         self.cached_first = None
@@ -228,8 +260,8 @@ class PromptVectorExtractor(nn.Module):
         )
         if self.cached_first is None or self.cached_mid is None:
             raise RuntimeError("Failed to capture hidden states for router vectors.")
-        first_vec = self.gather_last_valid(self.cached_first, attention_mask)
-        mid_vec = self.gather_last_valid(self.cached_mid, attention_mask)
+        first_vec = self.gather_pooled(self.cached_first, attention_mask)
+        mid_vec = self.gather_pooled(self.cached_mid, attention_mask)
         return first_vec, mid_vec
 
 
@@ -246,6 +278,8 @@ class JointAnswerSupervisionRouterModel(nn.Module):
         r: int,
         alpha: int,
         expert_names: Sequence[str],
+        router_pooling: str,
+        router_pooling_last_k: int,
     ):
         super().__init__()
         self.expert_names = list(expert_names)
@@ -281,6 +315,8 @@ class JointAnswerSupervisionRouterModel(nn.Module):
             model=self.model,
             first_layer_idx=self.first_layer_idx,
             middle_layer_idx=self.middle_layer_idx,
+            pooling=router_pooling,
+            pooling_last_k=router_pooling_last_k,
         )
 
         self.bert = BertExternalEncoder(router_bert_init)
@@ -347,11 +383,11 @@ class JointAnswerSupervisionRouterModel(nn.Module):
         if "bert_encoder" in state:
             self.bert.load_state_dict(state["bert_encoder"], strict=False)
 
-    def set_trainable(self, freeze_bert: bool):
+    def set_trainable(self, freeze_bert: bool, freeze_router_first: bool = False, freeze_router_mid: bool = False):
         for p in self.router_first.parameters():
-            p.requires_grad = True
+            p.requires_grad = not freeze_router_first
         for p in self.router_mid.parameters():
-            p.requires_grad = True
+            p.requires_grad = not freeze_router_mid
         for p in self.bert.parameters():
             p.requires_grad = not freeze_bert
 
@@ -754,10 +790,19 @@ def main():
     parser.add_argument("--first_layer_idx", type=int, default=0)
     parser.add_argument("--middle_layer_idx", type=int, default=15)
     parser.add_argument("--router_dim", type=int, default=512)
+    parser.add_argument(
+        "--router_pooling",
+        type=str,
+        default="last_token",
+        choices=["last_token", "mean", "lastk_mean"],
+    )
+    parser.add_argument("--router_pooling_last_k", type=int, default=4)
     parser.add_argument("--dtype", type=str, default="float16", choices=["float16", "bfloat16"])
     parser.add_argument("--r", type=int, default=8)
     parser.add_argument("--alpha", type=int, default=32)
     parser.add_argument("--freeze_bert", action="store_true")
+    parser.add_argument("--freeze_router_first", action="store_true")
+    parser.add_argument("--freeze_router_mid", action="store_true")
     parser.add_argument("--pseudo_ce_weight", type=float, default=0.5)
     parser.add_argument("--add_eos_to_target", action="store_true")
     parser.add_argument("--num_workers", type=int, default=0)
@@ -905,14 +950,29 @@ def main():
         r=args.r,
         alpha=args.alpha,
         expert_names=expert_names,
+        router_pooling=args.router_pooling,
+        router_pooling_last_k=args.router_pooling_last_k,
     )
     if args.load_router_ckpt_dir:
         model.load_router_weights(args.load_router_ckpt_dir)
         print(f"[INFO] loaded router weights from {args.load_router_ckpt_dir}")
 
-    model.set_trainable(freeze_bert=args.freeze_bert)
+    model.set_trainable(
+        freeze_bert=args.freeze_bert,
+        freeze_router_first=args.freeze_router_first,
+        freeze_router_mid=args.freeze_router_mid,
+    )
     model.to(device)
 
+    trainable_params = [p for p in model.parameters() if p.requires_grad]
+    trainable_param_count = sum(p.numel() for p in trainable_params)
+    print(
+        "[INFO] trainable_parts="
+        f"bert:{not args.freeze_bert} "
+        f"router_first:{not args.freeze_router_first} "
+        f"router_mid:{not args.freeze_router_mid} "
+        f"num_params={trainable_param_count}"
+    )
     config = vars(args).copy()
     config["train_task_names"] = train_task_names
     config["expert_names"] = expert_names
@@ -952,7 +1012,6 @@ def main():
             wandb_run.finish()
         return
 
-    trainable_params = [p for p in model.parameters() if p.requires_grad]
     optimizer = torch.optim.AdamW(trainable_params, lr=args.lr, weight_decay=args.weight_decay)
     total_steps = max(1, len(train_loader) * args.epochs)
     warmup_steps = int(total_steps * args.warmup_ratio)
@@ -1153,6 +1212,8 @@ def main():
                     "middle_layer_idx": args.middle_layer_idx,
                     "router_max_len": args.max_bert_len,
                     "router_feature_type": "answer_supervision_prompt_last_valid_token",
+                    "router_pooling": args.router_pooling,
+                    "router_pooling_last_k": args.router_pooling_last_k,
                     "best_epoch": best_epoch,
                     "best_val_loss": best_val,
                 },
