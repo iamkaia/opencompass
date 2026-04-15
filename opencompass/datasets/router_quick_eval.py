@@ -36,9 +36,8 @@ def _truncate_dataset(dataset, max_samples: int):
 @LOAD_DATASET.register_module()
 class SST2ConvertNPSmall(SST2_convert_np):
 
-    @staticmethod
-    def load(*args, max_samples: int = 100, **kwargs):
-        dataset = SST2_convert_np.load(*args, **kwargs)
+    def load(self, *args, max_samples: int = 100, **kwargs):
+        dataset = super().load(*args, **kwargs)
         return _truncate_dataset(dataset, max_samples=max_samples)
 
 
