@@ -4,11 +4,13 @@ import json
 import math
 import os
 import random
+import re
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Sequence
 
 import torch
 import torch.nn as nn
+from sacrebleu.metrics import BLEU
 from torch.utils.data import DataLoader, Dataset
 from transformers import AutoModelForCausalLM, AutoTokenizer, get_linear_schedule_with_warmup
 
@@ -16,6 +18,8 @@ try:
     from tqdm.auto import tqdm
 except Exception:
     tqdm = None
+
+from opencompass.utils.text_postprocessors import general_postprocess
 
 
 def _load_router_core_module():
@@ -44,6 +48,63 @@ set_layer_range_expert = _router_core.set_layer_range_expert
 
 
 DEFAULT_EXPERT_NAMES = ["iwslt2017", "medmcqa", "race", "squad2", "sst2"]
+MCQ_STYLE_TASKS = {"race", "medmcqa", "hellaswag", "piqa", "copa", "siqa"}
+BINARY_STYLE_TASKS = {"sst2", "boolq"}
+QA_STYLE_TASKS = {"squad2", "squad20", "squad2.0"}
+TRANSLATION_STYLE_TASKS = {"iwslt2017"}
+BLEU_SCORER = BLEU(effective_order=True)
+
+TASK_SCORE_FAMILY = {
+    "race": "mcq_abcd",
+    "medmcqa": "mcq_abcd",
+    "hellaswag": "mcq_abcd",
+    "piqa": "mcq_ab",
+    "copa": "mcq_ab",
+    "siqa": "mcq_abc",
+    "sst2": "sst2_label",
+    "boolq": "boolq_label",
+    "squad2": "squad20_em",
+    "squad20": "squad20_em",
+    "squad2.0": "squad20_em",
+    "iwslt2017": "translation_bleu",
+}
+
+
+class CompactRouterFeatureEncoder(nn.Module):
+    def __init__(self, llama_hidden_size: int, bert_hidden_size: int, router_dim: int):
+        super().__init__()
+        self.q_proj = nn.Linear(llama_hidden_size, router_dim)
+        self.k_proj = nn.Linear(bert_hidden_size, router_dim)
+        self.v_proj = nn.Linear(bert_hidden_size, router_dim)
+        self.out_norm = nn.LayerNorm(router_dim * 2)
+
+    def forward(
+        self,
+        llama_vec: torch.Tensor,
+        bert_prev: torch.Tensor,
+        bert_last: torch.Tensor,
+        bert_attention_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        router_dtype = self.q_proj.weight.dtype
+        router_device = self.q_proj.weight.device
+        llama_vec = llama_vec.to(device=router_device, dtype=router_dtype)
+        bert_prev = bert_prev.to(device=router_device, dtype=router_dtype)
+        bert_last = bert_last.to(device=router_device, dtype=router_dtype)
+
+        q = self.q_proj(llama_vec).unsqueeze(1)
+        mem = torch.cat([bert_prev, bert_last], dim=1)
+        k = self.k_proj(mem)
+        v = self.v_proj(mem)
+        scores = torch.matmul(q, k.transpose(-1, -2)) / (q.size(-1) ** 0.5)
+        if bert_attention_mask is not None:
+            mask = torch.cat([bert_attention_mask, bert_attention_mask], dim=1)
+            mask = (mask == 0).unsqueeze(1).to(device=router_device)
+            scores = scores.masked_fill(mask, float("-inf"))
+        attn = torch.softmax(scores, dim=-1)
+        ctx = torch.matmul(attn, v).squeeze(1)
+        qv = q.squeeze(1)
+        feat = torch.cat([qv, ctx], dim=-1)
+        return self.out_norm(feat)
 
 
 def save_json(obj: Dict, path: str):
@@ -300,6 +361,8 @@ class JointAnswerSupervisionRouterModel(nn.Module):
             r=r,
             alpha=alpha,
         )
+        for p in self.model.parameters():
+            p.requires_grad = False
 
         self.first_layer_idx = int(first_layer_idx)
         self.middle_layer_idx = int(middle_layer_idx)
@@ -323,17 +386,22 @@ class JointAnswerSupervisionRouterModel(nn.Module):
         bert_hidden_size = self.bert.encoder.config.hidden_size
         llama_hidden_size = self.model.config.hidden_size
 
-        self.router_first = CompactCrossAttentionRouter(
+        self.num_pairs = len(self.expert_names) * len(self.expert_names)
+        self.router_first = CompactRouterFeatureEncoder(
             llama_hidden_size=llama_hidden_size,
             bert_hidden_size=bert_hidden_size,
             router_dim=router_dim,
-            num_tasks=len(self.expert_names),
         )
-        self.router_mid = CompactCrossAttentionRouter(
+        self.router_mid = CompactRouterFeatureEncoder(
             llama_hidden_size=llama_hidden_size,
             bert_hidden_size=bert_hidden_size,
             router_dim=router_dim,
-            num_tasks=len(self.expert_names),
+        )
+        self.pair_classifier = nn.Sequential(
+            nn.LayerNorm(router_dim * 4),
+            nn.Linear(router_dim * 4, router_dim * 2),
+            nn.GELU(),
+            nn.Linear(router_dim * 2, self.num_pairs),
         )
 
     def load_router_weights(self, ckpt_dir: str):
@@ -378,8 +446,16 @@ class JointAnswerSupervisionRouterModel(nn.Module):
                 f"{ckpt_expert_names} to {self.expert_names}"
             )
 
-        _load_router_with_task_remap(self.router_first, state["router_first"], which="router_first")
-        _load_router_with_task_remap(self.router_mid, state["router_mid"], which="router_mid")
+        if "pair_first_encoder" in state:
+            self.router_first.load_state_dict(state["pair_first_encoder"])
+        else:
+            _load_router_with_task_remap(self.router_first, state["router_first"], which="router_first")
+        if "pair_mid_encoder" in state:
+            self.router_mid.load_state_dict(state["pair_mid_encoder"])
+        else:
+            _load_router_with_task_remap(self.router_mid, state["router_mid"], which="router_mid")
+        if "pair_classifier" in state:
+            self.pair_classifier.load_state_dict(state["pair_classifier"], strict=False)
         if "bert_encoder" in state:
             self.bert.load_state_dict(state["bert_encoder"], strict=False)
 
@@ -388,6 +464,8 @@ class JointAnswerSupervisionRouterModel(nn.Module):
             p.requires_grad = not freeze_router_first
         for p in self.router_mid.parameters():
             p.requires_grad = not freeze_router_mid
+        for p in self.pair_classifier.parameters():
+            p.requires_grad = not (freeze_router_first and freeze_router_mid)
         for p in self.bert.parameters():
             p.requires_grad = not freeze_bert
 
@@ -399,9 +477,15 @@ class JointAnswerSupervisionRouterModel(nn.Module):
     @torch.no_grad()
     def score_all_route_pairs(
         self,
+        prompt_input_ids: torch.Tensor,
+        prompt_attention_mask: torch.Tensor,
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
         labels: torch.Tensor,
+        targets: Sequence[str],
+        task_names: Sequence[str],
+        llm_tokenizer,
+        score_mode: str,
     ) -> torch.Tensor:
         batch_size = input_ids.size(0)
         num_tasks = len(self.expert_names)
@@ -415,17 +499,65 @@ class JointAnswerSupervisionRouterModel(nn.Module):
                 set_layer_range_expert(self.model, self.first_layer_idx, self.middle_layer_idx - 1, first_eid)
                 set_layer_range_expert(self.model, self.middle_layer_idx, self.num_layers - 1, mid_eid)
 
-                logits = self.model(
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    use_cache=False,
-                    return_dict=True,
-                ).logits
-                combo_loss = compute_sequence_nll(logits=logits, labels=labels)
+                if score_mode == "token_nll":
+                    logits = self.model(
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
+                        use_cache=False,
+                        return_dict=True,
+                    ).logits
+                    combo_loss = compute_dataset_aware_score(
+                        logits=logits,
+                        labels=labels,
+                        prompt_attention_mask=prompt_attention_mask,
+                        targets=targets,
+                        task_names=task_names,
+                        tokenizer=llm_tokenizer,
+                        score_mode=score_mode,
+                    )
+                else:
+                    generated_texts = self.generate_under_current_pair(
+                        prompt_input_ids=prompt_input_ids,
+                        prompt_attention_mask=prompt_attention_mask,
+                        tokenizer=llm_tokenizer,
+                        task_names=task_names,
+                    )
+                    combo_loss = compute_generated_dataset_scores(
+                        predictions=generated_texts,
+                        targets=targets,
+                        task_names=task_names,
+                    ).to(device=input_ids.device, dtype=torch.float32)
                 loss_matrix[:, first_tid, mid_tid] = combo_loss
 
         set_all_experts(self.model, NULL_EXPERT_ID)
         return loss_matrix
+
+    @torch.no_grad()
+    def generate_under_current_pair(
+        self,
+        prompt_input_ids: torch.Tensor,
+        prompt_attention_mask: torch.Tensor,
+        tokenizer,
+        task_names: Sequence[str],
+    ) -> List[str]:
+        max_new_tokens = max(task_max_new_tokens(task) for task in task_names)
+        outputs = self.model.generate(
+            input_ids=prompt_input_ids,
+            attention_mask=prompt_attention_mask,
+            max_new_tokens=max_new_tokens,
+            do_sample=False,
+            num_beams=1,
+            temperature=None,
+            top_p=None,
+            pad_token_id=tokenizer.pad_token_id,
+            eos_token_id=tokenizer.eos_token_id,
+        )
+        prompt_seq_len = prompt_input_ids.size(1)
+        texts = []
+        for idx in range(outputs.size(0)):
+            new_tokens = outputs[idx, prompt_seq_len:]
+            texts.append(tokenizer.decode(new_tokens, skip_special_tokens=True).strip())
+        return texts
 
     def forward_router(
         self,
@@ -434,25 +566,30 @@ class JointAnswerSupervisionRouterModel(nn.Module):
         bert_token_type_ids: Optional[torch.Tensor],
         first_vec: torch.Tensor,
         mid_vec: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         bert_prev, bert_last = self.bert(
             input_ids=bert_input_ids,
             attention_mask=bert_attention_mask,
             token_type_ids=bert_token_type_ids,
         )
-        logits_first = self.router_first(
+        first_feat = self.router_first(
             llama_vec=first_vec,
             bert_prev=bert_prev,
             bert_last=bert_last,
             bert_attention_mask=bert_attention_mask,
         )
-        logits_mid = self.router_mid(
+        mid_feat = self.router_mid(
             llama_vec=mid_vec,
             bert_prev=bert_prev,
             bert_last=bert_last,
             bert_attention_mask=bert_attention_mask,
         )
-        return logits_first, logits_mid
+        pair_feat = torch.cat([first_feat, mid_feat], dim=-1)
+        pair_logits = self.pair_classifier(pair_feat)
+        pair_prob = torch.softmax(pair_logits, dim=-1).view(pair_logits.size(0), len(self.expert_names), len(self.expert_names))
+        first_logits = torch.log(pair_prob.sum(dim=2).clamp_min(1e-12))
+        mid_logits = torch.log(pair_prob.sum(dim=1).clamp_min(1e-12))
+        return pair_logits, first_logits, mid_logits
 
 
 def build_lm_batch(
@@ -497,8 +634,8 @@ def build_lm_batch(
     for prompt_ids, full_ids, seq_labels in zip(prompt_ids_list, full_seqs, full_labels):
         prompt_ids = prompt_ids[:max_prompt_len]
         prompt_pad = max_prompt_len - len(prompt_ids)
-        prompt_input_ids.append(prompt_ids + [pad_id] * prompt_pad)
-        prompt_attention_masks.append([1] * len(prompt_ids) + [0] * prompt_pad)
+        prompt_input_ids.append([pad_id] * prompt_pad + prompt_ids)
+        prompt_attention_masks.append([0] * prompt_pad + [1] * len(prompt_ids))
 
         pad_len = max_full_len - len(full_ids)
         input_ids.append(full_ids + [pad_id] * pad_len)
@@ -529,36 +666,252 @@ def compute_sequence_nll(logits: torch.Tensor, labels: torch.Tensor) -> torch.Te
     return (per_token_loss * valid_mask).sum(dim=1) / denom
 
 
-def compute_router_loss(
+def _first_token_id(tokenizer, text: str) -> Optional[int]:
+    ids = tokenizer.encode(text, add_special_tokens=False)
+    return ids[0] if ids else None
+
+
+def compute_mcq_accuracy_proxy(
+    logits: torch.Tensor,
+    prompt_attention_mask: torch.Tensor,
+    targets: Sequence[str],
+    tokenizer,
+) -> torch.Tensor:
+    option_token_ids = []
+    for option in ["A", "B", "C", "D"]:
+        token_id = _first_token_id(tokenizer, option)
+        if token_id is None:
+            raise ValueError(f"Tokenizer cannot encode MCQ option {option!r}")
+        option_token_ids.append(token_id)
+    option_token_ids_tensor = torch.tensor(option_token_ids, dtype=torch.long, device=logits.device)
+
+    prompt_lens = prompt_attention_mask.sum(dim=1).clamp_min(1)
+    batch_idx = torch.arange(logits.size(0), device=logits.device)
+    answer_logits = logits[batch_idx, prompt_lens - 1, :]
+    option_logits = answer_logits.index_select(dim=-1, index=option_token_ids_tensor)
+    pred_idx = option_logits.argmax(dim=-1)
+
+    target_indices = []
+    for target in targets:
+        clean = str(target).strip().upper()[:1]
+        if clean not in {"A", "B", "C", "D"}:
+            target_indices.append(0)
+        else:
+            target_indices.append(ord(clean) - ord("A"))
+    target_idx_tensor = torch.tensor(target_indices, dtype=torch.long, device=logits.device)
+    correct = (pred_idx == target_idx_tensor).to(torch.float32)
+
+    log_probs = torch.log_softmax(option_logits, dim=-1)
+    correct_nll = -log_probs.gather(dim=-1, index=target_idx_tensor.unsqueeze(-1)).squeeze(-1)
+    return (1.0 - correct) + 1e-3 * correct_nll
+
+
+def normalize_qa_text(text: str) -> str:
+    text = str(text).strip().lower()
+    text = re.sub(r"\s+", " ", text)
+    text = re.sub(r"^[\"'“”‘’]+|[\"'“”‘’]+$", "", text)
+    return text
+
+
+def squad20_postprocess_local(text: str) -> str:
+    text = str(text)
+    text = text.split("\n")[0].lower()
+    if "answer is" in text:
+        text = text.split("answer is")[-1]
+    return general_postprocess(text).lower()
+
+
+def extract_first_option(text: str, options: str = "ABCD") -> str:
+    pattern = r"\b(" + "|".join(re.escape(ch) for ch in options) + r")\b"
+    matches = re.findall(pattern, str(text).upper())
+    return matches[0] if matches else ""
+
+
+def sst2_postprocess_local(text: str) -> str:
+    t = normalize_qa_text(text)
+    if re.fullmatch(r"\s*positive\s*", t):
+        return "1"
+    if re.fullmatch(r"\s*negative\s*", t):
+        return "0"
+    if re.search(r"\b(sentiment|tone|feeling)\b.*\bpositive\b", t):
+        return "1"
+    if re.search(r"\b(sentiment|tone|feeling)\b.*\bnegative\b", t):
+        return "0"
+    labels = re.findall(r"\b(positive|negative)\b", t)
+    if labels:
+        return "1" if labels[-1] == "positive" else "0"
+    return ""
+
+
+def boolq_postprocess_local(text: str) -> str:
+    text = str(text)
+    upper = text.upper()
+    if re.search(r"\bA\b", upper):
+        return "A"
+    if re.search(r"\bB\b", upper):
+        return "B"
+    t = normalize_qa_text(text)
+    if "yes" in t or t == "true":
+        return "A"
+    if "no" in t or t == "false":
+        return "B"
+    return ""
+
+
+def sacrebleu_score(prediction: str, reference: str) -> float:
+    prediction = str(prediction).strip()
+    reference = str(reference).strip()
+    if not prediction:
+        return 0.0
+    return float(BLEU_SCORER.sentence_score(prediction, [reference]).score)
+
+
+def task_max_new_tokens(task_name: str) -> int:
+    task_name = str(task_name)
+    if task_name in MCQ_STYLE_TASKS:
+        return 4
+    if task_name in BINARY_STYLE_TASKS:
+        return 4
+    if task_name in QA_STYLE_TASKS:
+        return 32
+    if task_name in TRANSLATION_STYLE_TASKS:
+        return 128
+    return 32
+
+
+def compute_generated_dataset_scores(
+    predictions: Sequence[str],
+    targets: Sequence[str],
+    task_names: Sequence[str],
+) -> torch.Tensor:
+    scores = []
+    for pred, target, task in zip(predictions, targets, task_names):
+        task = str(task)
+        family = TASK_SCORE_FAMILY.get(task)
+        if family == "mcq_abcd":
+            score = 0.0 if extract_first_option(pred, options="ABCD") == str(target).strip().upper()[:1] else 1.0
+        elif family == "mcq_ab":
+            score = 0.0 if extract_first_option(pred, options="AB") == str(target).strip().upper()[:1] else 1.0
+        elif family == "mcq_abc":
+            score = 0.0 if extract_first_option(pred, options="ABC") == str(target).strip().upper()[:1] else 1.0
+        elif family == "sst2_label":
+            gold = "1" if normalize_qa_text(target) in {"positive", "1"} else "0"
+            score = 0.0 if sst2_postprocess_local(pred) == gold else 1.0
+        elif family == "boolq_label":
+            gold_norm = normalize_qa_text(target)
+            if gold_norm in {"a", "yes", "true", "1"}:
+                gold = "A"
+            else:
+                gold = "B"
+            score = 0.0 if boolq_postprocess_local(pred) == gold else 1.0
+        elif family == "squad20_em":
+            score = 0.0 if squad20_postprocess_local(pred) == squad20_postprocess_local(target) else 1.0
+        elif family == "translation_bleu":
+            bleu = sacrebleu_score(pred, target)
+            score = 1.0 - (bleu / 100.0)
+        else:
+            score = 0.0 if normalize_qa_text(pred) == normalize_qa_text(target) else 1.0
+        scores.append(score)
+    return torch.tensor(scores, dtype=torch.float32)
+
+
+def compute_dataset_aware_score(
+    logits: torch.Tensor,
+    labels: torch.Tensor,
+    prompt_attention_mask: torch.Tensor,
+    targets: Sequence[str],
+    task_names: Sequence[str],
+    tokenizer,
+    score_mode: str,
+) -> torch.Tensor:
+    score_mode = str(score_mode)
+    base_nll = compute_sequence_nll(logits=logits, labels=labels)
+    if score_mode == "token_nll":
+        return base_nll
+
+    batch_scores = []
+    mcq_proxy = compute_mcq_accuracy_proxy(
+        logits=logits,
+        prompt_attention_mask=prompt_attention_mask,
+        targets=targets,
+        tokenizer=tokenizer,
+    )
+    for idx, task in enumerate(task_names):
+        task = str(task)
+        if score_mode == "dataset_auto":
+            if task in MCQ_STYLE_TASKS:
+                batch_scores.append(mcq_proxy[idx])
+            elif task == "sst2":
+                batch_scores.append(base_nll[idx])
+            elif task in {"squad2", "iwslt2017"}:
+                batch_scores.append(base_nll[idx])
+            else:
+                batch_scores.append(base_nll[idx])
+        else:
+            raise ValueError(f"Unknown score_mode: {score_mode}")
+    return torch.stack(batch_scores, dim=0)
+
+
+def compute_pair_losses(
+    pair_logits: torch.Tensor,
     logits_first: torch.Tensor,
     logits_mid: torch.Tensor,
     loss_matrix: torch.Tensor,
+    mode: str,
     pseudo_ce_weight: float,
-) -> tuple[torch.Tensor, Dict[str, float], torch.Tensor, torch.Tensor]:
-    prob_first = torch.softmax(logits_first, dim=-1)
-    prob_mid = torch.softmax(logits_mid, dim=-1)
-    joint_prob = prob_first.unsqueeze(2) * prob_mid.unsqueeze(1)
-    expected_loss = (joint_prob * loss_matrix).sum(dim=(1, 2)).mean()
-
-    flat_best = loss_matrix.view(loss_matrix.size(0), -1).argmin(dim=-1)
+    margin: float,
+) -> tuple[torch.Tensor, Dict[str, float], torch.Tensor, torch.Tensor, torch.Tensor]:
+    mode = str(mode)
+    flat_loss = loss_matrix.view(loss_matrix.size(0), -1)
+    flat_best = flat_loss.argmin(dim=-1)
     best_first = flat_best // loss_matrix.size(2)
     best_mid = flat_best % loss_matrix.size(2)
+    pair_prob = torch.softmax(pair_logits, dim=-1)
+    expected_loss = (pair_prob * flat_loss).sum(dim=-1).mean()
 
-    total_loss = expected_loss
-    ce_first = torch.tensor(0.0, device=logits_first.device)
-    ce_mid = torch.tensor(0.0, device=logits_first.device)
-    if pseudo_ce_weight > 0:
-        ce_first = nn.functional.cross_entropy(logits_first, best_first)
-        ce_mid = nn.functional.cross_entropy(logits_mid, best_mid)
-        total_loss = total_loss + pseudo_ce_weight * 0.5 * (ce_first + ce_mid)
+    sorted_loss, _ = flat_loss.sort(dim=-1)
+    if flat_loss.size(1) > 1:
+        margin_mask = (sorted_loss[:, 1] - sorted_loss[:, 0]) >= float(margin)
+    else:
+        margin_mask = torch.ones_like(flat_best, dtype=torch.bool)
+
+    ce_pair_all = nn.functional.cross_entropy(pair_logits, flat_best, reduction="none")
+    ce_first_all = nn.functional.cross_entropy(logits_first, best_first, reduction="none")
+    ce_mid_all = nn.functional.cross_entropy(logits_mid, best_mid, reduction="none")
+    ce_pair = ce_pair_all[margin_mask].mean() if margin_mask.any() else torch.tensor(0.0, device=pair_logits.device)
+    ce_first = ce_first_all[margin_mask].mean() if margin_mask.any() else torch.tensor(0.0, device=logits_first.device)
+    ce_mid = ce_mid_all[margin_mask].mean() if margin_mask.any() else torch.tensor(0.0, device=logits_first.device)
+    margin_active = float(margin_mask.float().mean().item())
+
+    if mode == "stage1":
+        total_loss = ce_first
+    elif mode == "stage2":
+        total_loss = ce_mid
+    elif mode == "joint":
+        total_loss = expected_loss
+        if pseudo_ce_weight > 0 and margin_mask.any():
+            total_loss = total_loss + pseudo_ce_weight * ce_pair
+        metrics = {
+            "expected_loss": float(expected_loss.detach().item()),
+            "pseudo_ce_pair": float(ce_pair.detach().item()),
+            "pseudo_ce_first": float(ce_first.detach().item()),
+            "pseudo_ce_mid": float(ce_mid.detach().item()),
+            "best_pair_loss": float(sorted_loss[:, 0].mean().item()),
+            "margin_active_ratio": margin_active,
+        }
+        return total_loss, metrics, best_first, best_mid, flat_best
+    else:
+        raise ValueError(f"Unknown training mode: {mode}")
 
     metrics = {
         "expected_loss": float(expected_loss.detach().item()),
+        "pseudo_ce_pair": float(ce_pair.detach().item()),
         "pseudo_ce_first": float(ce_first.detach().item()),
         "pseudo_ce_mid": float(ce_mid.detach().item()),
-        "best_pair_loss": float(loss_matrix.view(loss_matrix.size(0), -1).min(dim=-1).values.mean().item()),
+        "best_pair_loss": float(sorted_loss[:, 0].mean().item()),
+        "margin_active_ratio": margin_active,
     }
-    return total_loss, metrics, best_first, best_mid
+    return total_loss, metrics, best_first, best_mid, flat_best
 
 
 def compute_routing_accuracy_stats(
@@ -626,7 +979,10 @@ def evaluate(
     max_llm_len: int,
     max_bert_len: int,
     add_eos_to_target: bool,
+    train_mode: str,
     pseudo_ce_weight: float,
+    pseudo_ce_margin: float,
+    score_mode: str,
 ) -> Dict[str, float]:
     model.eval()
     total_loss = 0.0
@@ -666,26 +1022,36 @@ def evaluate(
             attention_mask=prompt_attention_mask,
         )
         loss_matrix = model.score_all_route_pairs(
+            prompt_input_ids=prompt_input_ids,
+            prompt_attention_mask=prompt_attention_mask,
             input_ids=input_ids,
             attention_mask=attention_mask,
             labels=labels,
+            targets=batch.targets,
+            task_names=batch.task_names,
+            llm_tokenizer=llm_tokenizer,
+            score_mode=score_mode,
         )
-        logits_first, logits_mid = model.forward_router(
+        pair_logits, logits_first, logits_mid = model.forward_router(
             bert_input_ids=bert_input_ids,
             bert_attention_mask=bert_attention_mask,
             bert_token_type_ids=bert_token_type_ids,
             first_vec=first_vec.to(torch.float32),
             mid_vec=mid_vec.to(torch.float32),
         )
-        loss, _, best_first, best_mid = compute_router_loss(
+        loss, metrics, best_first, best_mid, flat_best = compute_pair_losses(
+            pair_logits=pair_logits,
             logits_first=logits_first,
             logits_mid=logits_mid,
             loss_matrix=loss_matrix,
+            mode=train_mode,
             pseudo_ce_weight=pseudo_ce_weight,
+            margin=pseudo_ce_margin,
         )
 
-        pred_first = logits_first.argmax(dim=-1)
-        pred_mid = logits_mid.argmax(dim=-1)
+        pred_pair = pair_logits.argmax(dim=-1)
+        pred_first = pred_pair // loss_matrix.size(2)
+        pred_mid = pred_pair % loss_matrix.size(2)
         batch_size = pred_first.size(0)
         batch_stats = compute_routing_accuracy_stats(
             pred_first=pred_first,
@@ -699,6 +1065,9 @@ def evaluate(
         total_samples += batch_size
         for key, value in batch_stats.items():
             metric_totals[key] = metric_totals.get(key, 0.0) + value * batch_size
+        for key in ["expected_loss", "pseudo_ce_pair", "pseudo_ce_first", "pseudo_ce_mid", "best_pair_loss", "margin_active_ratio"]:
+            if key in metrics:
+                metric_totals[key] = metric_totals.get(key, 0.0) + metrics[key] * batch_size
 
         if tqdm is not None:
             progress.set_postfix(
@@ -777,6 +1146,9 @@ def main():
     parser.add_argument("--lora_sst2", type=str, default=None)
     parser.add_argument("--lora_piqa", type=str, default=None)
     parser.add_argument("--lora_copa", type=str, default=None)
+    parser.add_argument("--lora_hellaswag", type=str, default=None)
+    parser.add_argument("--lora_boolq", type=str, default=None)
+    parser.add_argument("--lora_siqa", type=str, default=None)
     parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--eval_batch_size", type=int, default=1)
     parser.add_argument("--epochs", type=int, default=3)
@@ -803,7 +1175,10 @@ def main():
     parser.add_argument("--freeze_bert", action="store_true")
     parser.add_argument("--freeze_router_first", action="store_true")
     parser.add_argument("--freeze_router_mid", action="store_true")
+    parser.add_argument("--train_mode", type=str, default="joint", choices=["stage1", "stage2", "joint"])
     parser.add_argument("--pseudo_ce_weight", type=float, default=0.5)
+    parser.add_argument("--pseudo_ce_margin", type=float, default=0.0)
+    parser.add_argument("--score_mode", type=str, default="dataset_auto", choices=["dataset_auto", "token_nll"])
     parser.add_argument("--add_eos_to_target", action="store_true")
     parser.add_argument("--num_workers", type=int, default=0)
     parser.add_argument("--seed", type=int, default=42)
@@ -859,6 +1234,9 @@ def main():
         "sst2": args.lora_sst2,
         "piqa": args.lora_piqa,
         "copa": args.lora_copa,
+        "hellaswag": args.lora_hellaswag,
+        "boolq": args.lora_boolq,
+        "siqa": args.lora_siqa,
     }
     requested_experts = parse_csv_arg(args.expert_names)
     expert_names, expert_name_source = discover_expert_names(requested_experts, all_lora_paths)
@@ -881,6 +1259,7 @@ def main():
     llm_tokenizer = AutoTokenizer.from_pretrained(args.base_model_path)
     if llm_tokenizer.pad_token_id is None:
         llm_tokenizer.pad_token = llm_tokenizer.eos_token
+    llm_tokenizer.padding_side = "left"
     bert_tokenizer = AutoTokenizer.from_pretrained(args.router_bert_init)
 
     train_task_names: List[str] = []
@@ -957,10 +1336,12 @@ def main():
         model.load_router_weights(args.load_router_ckpt_dir)
         print(f"[INFO] loaded router weights from {args.load_router_ckpt_dir}")
 
+    freeze_router_first = args.freeze_router_first or (args.train_mode == "stage2")
+    freeze_router_mid = args.freeze_router_mid or (args.train_mode == "stage1")
     model.set_trainable(
         freeze_bert=args.freeze_bert,
-        freeze_router_first=args.freeze_router_first,
-        freeze_router_mid=args.freeze_router_mid,
+        freeze_router_first=freeze_router_first,
+        freeze_router_mid=freeze_router_mid,
     )
     model.to(device)
 
@@ -969,8 +1350,8 @@ def main():
     print(
         "[INFO] trainable_parts="
         f"bert:{not args.freeze_bert} "
-        f"router_first:{not args.freeze_router_first} "
-        f"router_mid:{not args.freeze_router_mid} "
+        f"router_first:{not freeze_router_first} "
+        f"router_mid:{not freeze_router_mid} "
         f"num_params={trainable_param_count}"
     )
     config = vars(args).copy()
@@ -991,7 +1372,10 @@ def main():
             max_llm_len=args.max_llm_len,
             max_bert_len=args.max_bert_len,
             add_eos_to_target=args.add_eos_to_target,
+            train_mode=args.train_mode,
             pseudo_ce_weight=args.pseudo_ce_weight,
+            pseudo_ce_margin=args.pseudo_ce_margin,
+            score_mode=args.score_mode,
         )
         print(
             f"[EVAL] split={args.eval_split} loss={eval_metrics['loss']:.4f} "
@@ -1067,23 +1451,32 @@ def main():
                     attention_mask=prompt_attention_mask,
                 )
                 loss_matrix = model.score_all_route_pairs(
+                    prompt_input_ids=prompt_input_ids,
+                    prompt_attention_mask=prompt_attention_mask,
                     input_ids=input_ids,
                     attention_mask=attention_mask,
                     labels=labels,
+                    targets=batch.targets,
+                    task_names=batch.task_names,
+                    llm_tokenizer=llm_tokenizer,
+                    score_mode=args.score_mode,
                 )
 
-            logits_first, logits_mid = model.forward_router(
+            pair_logits, logits_first, logits_mid = model.forward_router(
                 bert_input_ids=bert_input_ids,
                 bert_attention_mask=bert_attention_mask,
                 bert_token_type_ids=bert_token_type_ids,
                 first_vec=first_vec.to(torch.float32),
                 mid_vec=mid_vec.to(torch.float32),
             )
-            loss, metrics, best_first, best_mid = compute_router_loss(
+            loss, metrics, best_first, best_mid, flat_best = compute_pair_losses(
+                pair_logits=pair_logits,
                 logits_first=logits_first,
                 logits_mid=logits_mid,
                 loss_matrix=loss_matrix,
+                mode=args.train_mode,
                 pseudo_ce_weight=args.pseudo_ce_weight,
+                margin=args.pseudo_ce_margin,
             )
 
             optimizer.zero_grad()
@@ -1096,9 +1489,10 @@ def main():
             running_count += batch_size
 
             if tqdm is not None:
+                pred_pair = pair_logits.argmax(dim=-1)
                 batch_stats = compute_routing_accuracy_stats(
-                    pred_first=logits_first.argmax(dim=-1),
-                    pred_mid=logits_mid.argmax(dim=-1),
+                    pred_first=pred_pair // loss_matrix.size(2),
+                    pred_mid=pred_pair % loss_matrix.size(2),
                     best_first=best_first,
                     best_mid=best_mid,
                     task_ids=batch.task_ids,
@@ -1113,8 +1507,9 @@ def main():
                 )
 
             if step % 10 == 0 or step == len(train_loader):
-                pred_first = logits_first.argmax(dim=-1)
-                pred_mid = logits_mid.argmax(dim=-1)
+                pred_pair = pair_logits.argmax(dim=-1)
+                pred_first = pred_pair // loss_matrix.size(2)
+                pred_mid = pred_pair % loss_matrix.size(2)
                 batch_stats = compute_routing_accuracy_stats(
                     pred_first=pred_first,
                     pred_mid=pred_mid,
@@ -1143,6 +1538,7 @@ def main():
                             "train/oracle_mid_self_acc": batch_stats["oracle_mid_self_acc"],
                             "train/oracle_self_joint_acc": batch_stats["oracle_self_joint_acc"],
                             "train/oracle_self_pair_acc": batch_stats["oracle_self_pair_acc"],
+                            "train/margin_active_ratio": metrics.get("margin_active_ratio", 0.0),
                             "train/lr": scheduler.get_last_lr()[0],
                         }
                     )
@@ -1164,7 +1560,10 @@ def main():
             max_llm_len=args.max_llm_len,
             max_bert_len=args.max_bert_len,
             add_eos_to_target=args.add_eos_to_target,
+            train_mode=args.train_mode,
             pseudo_ce_weight=args.pseudo_ce_weight,
+            pseudo_ce_margin=args.pseudo_ce_margin,
+            score_mode=args.score_mode,
         )
         print(
             f"[VAL] epoch={epoch} loss={val_metrics['loss']:.4f} "
@@ -1186,8 +1585,9 @@ def main():
             wandb_run.log(payload)
 
         state = {
-            "router_first": model.router_first.state_dict(),
-            "router_mid": model.router_mid.state_dict(),
+            "pair_first_encoder": model.router_first.state_dict(),
+            "pair_mid_encoder": model.router_mid.state_dict(),
+            "pair_classifier": model.pair_classifier.state_dict(),
             "bert_encoder": model.bert.state_dict(),
             "epoch": epoch,
             "val_metrics": val_metrics,
@@ -1212,8 +1612,11 @@ def main():
                     "middle_layer_idx": args.middle_layer_idx,
                     "router_max_len": args.max_bert_len,
                     "router_feature_type": "answer_supervision_prompt_last_valid_token",
+                    "train_mode": args.train_mode,
+                    "score_mode": args.score_mode,
                     "router_pooling": args.router_pooling,
                     "router_pooling_last_k": args.router_pooling_last_k,
+                    "pseudo_ce_margin": args.pseudo_ce_margin,
                     "best_epoch": best_epoch,
                     "best_val_loss": best_val,
                 },
