@@ -5,6 +5,7 @@ import math
 import os
 import random
 import re
+from collections import Counter, defaultdict
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Sequence
 
@@ -19,7 +20,13 @@ try:
 except Exception:
     tqdm = None
 
-from opencompass.utils.text_postprocessors import general_postprocess
+from opencompass.utils.text_postprocessors import (
+    first_capital_postprocess,
+    first_option_postprocess,
+    general_cn_postprocess,
+    general_postprocess,
+    sst2_postprocess,
+)
 
 
 def _load_router_core_module():
@@ -186,6 +193,7 @@ class RouterTrainDataset(Dataset):
                         "text": str(prompt),
                         "source_text": str(row.get("source_text") or prompt),
                         "target": str(target),
+                        "meta": dict(row),
                     }
                 )
 
@@ -227,6 +235,7 @@ class Batch:
     texts: List[str]
     source_texts: List[str]
     targets: List[str]
+    metas: List[Dict]
     task_ids: torch.Tensor
     task_names: List[str]
 
@@ -237,6 +246,7 @@ class Collator:
             texts=[x["text"] for x in batch],
             source_texts=[x["source_text"] for x in batch],
             targets=[x["target"] for x in batch],
+            metas=[x.get("meta", {}) for x in batch],
             task_ids=torch.tensor([x["task_id"] for x in batch], dtype=torch.long),
             task_names=[x["task"] for x in batch],
         )
@@ -483,6 +493,7 @@ class JointAnswerSupervisionRouterModel(nn.Module):
         attention_mask: torch.Tensor,
         labels: torch.Tensor,
         targets: Sequence[str],
+        source_texts: Sequence[str],
         task_names: Sequence[str],
         llm_tokenizer,
         score_mode: str,
@@ -526,6 +537,7 @@ class JointAnswerSupervisionRouterModel(nn.Module):
                         predictions=generated_texts,
                         targets=targets,
                         task_names=task_names,
+                        source_texts=source_texts,
                     ).to(device=input_ids.device, dtype=torch.float32)
                 loss_matrix[:, first_tid, mid_tid] = combo_loss
 
@@ -713,57 +725,193 @@ def normalize_qa_text(text: str) -> str:
     return text
 
 
-def squad20_postprocess_local(text: str) -> str:
-    text = str(text)
-    text = text.split("\n")[0].lower()
-    if "answer is" in text:
-        text = text.split("answer is")[-1]
-    return general_postprocess(text).lower()
-
-
 def extract_first_option(text: str, options: str = "ABCD") -> str:
-    pattern = r"\b(" + "|".join(re.escape(ch) for ch in options) + r")\b"
-    matches = re.findall(pattern, str(text).upper())
-    return matches[0] if matches else ""
+    return first_option_postprocess(str(text), options=options)
 
 
-def sst2_postprocess_local(text: str) -> str:
-    t = normalize_qa_text(text)
-    if re.fullmatch(r"\s*positive\s*", t):
+def _split_option_block(text: str, labels: Sequence[str]) -> Dict[str, str]:
+    positions = []
+    for label in labels:
+        match = re.search(rf"{re.escape(label)}[\.:]\s*", text)
+        if match:
+            positions.append((label, match.start(), match.end()))
+    if len(positions) != len(labels):
+        return {}
+    positions.sort(key=lambda item: item[1])
+    parsed = {}
+    for idx, (label, _start, content_start) in enumerate(positions):
+        next_start = positions[idx + 1][1] if idx + 1 < len(positions) else len(text)
+        parsed[label] = text[content_start:next_start].strip()
+    return parsed
+
+
+def _parse_siqa_reference(source_text: str, target: str) -> Optional[Dict]:
+    parsed = _split_option_block(str(source_text), ["A", "B", "C"])
+    if not parsed:
+        return None
+    label = str(target).strip().upper()[:1]
+    if label not in parsed:
+        return None
+    return {
+        "candidates": [
+            [f"A. {parsed['A']}", "A", parsed["A"]],
+            [f"B. {parsed['B']}", "B", parsed["B"]],
+            [f"C. {parsed['C']}", "C", parsed["C"]],
+        ],
+        "label": ord(label) - ord("A"),
+    }
+
+
+def _parse_medmcqa_options(source_text: str) -> Dict[str, str]:
+    return _split_option_block(str(source_text), ["A", "B", "C", "D"])
+
+
+def _normalize_sst2_label(text: str) -> str:
+    value = str(text).strip().lower()
+    if value in {"1", "positive"}:
         return "1"
-    if re.fullmatch(r"\s*negative\s*", t):
+    if value in {"0", "negative"}:
         return "0"
-    if re.search(r"\b(sentiment|tone|feeling)\b.*\bpositive\b", t):
-        return "1"
-    if re.search(r"\b(sentiment|tone|feeling)\b.*\bnegative\b", t):
-        return "0"
-    labels = re.findall(r"\b(positive|negative)\b", t)
-    if labels:
-        return "1" if labels[-1] == "positive" else "0"
-    return ""
+    return value
 
 
-def boolq_postprocess_local(text: str) -> str:
-    text = str(text)
-    upper = text.upper()
-    if re.search(r"\bA\b", upper):
+def _normalize_boolq_label(text: str) -> str:
+    value = str(text).strip().lower()
+    if value in {"a", "yes", "true", "1"}:
         return "A"
-    if re.search(r"\bB\b", upper):
+    if value in {"b", "no", "false", "0"}:
         return "B"
-    t = normalize_qa_text(text)
-    if "yes" in t or t == "true":
-        return "A"
-    if "no" in t or t == "false":
-        return "B"
-    return ""
+    return value.upper()[:1]
 
 
-def sacrebleu_score(prediction: str, reference: str) -> float:
-    prediction = str(prediction).strip()
-    reference = str(reference).strip()
-    if not prediction:
-        return 0.0
-    return float(BLEU_SCORER.sentence_score(prediction, [reference]).score)
+def _parse_squad_references(target: str) -> List[str]:
+    raw = target
+    if isinstance(raw, (list, tuple)):
+        refs = [str(item) for item in raw]
+    else:
+        refs = []
+        text = str(raw).strip()
+        if text.startswith("[") and text.endswith("]"):
+            try:
+                parsed = json.loads(text)
+                if isinstance(parsed, list):
+                    refs = [str(item) for item in parsed]
+            except Exception:
+                refs = []
+        if not refs:
+            refs = [text]
+    refs = [ref for ref in refs if str(ref).strip()]
+    return refs or [str(target).strip()]
+
+
+def _medmcqa_answer_cleansing(prediction: str, num_options: int = 4) -> str:
+    text = str(prediction)
+    for unwanted_phrase in [
+        "I understand",
+        "A through J",
+        "A through E",
+        "A through D",
+    ]:
+        text = text.replace(unwanted_phrase, "")
+    options = [chr(65 + i) for i in range(num_options)]
+    options_pattern = r"\b(" + "|".join(options) + r")\b"
+    matches = re.findall(options_pattern, text)
+    if not matches:
+        return ""
+    return matches[0].rstrip(".")
+
+
+def _compute_siqa_edit_distance_loss(prediction: str, reference: Dict) -> float:
+    try:
+        from rapidfuzz.distance import Levenshtein
+    except Exception:
+        pred = str(prediction)
+        candidates = reference["candidates"][reference["label"]]
+        golds = candidates if isinstance(candidates, list) else [candidates]
+        return 0.0 if any(pred == cand for cand in golds) else 1.0
+
+    pred = str(prediction)
+    dists = []
+    for candidates in reference["candidates"]:
+        if isinstance(candidates, str):
+            dists.append(Levenshtein.distance(pred, candidates))
+        else:
+            dists.append(min(Levenshtein.distance(pred, cand) for cand in candidates))
+    pred_idx = min(range(len(dists)), key=lambda idx: dists[idx])
+    return 0.0 if pred_idx == int(reference["label"]) else 1.0
+
+
+def _compute_squad20_em_loss(prediction: str, references: Sequence[str]) -> float:
+    pred = str(prediction).split("\n")[0].lower()
+    if "answer is" in pred:
+        pred = pred.split("answer is")[-1]
+    pred = general_postprocess(pred).lower()
+    refs = [general_postprocess(str(ref)).lower() for ref in references]
+    return 0.0 if any(ref == pred for ref in refs) else 1.0
+
+
+def _compute_translation_bleu_loss(prediction: str, reference: str) -> float:
+    pred = general_cn_postprocess(str(prediction))
+    ref = general_cn_postprocess(str(reference))
+    if not pred:
+        return 1.0
+    bleu = float(BLEU_SCORER.sentence_score(pred, [ref]).score)
+    return 1.0 - bleu / 100.0
+
+
+def compute_official_evaluator_sample_score(
+    prediction: str,
+    target: str,
+    task_name: str,
+    source_text: Optional[str] = None,
+) -> float:
+    task = str(task_name)
+    family = TASK_SCORE_FAMILY.get(task)
+
+    if family == "mcq_abcd":
+        if task == "medmcqa":
+            options = _parse_medmcqa_options(source_text or "")
+            if not options:
+                return 1.0
+            pred = _medmcqa_answer_cleansing(prediction, num_options=4)
+            gold = str(target).strip().upper()[:1]
+            return 0.0 if pred == gold else 1.0
+        pred = first_option_postprocess(str(prediction), options="ABCD")
+        gold = str(target).strip().upper()[:1]
+        return 0.0 if pred == gold else 1.0
+
+    if family == "mcq_ab":
+        pred = first_option_postprocess(str(prediction), options="AB")
+        gold = str(target).strip().upper()[:1]
+        return 0.0 if pred == gold else 1.0
+
+    if family == "mcq_abc":
+        reference = _parse_siqa_reference(source_text or "", target)
+        if reference is None:
+            pred = first_option_postprocess(str(prediction), options="ABC")
+            gold = str(target).strip().upper()[:1]
+            return 0.0 if pred == gold else 1.0
+        return _compute_siqa_edit_distance_loss(prediction, reference)
+
+    if family == "sst2_label":
+        pred = sst2_postprocess(str(prediction))
+        gold = _normalize_sst2_label(target)
+        return 0.0 if pred == gold else 1.0
+
+    if family == "boolq_label":
+        pred = first_capital_postprocess(str(prediction))
+        if pred not in {"A", "B"}:
+            pred = _normalize_boolq_label(prediction)
+        gold = _normalize_boolq_label(target)
+        return 0.0 if pred == gold else 1.0
+
+    if family == "squad20_em":
+        return _compute_squad20_em_loss(prediction, _parse_squad_references(target))
+
+    if family == "translation_bleu":
+        return _compute_translation_bleu_loss(prediction, target)
+
+    return 0.0 if normalize_qa_text(prediction) == normalize_qa_text(target) else 1.0
 
 
 def task_max_new_tokens(task_name: str) -> int:
@@ -783,35 +931,19 @@ def compute_generated_dataset_scores(
     predictions: Sequence[str],
     targets: Sequence[str],
     task_names: Sequence[str],
+    source_texts: Optional[Sequence[str]] = None,
 ) -> torch.Tensor:
     scores = []
-    for pred, target, task in zip(predictions, targets, task_names):
-        task = str(task)
-        family = TASK_SCORE_FAMILY.get(task)
-        if family == "mcq_abcd":
-            score = 0.0 if extract_first_option(pred, options="ABCD") == str(target).strip().upper()[:1] else 1.0
-        elif family == "mcq_ab":
-            score = 0.0 if extract_first_option(pred, options="AB") == str(target).strip().upper()[:1] else 1.0
-        elif family == "mcq_abc":
-            score = 0.0 if extract_first_option(pred, options="ABC") == str(target).strip().upper()[:1] else 1.0
-        elif family == "sst2_label":
-            gold = "1" if normalize_qa_text(target) in {"positive", "1"} else "0"
-            score = 0.0 if sst2_postprocess_local(pred) == gold else 1.0
-        elif family == "boolq_label":
-            gold_norm = normalize_qa_text(target)
-            if gold_norm in {"a", "yes", "true", "1"}:
-                gold = "A"
-            else:
-                gold = "B"
-            score = 0.0 if boolq_postprocess_local(pred) == gold else 1.0
-        elif family == "squad20_em":
-            score = 0.0 if squad20_postprocess_local(pred) == squad20_postprocess_local(target) else 1.0
-        elif family == "translation_bleu":
-            bleu = sacrebleu_score(pred, target)
-            score = 1.0 - (bleu / 100.0)
-        else:
-            score = 0.0 if normalize_qa_text(pred) == normalize_qa_text(target) else 1.0
-        scores.append(score)
+    if source_texts is None:
+        source_texts = [""] * len(predictions)
+    for pred, target, task, source_text in zip(predictions, targets, task_names, source_texts):
+        scores.append(
+            compute_official_evaluator_sample_score(
+                prediction=pred,
+                target=target,
+                task_name=task,
+                source_text=source_text,
+            ))
     return torch.tensor(scores, dtype=torch.float32)
 
 
@@ -953,6 +1085,143 @@ def compute_routing_accuracy_stats(
     }
 
 
+def build_routing_summary(
+    pred_first_all: Sequence[int],
+    pred_mid_all: Sequence[int],
+    best_first_all: Sequence[int],
+    best_mid_all: Sequence[int],
+    task_ids_all: Sequence[int],
+    expert_names: Sequence[str],
+    top_k: int = 5,
+) -> Dict:
+    if not pred_first_all:
+        return {"num_samples": 0, "top_pred_pairs": [], "per_task": []}
+
+    stats = compute_routing_accuracy_stats(
+        pred_first=torch.tensor(pred_first_all, dtype=torch.long),
+        pred_mid=torch.tensor(pred_mid_all, dtype=torch.long),
+        best_first=torch.tensor(best_first_all, dtype=torch.long),
+        best_mid=torch.tensor(best_mid_all, dtype=torch.long),
+        task_ids=torch.tensor(task_ids_all, dtype=torch.long),
+    )
+
+    num_samples = len(pred_first_all)
+    pred_pair_counter = Counter()
+    gold_pair_counter = Counter()
+    task_bucket: Dict[int, Dict[str, Counter]] = defaultdict(
+        lambda: {
+            "pred_first": Counter(),
+            "pred_mid": Counter(),
+            "pred_pair": Counter(),
+            "gold_pair": Counter(),
+        }
+    )
+
+    for pred_first, pred_mid, best_first, best_mid, task_id in zip(
+        pred_first_all, pred_mid_all, best_first_all, best_mid_all, task_ids_all
+    ):
+        pred_pair_name = f"{expert_names[pred_first]}->{expert_names[pred_mid]}"
+        gold_pair_name = f"{expert_names[best_first]}->{expert_names[best_mid]}"
+        pred_pair_counter[pred_pair_name] += 1
+        gold_pair_counter[gold_pair_name] += 1
+
+        bucket = task_bucket[int(task_id)]
+        bucket["pred_first"][expert_names[pred_first]] += 1
+        bucket["pred_mid"][expert_names[pred_mid]] += 1
+        bucket["pred_pair"][pred_pair_name] += 1
+        bucket["gold_pair"][gold_pair_name] += 1
+
+    def _counter_rows(counter: Counter, denom: int, limit: int) -> List[Dict]:
+        rows = []
+        for name, count in counter.most_common(limit):
+            rows.append(
+                {
+                    "name": name,
+                    "count": int(count),
+                    "rate": float(count / max(denom, 1)),
+                }
+            )
+        return rows
+
+    per_task = []
+    for task_id, task_name in enumerate(expert_names):
+        mask_count = sum(1 for x in task_ids_all if x == task_id)
+        if mask_count == 0:
+            continue
+
+        pred_self_first = sum(
+            1 for pf, tid in zip(pred_first_all, task_ids_all) if tid == task_id and pf == task_id
+        )
+        pred_self_mid = sum(
+            1 for pm, tid in zip(pred_mid_all, task_ids_all) if tid == task_id and pm == task_id
+        )
+        gold_self_pair = sum(
+            1
+            for bf, bm, tid in zip(best_first_all, best_mid_all, task_ids_all)
+            if tid == task_id and bf == task_id and bm == task_id
+        )
+
+        bucket = task_bucket[task_id]
+        per_task.append(
+            {
+                "task": task_name,
+                "count": int(mask_count),
+                "pred_self_first_rate": float(pred_self_first / mask_count),
+                "pred_self_mid_rate": float(pred_self_mid / mask_count),
+                "gold_self_pair_rate": float(gold_self_pair / mask_count),
+                "top_pred_first": _counter_rows(bucket["pred_first"], mask_count, limit=3),
+                "top_pred_mid": _counter_rows(bucket["pred_mid"], mask_count, limit=3),
+                "top_pred_pairs": _counter_rows(bucket["pred_pair"], mask_count, limit=3),
+                "top_gold_pairs": _counter_rows(bucket["gold_pair"], mask_count, limit=3),
+            }
+        )
+
+    summary = {
+        "num_samples": int(num_samples),
+        "first_acc": float(stats["first_acc"]),
+        "mid_acc": float(stats["mid_acc"]),
+        "pair_acc": float(stats["pair_acc"]),
+        "self_first_acc": float(stats["self_first_acc"]),
+        "self_mid_acc": float(stats["self_mid_acc"]),
+        "self_pair_acc": float(stats["self_pair_acc"]),
+        "oracle_self_pair_acc": float(stats["oracle_self_pair_acc"]),
+        "top_pred_pairs": _counter_rows(pred_pair_counter, num_samples, limit=top_k),
+        "top_gold_pairs": _counter_rows(gold_pair_counter, num_samples, limit=top_k),
+        "per_task": per_task,
+    }
+    return summary
+
+
+def print_routing_summary(tag: str, summary: Dict):
+    if int(summary.get("num_samples", 0)) <= 0:
+        print(f"[ROUTE][{tag}] no samples")
+        return
+
+    top_pairs = ", ".join(
+        f"{row['name']}:{row['rate']:.2%}" for row in summary.get("top_pred_pairs", [])[:3]
+    )
+    print(
+        f"[ROUTE][{tag}] pair_acc={summary.get('pair_acc', 0.0):.4f} "
+        f"self_pair={summary.get('self_pair_acc', 0.0):.4f} "
+        f"oracle_self_pair={summary.get('oracle_self_pair_acc', 0.0):.4f} "
+        f"top_pred_pairs={top_pairs}"
+    )
+    for row in summary.get("per_task", []):
+        top_first = row.get("top_pred_first", [])
+        top_mid = row.get("top_pred_mid", [])
+        top_pair = row.get("top_pred_pairs", [])
+        first_name = top_first[0]["name"] if top_first else "-"
+        mid_name = top_mid[0]["name"] if top_mid else "-"
+        pair_name = top_pair[0]["name"] if top_pair else "-"
+        print(
+            f"[ROUTE][{tag}][{row['task']}] n={row['count']} "
+            f"self_first={row['pred_self_first_rate']:.2%} "
+            f"self_mid={row['pred_self_mid_rate']:.2%} "
+            f"oracle_self_pair={row['gold_self_pair_rate']:.2%} "
+            f"top_first={first_name} top_mid={mid_name} top_pair={pair_name}"
+        )
+
+
 def save_runtime_compatible_router_bundle(
     model: JointAnswerSupervisionRouterModel,
     bert_tokenizer,
@@ -988,6 +1257,11 @@ def evaluate(
     total_loss = 0.0
     total_samples = 0
     metric_totals: Dict[str, float] = {}
+    pred_first_all: List[int] = []
+    pred_mid_all: List[int] = []
+    best_first_all: List[int] = []
+    best_mid_all: List[int] = []
+    task_ids_all: List[int] = []
 
     progress = make_progress(loader, total=len(loader), desc="eval")
     for batch in progress:
@@ -1028,6 +1302,7 @@ def evaluate(
             attention_mask=attention_mask,
             labels=labels,
             targets=batch.targets,
+            source_texts=batch.source_texts,
             task_names=batch.task_names,
             llm_tokenizer=llm_tokenizer,
             score_mode=score_mode,
@@ -1060,6 +1335,11 @@ def evaluate(
             best_mid=best_mid,
             task_ids=batch.task_ids,
         )
+        pred_first_all.extend(pred_first.cpu().tolist())
+        pred_mid_all.extend(pred_mid.cpu().tolist())
+        best_first_all.extend(best_first.cpu().tolist())
+        best_mid_all.extend(best_mid.cpu().tolist())
+        task_ids_all.extend(batch.task_ids.cpu().tolist())
 
         total_loss += loss.item() * batch_size
         total_samples += batch_size
@@ -1081,6 +1361,14 @@ def evaluate(
     result = {"loss": total_loss / denom}
     for key, value in metric_totals.items():
         result[key] = value / denom
+    result["routing_summary"] = build_routing_summary(
+        pred_first_all=pred_first_all,
+        pred_mid_all=pred_mid_all,
+        best_first_all=best_first_all,
+        best_mid_all=best_mid_all,
+        task_ids_all=task_ids_all,
+        expert_names=model.expert_names,
+    )
     return result
 
 
@@ -1391,8 +1679,19 @@ def main():
             f"oracle_mid_self={eval_metrics['oracle_mid_self_acc']:.4f} "
             f"oracle_self_pair={eval_metrics['oracle_self_pair_acc']:.4f}"
         )
+        print_routing_summary(tag=f"EVAL-{args.eval_split}", summary=eval_metrics["routing_summary"])
+        save_json(
+            eval_metrics["routing_summary"],
+            os.path.join(args.output_dir, f"routing_summary_{args.eval_split}.json"),
+        )
         if wandb_run is not None:
-            wandb_run.log({f"eval/{k}": v for k, v in eval_metrics.items()})
+            wandb_run.log(
+                {
+                    f"eval/{k}": v
+                    for k, v in eval_metrics.items()
+                    if isinstance(v, (int, float))
+                }
+            )
             wandb_run.finish()
         return
 
@@ -1412,6 +1711,11 @@ def main():
         model.train()
         running_loss = 0.0
         running_count = 0
+        train_pred_first_all: List[int] = []
+        train_pred_mid_all: List[int] = []
+        train_best_first_all: List[int] = []
+        train_best_mid_all: List[int] = []
+        train_task_ids_all: List[int] = []
 
         train_progress = make_progress(
             train_loader,
@@ -1457,6 +1761,7 @@ def main():
                     attention_mask=attention_mask,
                     labels=labels,
                     targets=batch.targets,
+                    source_texts=batch.source_texts,
                     task_names=batch.task_names,
                     llm_tokenizer=llm_tokenizer,
                     score_mode=args.score_mode,
@@ -1487,12 +1792,19 @@ def main():
             batch_size = len(batch.texts)
             running_loss += loss.item() * batch_size
             running_count += batch_size
+            pred_pair = pair_logits.argmax(dim=-1)
+            pred_first = pred_pair // loss_matrix.size(2)
+            pred_mid = pred_pair % loss_matrix.size(2)
+            train_pred_first_all.extend(pred_first.detach().cpu().tolist())
+            train_pred_mid_all.extend(pred_mid.detach().cpu().tolist())
+            train_best_first_all.extend(best_first.detach().cpu().tolist())
+            train_best_mid_all.extend(best_mid.detach().cpu().tolist())
+            train_task_ids_all.extend(batch.task_ids.cpu().tolist())
 
             if tqdm is not None:
-                pred_pair = pair_logits.argmax(dim=-1)
                 batch_stats = compute_routing_accuracy_stats(
-                    pred_first=pred_pair // loss_matrix.size(2),
-                    pred_mid=pred_pair % loss_matrix.size(2),
+                    pred_first=pred_first,
+                    pred_mid=pred_mid,
                     best_first=best_first,
                     best_mid=best_mid,
                     task_ids=batch.task_ids,
@@ -1507,9 +1819,6 @@ def main():
                 )
 
             if step % 10 == 0 or step == len(train_loader):
-                pred_pair = pair_logits.argmax(dim=-1)
-                pred_first = pred_pair // loss_matrix.size(2)
-                pred_mid = pred_pair % loss_matrix.size(2)
                 batch_stats = compute_routing_accuracy_stats(
                     pred_first=pred_first,
                     pred_mid=pred_mid,
@@ -1547,9 +1856,24 @@ def main():
                     f"loss={avg_loss:.4f} expected={metrics['expected_loss']:.4f} "
                     f"best_pair={metrics['best_pair_loss']:.4f} "
                     f"first_acc={batch_stats['first_acc']:.4f} mid_acc={batch_stats['mid_acc']:.4f} "
+                    f"pair_acc={batch_stats['pair_acc']:.4f} "
                     f"self_first={batch_stats['self_first_acc']:.4f} self_mid={batch_stats['self_mid_acc']:.4f} "
                     f"oracle_self_pair={batch_stats['oracle_self_pair_acc']:.4f}"
                 )
+
+        train_routing_summary = build_routing_summary(
+            pred_first_all=train_pred_first_all,
+            pred_mid_all=train_pred_mid_all,
+            best_first_all=train_best_first_all,
+            best_mid_all=train_best_mid_all,
+            task_ids_all=train_task_ids_all,
+            expert_names=expert_names,
+        )
+        print_routing_summary(tag=f"TRAIN-EPOCH{epoch}", summary=train_routing_summary)
+        save_json(
+            train_routing_summary,
+            os.path.join(args.output_dir, f"routing_summary_train_epoch{epoch}.json"),
+        )
 
         val_metrics = evaluate(
             model=model,
@@ -1569,9 +1893,15 @@ def main():
             f"[VAL] epoch={epoch} loss={val_metrics['loss']:.4f} "
             f"first_acc={val_metrics['first_acc']:.4f} "
             f"mid_acc={val_metrics['mid_acc']:.4f} "
+            f"pair_acc={val_metrics['pair_acc']:.4f} "
             f"self_first={val_metrics['self_first_acc']:.4f} "
             f"self_mid={val_metrics['self_mid_acc']:.4f} "
             f"oracle_self_pair={val_metrics['oracle_self_pair_acc']:.4f}"
+        )
+        print_routing_summary(tag=f"VAL-EPOCH{epoch}", summary=val_metrics["routing_summary"])
+        save_json(
+            val_metrics["routing_summary"],
+            os.path.join(args.output_dir, f"routing_summary_val_epoch{epoch}.json"),
         )
         if wandb_run is not None:
             payload = {
@@ -1579,6 +1909,7 @@ def main():
                 "val/loss": val_metrics["loss"],
                 "val/first_acc": val_metrics["first_acc"],
                 "val/mid_acc": val_metrics["mid_acc"],
+                "val/pair_acc": val_metrics["pair_acc"],
                 "val/joint_acc": val_metrics["joint_acc"],
                 "val/best_val": min(best_val, val_metrics["loss"]),
             }
