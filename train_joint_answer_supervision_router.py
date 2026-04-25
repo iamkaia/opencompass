@@ -1,4 +1,5 @@
 import argparse
+import importlib
 import importlib.util
 import json
 import math
@@ -11,7 +12,6 @@ from typing import Dict, List, Optional, Sequence
 
 import torch
 import torch.nn as nn
-from sacrebleu.metrics import BLEU
 from torch.utils.data import DataLoader, Dataset
 from transformers import AutoModelForCausalLM, AutoTokenizer, get_linear_schedule_with_warmup
 
@@ -59,7 +59,6 @@ MCQ_STYLE_TASKS = {"race", "medmcqa", "hellaswag", "piqa", "copa", "siqa"}
 BINARY_STYLE_TASKS = {"sst2", "boolq"}
 QA_STYLE_TASKS = {"squad2", "squad20", "squad2.0"}
 TRANSLATION_STYLE_TASKS = {"iwslt2017"}
-BLEU_SCORER = BLEU(effective_order=True)
 
 TASK_SCORE_FAMILY = {
     "race": "mcq_abcd",
@@ -75,6 +74,35 @@ TASK_SCORE_FAMILY = {
     "squad2.0": "squad20_em",
     "iwslt2017": "translation_bleu",
 }
+
+_OPENCOMPASS_EVAL_RUNTIME = None
+
+
+def _get_opencompass_eval_runtime():
+    global _OPENCOMPASS_EVAL_RUNTIME
+    if _OPENCOMPASS_EVAL_RUNTIME is not None:
+        return _OPENCOMPASS_EVAL_RUNTIME
+
+    try:
+        icl_eval_mod = importlib.import_module("opencompass.openicl.icl_evaluator")
+        medmcqa_mod = importlib.import_module("opencompass.datasets.medmcqa")
+        squad20_mod = importlib.import_module("opencompass.datasets.squad20")
+    except Exception as exc:
+        raise RuntimeError(
+            "Failed to import OpenCompass evaluator runtime. "
+            "Please ensure the training environment can import the same "
+            "OpenCompass package used for evaluation."
+        ) from exc
+
+    _OPENCOMPASS_EVAL_RUNTIME = {
+        "acc": icl_eval_mod.AccEvaluator(),
+        "acc_with_details": icl_eval_mod.AccwithDetailsEvaluator(),
+        "bleu": icl_eval_mod.BleuEvaluator(),
+        "edacc": icl_eval_mod.EDAccEvaluator(),
+        "medmcqa": medmcqa_mod.MedmcqaEvaluator(),
+        "squad20": squad20_mod.SQuAD20Evaluator(),
+    }
+    return _OPENCOMPASS_EVAL_RUNTIME
 
 
 class CompactRouterFeatureEncoder(nn.Module):
@@ -804,67 +832,13 @@ def _parse_squad_references(target: str) -> List[str]:
     return refs or [str(target).strip()]
 
 
-def _medmcqa_answer_cleansing(prediction: str, num_options: int = 4) -> str:
-    text = str(prediction)
-    for unwanted_phrase in [
-        "I understand",
-        "A through J",
-        "A through E",
-        "A through D",
-    ]:
-        text = text.replace(unwanted_phrase, "")
-    options = [chr(65 + i) for i in range(num_options)]
-    options_pattern = r"\b(" + "|".join(options) + r")\b"
-    matches = re.findall(options_pattern, text)
-    if not matches:
-        return ""
-    return matches[0].rstrip(".")
-
-
-def _compute_siqa_edit_distance_loss(prediction: str, reference: Dict) -> float:
-    try:
-        from rapidfuzz.distance import Levenshtein
-    except Exception:
-        pred = str(prediction)
-        candidates = reference["candidates"][reference["label"]]
-        golds = candidates if isinstance(candidates, list) else [candidates]
-        return 0.0 if any(pred == cand for cand in golds) else 1.0
-
-    pred = str(prediction)
-    dists = []
-    for candidates in reference["candidates"]:
-        if isinstance(candidates, str):
-            dists.append(Levenshtein.distance(pred, candidates))
-        else:
-            dists.append(min(Levenshtein.distance(pred, cand) for cand in candidates))
-    pred_idx = min(range(len(dists)), key=lambda idx: dists[idx])
-    return 0.0 if pred_idx == int(reference["label"]) else 1.0
-
-
-def _compute_squad20_em_loss(prediction: str, references: Sequence[str]) -> float:
-    pred = str(prediction).split("\n")[0].lower()
-    if "answer is" in pred:
-        pred = pred.split("answer is")[-1]
-    pred = general_postprocess(pred).lower()
-    refs = [general_postprocess(str(ref)).lower() for ref in references]
-    return 0.0 if any(ref == pred for ref in refs) else 1.0
-
-
-def _compute_translation_bleu_loss(prediction: str, reference: str) -> float:
-    pred = general_cn_postprocess(str(prediction))
-    ref = general_cn_postprocess(str(reference))
-    if not pred:
-        return 1.0
-    bleu = float(BLEU_SCORER.sentence_score(pred, [ref]).score)
-    return 1.0 - bleu / 100.0
-
-
 def compute_official_evaluator_sample_score(
     prediction: str,
     target: str,
     task_name: str,
     source_text: Optional[str] = None,
 ) -> float:
+    runtime = _get_opencompass_eval_runtime()
     task = str(task_name)
     family = TASK_SCORE_FAMILY.get(task)
 
@@ -873,45 +847,74 @@ def compute_official_evaluator_sample_score(
             options = _parse_medmcqa_options(source_text or "")
             if not options:
                 return 1.0
-            pred = _medmcqa_answer_cleansing(prediction, num_options=4)
             gold = str(target).strip().upper()[:1]
-            return 0.0 if pred == gold else 1.0
+            test_set = {
+                "prompt_mode": ["zero-shot"],
+                "options": [[options["A"], options["B"], options["C"], options["D"]]],
+                "label": [gold],
+                "subject_name": [""],
+                "topic_name": [""],
+                "choice_type": [""],
+            }
+            result = runtime["medmcqa"].score([prediction], [gold], test_set)
+            return 1.0 - float(result["accuracy"]) / 100.0
         pred = first_option_postprocess(str(prediction), options="ABCD")
         gold = str(target).strip().upper()[:1]
-        return 0.0 if pred == gold else 1.0
+        if task == "race":
+            result = runtime["acc_with_details"].score(
+                predictions=[pred],
+                references=[gold],
+                origin_prompt=[str(source_text or "")],
+            )
+        else:
+            result = runtime["acc"].score([pred], [gold])
+        return 1.0 - float(result["accuracy"]) / 100.0
 
     if family == "mcq_ab":
         pred = first_option_postprocess(str(prediction), options="AB")
         gold = str(target).strip().upper()[:1]
-        return 0.0 if pred == gold else 1.0
+        result = runtime["acc"].score([pred], [gold])
+        return 1.0 - float(result["accuracy"]) / 100.0
 
     if family == "mcq_abc":
         reference = _parse_siqa_reference(source_text or "", target)
         if reference is None:
             pred = first_option_postprocess(str(prediction), options="ABC")
             gold = str(target).strip().upper()[:1]
-            return 0.0 if pred == gold else 1.0
-        return _compute_siqa_edit_distance_loss(prediction, reference)
+            result = runtime["acc"].score([pred], [gold])
+            return 1.0 - float(result["accuracy"]) / 100.0
+        result = runtime["edacc"].score([prediction], [reference])
+        return 1.0 - float(result["accuracy"]) / 100.0
 
     if family == "sst2_label":
         pred = sst2_postprocess(str(prediction))
         gold = _normalize_sst2_label(target)
-        return 0.0 if pred == gold else 1.0
+        result = runtime["acc"].score([pred], [gold])
+        return 1.0 - float(result["accuracy"]) / 100.0
 
     if family == "boolq_label":
         pred = first_capital_postprocess(str(prediction))
         if pred not in {"A", "B"}:
             pred = _normalize_boolq_label(prediction)
         gold = _normalize_boolq_label(target)
-        return 0.0 if pred == gold else 1.0
+        result = runtime["acc"].score([pred], [gold])
+        return 1.0 - float(result["accuracy"]) / 100.0
 
     if family == "squad20_em":
-        return _compute_squad20_em_loss(prediction, _parse_squad_references(target))
+        result = runtime["squad20"].score([prediction], [_parse_squad_references(target)])
+        return 1.0 - float(result["score"]) / 100.0
 
     if family == "translation_bleu":
-        return _compute_translation_bleu_loss(prediction, target)
+        pred = general_cn_postprocess(str(prediction))
+        ref = general_cn_postprocess(str(target))
+        result = runtime["bleu"].score([pred], [ref])
+        bleu_score = float(result.get("score", 0.0) if isinstance(result, dict) else result)
+        return 1.0 - bleu_score / 100.0
 
-    return 0.0 if normalize_qa_text(prediction) == normalize_qa_text(target) else 1.0
+    pred = normalize_qa_text(prediction)
+    gold = normalize_qa_text(target)
+    result = runtime["acc"].score([pred], [gold])
+    return 1.0 - float(result["accuracy"]) / 100.0
 
 
 def task_max_new_tokens(task_name: str) -> int:

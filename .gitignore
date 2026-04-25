@@ -133,3 +133,7 @@ turbomind/
 
 # aliyun
 core.*
+router_ckpt_*/
+saves/
+.codex
+*ckpt*/
