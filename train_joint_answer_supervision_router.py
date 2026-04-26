@@ -5,7 +5,6 @@ import json
 import math
 import os
 import random
-import re
 from collections import Counter, defaultdict
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Sequence
@@ -21,11 +20,16 @@ except Exception:
     tqdm = None
 
 from opencompass.utils.text_postprocessors import (
-    first_capital_postprocess,
-    first_option_postprocess,
-    general_cn_postprocess,
     general_postprocess,
-    sst2_postprocess,
+)
+from model_backbone_specs import get_decoder_layers, get_pre_attn_norm, infer_backbone_spec
+from task_eval_specs import (
+    TASK_EVAL_SPECS,
+    TaskEvalSpec,
+    apply_postprocessor,
+    normalize_boolq_label,
+    normalize_qa_text,
+    normalize_sst2_label,
 )
 
 
@@ -59,21 +63,6 @@ MCQ_STYLE_TASKS = {"race", "medmcqa", "hellaswag", "piqa", "copa", "siqa"}
 BINARY_STYLE_TASKS = {"sst2", "boolq"}
 QA_STYLE_TASKS = {"squad2", "squad20", "squad2.0"}
 TRANSLATION_STYLE_TASKS = {"iwslt2017"}
-
-TASK_SCORE_FAMILY = {
-    "race": "mcq_abcd",
-    "medmcqa": "mcq_abcd",
-    "hellaswag": "mcq_abcd",
-    "piqa": "mcq_ab",
-    "copa": "mcq_ab",
-    "siqa": "mcq_abc",
-    "sst2": "sst2_label",
-    "boolq": "boolq_label",
-    "squad2": "squad20_em",
-    "squad20": "squad20_em",
-    "squad2.0": "squad20_em",
-    "iwslt2017": "translation_bleu",
-}
 
 _OPENCOMPASS_EVAL_RUNTIME = None
 
@@ -291,6 +280,7 @@ class PromptVectorExtractor(nn.Module):
     ):
         super().__init__()
         self.model = model
+        self.backbone_spec = infer_backbone_spec(model)
         self.first_layer_idx = int(first_layer_idx)
         self.middle_layer_idx = int(middle_layer_idx)
         self.pooling = str(pooling)
@@ -308,8 +298,11 @@ class PromptVectorExtractor(nn.Module):
             self.cached_mid = args[0].detach()
             return None
 
-        self.model.model.layers[self.first_layer_idx].input_layernorm.register_forward_pre_hook(first_pre_hook)
-        self.model.model.layers[self.middle_layer_idx].input_layernorm.register_forward_pre_hook(mid_pre_hook)
+        layers = get_decoder_layers(self.model, spec=self.backbone_spec)
+        get_pre_attn_norm(layers[self.first_layer_idx], self.backbone_spec).register_forward_pre_hook(
+            first_pre_hook)
+        get_pre_attn_norm(layers[self.middle_layer_idx], self.backbone_spec).register_forward_pre_hook(
+            mid_pre_hook)
 
     @staticmethod
     def gather_last_valid(hidden_states: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
@@ -392,6 +385,7 @@ class JointAnswerSupervisionRouterModel(nn.Module):
         self.model.eval()
         for p in self.model.parameters():
             p.requires_grad = False
+        self.backbone_spec = infer_backbone_spec(self.model)
 
         self.model = patch_llama_with_hard_routed_lora(
             self.model,
@@ -404,7 +398,7 @@ class JointAnswerSupervisionRouterModel(nn.Module):
 
         self.first_layer_idx = int(first_layer_idx)
         self.middle_layer_idx = int(middle_layer_idx)
-        self.num_layers = len(self.model.model.layers)
+        self.num_layers = len(get_decoder_layers(self.model, spec=self.backbone_spec))
         self.task_to_expert_id = {task: self.expert2id[task] + 1 for task in self.expert_names}
 
         for task in self.expert_names:
@@ -746,92 +740,6 @@ def compute_mcq_accuracy_proxy(
     return (1.0 - correct) + 1e-3 * correct_nll
 
 
-def normalize_qa_text(text: str) -> str:
-    text = str(text).strip().lower()
-    text = re.sub(r"\s+", " ", text)
-    text = re.sub(r"^[\"'“”‘’]+|[\"'“”‘’]+$", "", text)
-    return text
-
-
-def extract_first_option(text: str, options: str = "ABCD") -> str:
-    return first_option_postprocess(str(text), options=options)
-
-
-def _split_option_block(text: str, labels: Sequence[str]) -> Dict[str, str]:
-    positions = []
-    for label in labels:
-        match = re.search(rf"{re.escape(label)}[\.:]\s*", text)
-        if match:
-            positions.append((label, match.start(), match.end()))
-    if len(positions) != len(labels):
-        return {}
-    positions.sort(key=lambda item: item[1])
-    parsed = {}
-    for idx, (label, _start, content_start) in enumerate(positions):
-        next_start = positions[idx + 1][1] if idx + 1 < len(positions) else len(text)
-        parsed[label] = text[content_start:next_start].strip()
-    return parsed
-
-
-def _parse_siqa_reference(source_text: str, target: str) -> Optional[Dict]:
-    parsed = _split_option_block(str(source_text), ["A", "B", "C"])
-    if not parsed:
-        return None
-    label = str(target).strip().upper()[:1]
-    if label not in parsed:
-        return None
-    return {
-        "candidates": [
-            [f"A. {parsed['A']}", "A", parsed["A"]],
-            [f"B. {parsed['B']}", "B", parsed["B"]],
-            [f"C. {parsed['C']}", "C", parsed["C"]],
-        ],
-        "label": ord(label) - ord("A"),
-    }
-
-
-def _parse_medmcqa_options(source_text: str) -> Dict[str, str]:
-    return _split_option_block(str(source_text), ["A", "B", "C", "D"])
-
-
-def _normalize_sst2_label(text: str) -> str:
-    value = str(text).strip().lower()
-    if value in {"1", "positive"}:
-        return "1"
-    if value in {"0", "negative"}:
-        return "0"
-    return value
-
-
-def _normalize_boolq_label(text: str) -> str:
-    value = str(text).strip().lower()
-    if value in {"a", "yes", "true", "1"}:
-        return "A"
-    if value in {"b", "no", "false", "0"}:
-        return "B"
-    return value.upper()[:1]
-
-
-def _parse_squad_references(target: str) -> List[str]:
-    raw = target
-    if isinstance(raw, (list, tuple)):
-        refs = [str(item) for item in raw]
-    else:
-        refs = []
-        text = str(raw).strip()
-        if text.startswith("[") and text.endswith("]"):
-            try:
-                parsed = json.loads(text)
-                if isinstance(parsed, list):
-                    refs = [str(item) for item in parsed]
-            except Exception:
-                refs = []
-        if not refs:
-            refs = [text]
-    refs = [ref for ref in refs if str(ref).strip()]
-    return refs or [str(target).strip()]
-
-
 def compute_official_evaluator_sample_score(
     prediction: str,
     target: str,
@@ -840,81 +748,46 @@ def compute_official_evaluator_sample_score(
 ) -> float:
     runtime = _get_opencompass_eval_runtime()
     task = str(task_name)
-    family = TASK_SCORE_FAMILY.get(task)
+    spec: Optional[TaskEvalSpec] = TASK_EVAL_SPECS.get(task)
+    if spec is None:
+        pred = normalize_qa_text(prediction)
+        gold = normalize_qa_text(target)
+        result = runtime["acc"].score([pred], [gold])
+        return 1.0 - float(result["accuracy"]) / 100.0
 
-    if family == "mcq_abcd":
-        if task == "medmcqa":
-            options = _parse_medmcqa_options(source_text or "")
-            if not options:
-                return 1.0
-            gold = str(target).strip().upper()[:1]
-            test_set = {
-                "prompt_mode": ["zero-shot"],
-                "options": [[options["A"], options["B"], options["C"], options["D"]]],
-                "label": [gold],
-                "subject_name": [""],
-                "topic_name": [""],
-                "choice_type": [""],
-            }
-            result = runtime["medmcqa"].score([prediction], [gold], test_set)
-            return 1.0 - float(result["accuracy"]) / 100.0
-        pred = first_option_postprocess(str(prediction), options="ABCD")
-        gold = str(target).strip().upper()[:1]
-        if task == "race":
-            result = runtime["acc_with_details"].score(
-                predictions=[pred],
-                references=[gold],
-                origin_prompt=[str(source_text or "")],
-            )
+    processed_prediction = apply_postprocessor([prediction],
+                                               spec.pred_postprocessor)[0]
+    prediction_for_eval = prediction if spec.use_raw_prediction else processed_prediction
+    if spec.reference_adapter is not None:
+        reference = spec.reference_adapter(str(source_text or ""), target)
+    elif task == "sst2":
+        reference = normalize_sst2_label(target)
+    elif task == "boolq":
+        reference = normalize_boolq_label(target)
+    else:
+        reference = target
+
+    score_kwargs = {}
+    if spec.extra_score_kwargs_builder is not None:
+        score_kwargs.update(
+            spec.extra_score_kwargs_builder(str(source_text or ""), target))
+    if "references" not in score_kwargs:
+        score_kwargs["references"] = [reference]
+
+    if spec.dataset_postprocessor is not None and "references" in score_kwargs:
+        refs = score_kwargs["references"]
+        if refs and isinstance(refs[0], list):
+            refs = [apply_postprocessor(ref_list, spec.dataset_postprocessor) for ref_list in refs]
         else:
-            result = runtime["acc"].score([pred], [gold])
-        return 1.0 - float(result["accuracy"]) / 100.0
+            refs = apply_postprocessor(refs, spec.dataset_postprocessor)
+        score_kwargs["references"] = refs
 
-    if family == "mcq_ab":
-        pred = first_option_postprocess(str(prediction), options="AB")
-        gold = str(target).strip().upper()[:1]
-        result = runtime["acc"].score([pred], [gold])
-        return 1.0 - float(result["accuracy"]) / 100.0
-
-    if family == "mcq_abc":
-        reference = _parse_siqa_reference(source_text or "", target)
-        if reference is None:
-            pred = first_option_postprocess(str(prediction), options="ABC")
-            gold = str(target).strip().upper()[:1]
-            result = runtime["acc"].score([pred], [gold])
-            return 1.0 - float(result["accuracy"]) / 100.0
-        result = runtime["edacc"].score([prediction], [reference])
-        return 1.0 - float(result["accuracy"]) / 100.0
-
-    if family == "sst2_label":
-        pred = sst2_postprocess(str(prediction))
-        gold = _normalize_sst2_label(target)
-        result = runtime["acc"].score([pred], [gold])
-        return 1.0 - float(result["accuracy"]) / 100.0
-
-    if family == "boolq_label":
-        pred = first_capital_postprocess(str(prediction))
-        if pred not in {"A", "B"}:
-            pred = _normalize_boolq_label(prediction)
-        gold = _normalize_boolq_label(target)
-        result = runtime["acc"].score([pred], [gold])
-        return 1.0 - float(result["accuracy"]) / 100.0
-
-    if family == "squad20_em":
-        result = runtime["squad20"].score([prediction], [_parse_squad_references(target)])
-        return 1.0 - float(result["score"]) / 100.0
-
-    if family == "translation_bleu":
-        pred = general_cn_postprocess(str(prediction))
-        ref = general_cn_postprocess(str(target))
-        result = runtime["bleu"].score([pred], [ref])
-        bleu_score = float(result.get("score", 0.0) if isinstance(result, dict) else result)
-        return 1.0 - bleu_score / 100.0
-
-    pred = normalize_qa_text(prediction)
-    gold = normalize_qa_text(target)
-    result = runtime["acc"].score([pred], [gold])
-    return 1.0 - float(result["accuracy"]) / 100.0
+    result = runtime[spec.evaluator_key].score(
+        predictions=[prediction_for_eval], **score_kwargs)
+    metric_name = spec.score_family if spec.score_family in result else None
+    if metric_name is None:
+        metric_name = "accuracy" if "accuracy" in result else "score"
+    return 1.0 - float(result[metric_name]) / 100.0
 
 
 def task_max_new_tokens(task_name: str) -> int:
