@@ -8,6 +8,12 @@ import torch.nn as nn
 from safetensors.torch import load_file as safe_load
 from transformers import AutoModel, AutoModelForCausalLM, AutoTokenizer
 
+from model_backbone_specs import (
+    get_decoder_layers,
+    infer_backbone_spec,
+    set_decoder_layer,
+)
+
 
 TASK_NAMES = ["iwslt2017", "medmcqa", "race", "squad2", "sst2"]
 NULL_EXPERT_ID = 0
@@ -51,8 +57,9 @@ class HardRoutedLoRALinear(nn.Module):
         return y + self.scale * d
 
 
-def patch_llama_with_hard_routed_lora(model, num_experts: int, r: int = 8, alpha: int = 16):
-    for layer in model.model.layers:
+def patch_causal_lm_with_hard_routed_lora(model, num_experts: int, r: int = 8, alpha: int = 16):
+    layers = get_decoder_layers(model)
+    for layer in layers:
         mlp = layer.mlp
         for name in ["gate_proj", "up_proj", "down_proj"]:
             base = getattr(mlp, name)
@@ -65,6 +72,10 @@ def patch_llama_with_hard_routed_lora(model, num_experts: int, r: int = 8, alpha
             if isinstance(base, nn.Linear):
                 setattr(attn, name, HardRoutedLoRALinear(base, num_experts=num_experts, r=r, alpha=alpha))
     return model
+
+
+def patch_llama_with_hard_routed_lora(model, num_experts: int, r: int = 8, alpha: int = 16):
+    return patch_causal_lm_with_hard_routed_lora(model, num_experts=num_experts, r=r, alpha=alpha)
 
 
 def set_all_experts(model, eid: int):
@@ -80,7 +91,7 @@ def _unwrap_layer(layer):
 
 
 def set_layer_expert(model, layer_idx: int, eid: int):
-    layer = model.model.layers[layer_idx]
+    layer = get_decoder_layers(model)[layer_idx]
     layer = _unwrap_layer(layer)
 
     for name in ["gate_proj", "up_proj", "down_proj"]:
@@ -97,7 +108,7 @@ def set_layer_expert(model, layer_idx: int, eid: int):
 def set_layer_range_expert(model, start_idx: int, end_idx: int, eid: int):
     if end_idx < start_idx:
         return
-    num_layers = len(model.model.layers)
+    num_layers = len(get_decoder_layers(model))
     start_idx = max(0, int(start_idx))
     end_idx = min(int(end_idx), num_layers - 1)
     for li in range(start_idx, end_idx + 1):
@@ -123,7 +134,7 @@ def load_lora_into_expert(model, adapter_dir: str, expert_id: int):
         mod.A[expert_id].copy_(sd[kA].to(mod.A[expert_id].device, dtype=mod.A[expert_id].dtype))
         mod.B[expert_id].copy_(sd[kB].to(mod.B[expert_id].device, dtype=mod.B[expert_id].dtype))
 
-    for li, layer in enumerate(model.model.layers):
+    for li, layer in enumerate(get_decoder_layers(model)):
         mlp = layer.mlp
         for proj in ["gate_proj", "up_proj", "down_proj"]:
             mod = getattr(mlp, proj)
@@ -279,9 +290,10 @@ class UnifiedMoECoreInternalRouterCompact:
         self.model.config.pad_token_id = self.tokenizer.pad_token_id
         self.model.config.eos_token_id = self.tokenizer.eos_token_id
 
-        self.num_layers = len(self.model.model.layers)
+        self.backbone_spec = infer_backbone_spec(self.model)
+        self.num_layers = len(get_decoder_layers(self.model, spec=self.backbone_spec))
 
-        self.model = patch_llama_with_hard_routed_lora(
+        self.model = patch_causal_lm_with_hard_routed_lora(
             self.model,
             num_experts=1 + len(self.task_names),
             r=r,
@@ -330,15 +342,15 @@ class UnifiedMoECoreInternalRouterCompact:
         self.cached_bert_last = None
         self.cached_bert_mask = None
 
-        base_first = self.model.model.layers[self.first_layer_idx]
-        self.model.model.layers[self.first_layer_idx] = BeforeAttentionRouterWrapper(
+        base_first = get_decoder_layers(self.model, spec=self.backbone_spec)[self.first_layer_idx]
+        set_decoder_layer(self.model, self.first_layer_idx, BeforeAttentionRouterWrapper(
             base_first, self, which="first"
-        )
+        ), spec=self.backbone_spec)
 
-        base_mid = self.model.model.layers[self.middle_layer_idx]
-        self.model.model.layers[self.middle_layer_idx] = BeforeAttentionRouterWrapper(
+        base_mid = get_decoder_layers(self.model, spec=self.backbone_spec)[self.middle_layer_idx]
+        set_decoder_layer(self.model, self.middle_layer_idx, BeforeAttentionRouterWrapper(
             base_mid, self, which="mid"
-        )
+        ), spec=self.backbone_spec)
 
     def _reset_runtime_cache(self):
         self.cached_first_eid = None
