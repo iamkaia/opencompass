@@ -446,12 +446,27 @@ class JointAnswerSupervisionRouterModel(nn.Module):
         state = torch.load(os.path.join(ckpt_dir, "router_heads.pt"), map_location="cpu")
 
         def _load_router_with_task_remap(module: nn.Module, saved_state: Dict[str, torch.Tensor], which: str):
-            if not ckpt_expert_names or list(ckpt_expert_names) == list(self.expert_names):
-                module.load_state_dict(saved_state)
-                return
-
             current_state = module.state_dict()
             loaded = {}
+
+            # New pair-joint checkpoints store only the shared encoder weights
+            # for router_first/router_mid, while older checkpoints may come
+            # from CompactCrossAttentionRouter and include a task classifier
+            # head. The feature encoder does not own classifier params, so we
+            # keep only the overlapping keys here.
+            if not ckpt_expert_names or list(ckpt_expert_names) == list(self.expert_names):
+                for key, value in current_state.items():
+                    if key in saved_state:
+                        loaded[key] = saved_state[key]
+                module.load_state_dict(loaded, strict=False)
+                skipped = sorted(set(saved_state.keys()) - set(current_state.keys()))
+                if skipped:
+                    print(
+                        f"[INFO] skipped incompatible {which} keys when loading "
+                        f"legacy checkpoint: {skipped}"
+                    )
+                return
+
             for key, value in current_state.items():
                 if key not in saved_state:
                     continue
@@ -511,18 +526,14 @@ class JointAnswerSupervisionRouterModel(nn.Module):
         self,
         prompt_input_ids: torch.Tensor,
         prompt_attention_mask: torch.Tensor,
-        input_ids: torch.Tensor,
-        attention_mask: torch.Tensor,
-        labels: torch.Tensor,
         targets: Sequence[str],
         source_texts: Sequence[str],
         task_names: Sequence[str],
         llm_tokenizer,
-        score_mode: str,
     ) -> torch.Tensor:
-        batch_size = input_ids.size(0)
+        batch_size = prompt_input_ids.size(0)
         num_tasks = len(self.expert_names)
-        loss_matrix = torch.empty(batch_size, num_tasks, num_tasks, dtype=torch.float32, device=input_ids.device)
+        loss_matrix = torch.empty(batch_size, num_tasks, num_tasks, dtype=torch.float32, device=prompt_input_ids.device)
 
         for first_tid, first_task in enumerate(self.expert_names):
             first_eid = self.task_to_expert_id[first_task]
@@ -532,35 +543,18 @@ class JointAnswerSupervisionRouterModel(nn.Module):
                 set_layer_range_expert(self.model, self.first_layer_idx, self.middle_layer_idx - 1, first_eid)
                 set_layer_range_expert(self.model, self.middle_layer_idx, self.num_layers - 1, mid_eid)
 
-                if score_mode == "token_nll":
-                    logits = self.model(
-                        input_ids=input_ids,
-                        attention_mask=attention_mask,
-                        use_cache=False,
-                        return_dict=True,
-                    ).logits
-                    combo_loss = compute_dataset_aware_score(
-                        logits=logits,
-                        labels=labels,
-                        prompt_attention_mask=prompt_attention_mask,
-                        targets=targets,
-                        task_names=task_names,
-                        tokenizer=llm_tokenizer,
-                        score_mode=score_mode,
-                    )
-                else:
-                    generated_texts = self.generate_under_current_pair(
-                        prompt_input_ids=prompt_input_ids,
-                        prompt_attention_mask=prompt_attention_mask,
-                        tokenizer=llm_tokenizer,
-                        task_names=task_names,
-                    )
-                    combo_loss = compute_generated_dataset_scores(
-                        predictions=generated_texts,
-                        targets=targets,
-                        task_names=task_names,
-                        source_texts=source_texts,
-                    ).to(device=input_ids.device, dtype=torch.float32)
+                generated_texts = self.generate_under_current_pair(
+                    prompt_input_ids=prompt_input_ids,
+                    prompt_attention_mask=prompt_attention_mask,
+                    tokenizer=llm_tokenizer,
+                    task_names=task_names,
+                )
+                combo_loss = compute_generated_dataset_scores(
+                    predictions=generated_texts,
+                    targets=targets,
+                    task_names=task_names,
+                    source_texts=source_texts,
+                ).to(device=prompt_input_ids.device, dtype=torch.float32)
                 loss_matrix[:, first_tid, mid_tid] = combo_loss
 
         set_all_experts(self.model, NULL_EXPERT_ID)
@@ -685,61 +679,6 @@ def build_lm_batch(
     }
 
 
-def compute_sequence_nll(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
-    shift_logits = logits[:, :-1, :].contiguous()
-    shift_labels = labels[:, 1:].contiguous()
-    vocab_size = shift_logits.size(-1)
-    per_token_loss = nn.functional.cross_entropy(
-        shift_logits.view(-1, vocab_size),
-        shift_labels.view(-1),
-        reduction="none",
-        ignore_index=-100,
-    ).view(shift_labels.size())
-    valid_mask = (shift_labels != -100).to(per_token_loss.dtype)
-    denom = valid_mask.sum(dim=1).clamp_min(1.0)
-    return (per_token_loss * valid_mask).sum(dim=1) / denom
-
-
-def _first_token_id(tokenizer, text: str) -> Optional[int]:
-    ids = tokenizer.encode(text, add_special_tokens=False)
-    return ids[0] if ids else None
-
-
-def compute_mcq_accuracy_proxy(
-    logits: torch.Tensor,
-    prompt_attention_mask: torch.Tensor,
-    targets: Sequence[str],
-    tokenizer,
-) -> torch.Tensor:
-    option_token_ids = []
-    for option in ["A", "B", "C", "D"]:
-        token_id = _first_token_id(tokenizer, option)
-        if token_id is None:
-            raise ValueError(f"Tokenizer cannot encode MCQ option {option!r}")
-        option_token_ids.append(token_id)
-    option_token_ids_tensor = torch.tensor(option_token_ids, dtype=torch.long, device=logits.device)
-
-    prompt_lens = prompt_attention_mask.sum(dim=1).clamp_min(1)
-    batch_idx = torch.arange(logits.size(0), device=logits.device)
-    answer_logits = logits[batch_idx, prompt_lens - 1, :]
-    option_logits = answer_logits.index_select(dim=-1, index=option_token_ids_tensor)
-    pred_idx = option_logits.argmax(dim=-1)
-
-    target_indices = []
-    for target in targets:
-        clean = str(target).strip().upper()[:1]
-        if clean not in {"A", "B", "C", "D"}:
-            target_indices.append(0)
-        else:
-            target_indices.append(ord(clean) - ord("A"))
-    target_idx_tensor = torch.tensor(target_indices, dtype=torch.long, device=logits.device)
-    correct = (pred_idx == target_idx_tensor).to(torch.float32)
-
-    log_probs = torch.log_softmax(option_logits, dim=-1)
-    correct_nll = -log_probs.gather(dim=-1, index=target_idx_tensor.unsqueeze(-1)).squeeze(-1)
-    return (1.0 - correct) + 1e-3 * correct_nll
-
-
 def compute_official_evaluator_sample_score(
     prediction: str,
     target: str,
@@ -823,43 +762,6 @@ def compute_generated_dataset_scores(
     return torch.tensor(scores, dtype=torch.float32)
 
 
-def compute_dataset_aware_score(
-    logits: torch.Tensor,
-    labels: torch.Tensor,
-    prompt_attention_mask: torch.Tensor,
-    targets: Sequence[str],
-    task_names: Sequence[str],
-    tokenizer,
-    score_mode: str,
-) -> torch.Tensor:
-    score_mode = str(score_mode)
-    base_nll = compute_sequence_nll(logits=logits, labels=labels)
-    if score_mode == "token_nll":
-        return base_nll
-
-    batch_scores = []
-    mcq_proxy = compute_mcq_accuracy_proxy(
-        logits=logits,
-        prompt_attention_mask=prompt_attention_mask,
-        targets=targets,
-        tokenizer=tokenizer,
-    )
-    for idx, task in enumerate(task_names):
-        task = str(task)
-        if score_mode == "dataset_auto":
-            if task in MCQ_STYLE_TASKS:
-                batch_scores.append(mcq_proxy[idx])
-            elif task == "sst2":
-                batch_scores.append(base_nll[idx])
-            elif task in {"squad2", "iwslt2017"}:
-                batch_scores.append(base_nll[idx])
-            else:
-                batch_scores.append(base_nll[idx])
-        else:
-            raise ValueError(f"Unknown score_mode: {score_mode}")
-    return torch.stack(batch_scores, dim=0)
-
-
 def compute_pair_losses(
     pair_logits: torch.Tensor,
     logits_first: torch.Tensor,
@@ -896,11 +798,12 @@ def compute_pair_losses(
     elif mode == "stage2":
         total_loss = ce_mid
     elif mode == "joint":
-        total_loss = expected_loss
-        if pseudo_ce_weight > 0 and margin_mask.any():
-            total_loss = total_loss + pseudo_ce_weight * ce_pair
+        total_loss = ce_pair
+        if pseudo_ce_weight > 0:
+            total_loss = total_loss + pseudo_ce_weight * expected_loss
         metrics = {
             "expected_loss": float(expected_loss.detach().item()),
+            "main_pair_ce": float(ce_pair.detach().item()),
             "pseudo_ce_pair": float(ce_pair.detach().item()),
             "pseudo_ce_first": float(ce_first.detach().item()),
             "pseudo_ce_mid": float(ce_mid.detach().item()),
@@ -913,6 +816,7 @@ def compute_pair_losses(
 
     metrics = {
         "expected_loss": float(expected_loss.detach().item()),
+        "main_pair_ce": float(ce_pair.detach().item()),
         "pseudo_ce_pair": float(ce_pair.detach().item()),
         "pseudo_ce_first": float(ce_first.detach().item()),
         "pseudo_ce_mid": float(ce_mid.detach().item()),
@@ -920,6 +824,10 @@ def compute_pair_losses(
         "margin_active_ratio": margin_active,
     }
     return total_loss, metrics, best_first, best_mid, flat_best
+
+
+def score_from_cost(cost: torch.Tensor) -> torch.Tensor:
+    return (1.0 - cost) * 100.0
 
 
 def compute_routing_accuracy_stats(
@@ -958,6 +866,29 @@ def compute_routing_accuracy_stats(
         "oracle_mid_self_acc": oracle_mid_self_acc,
         "oracle_self_joint_acc": 0.5 * (oracle_first_self_acc + oracle_mid_self_acc),
         "oracle_self_pair_acc": oracle_self_pair_acc,
+    }
+
+
+def compute_route_score_stats(
+    loss_matrix: torch.Tensor,
+    pred_pair: torch.Tensor,
+    task_ids: torch.Tensor,
+) -> Dict[str, float]:
+    flat_loss = loss_matrix.view(loss_matrix.size(0), -1)
+    best_pair = flat_loss.argmin(dim=-1)
+    batch_idx = torch.arange(loss_matrix.size(0), device=loss_matrix.device)
+
+    pred_cost = flat_loss[batch_idx, pred_pair]
+    oracle_cost = flat_loss[batch_idx, best_pair]
+    self_cost = loss_matrix[batch_idx, task_ids.to(loss_matrix.device), task_ids.to(loss_matrix.device)]
+
+    return {
+        "router_argmax_score": float(score_from_cost(pred_cost).mean().item()),
+        "oracle_best_pair_score": float(score_from_cost(oracle_cost).mean().item()),
+        "fixed_self_score": float(score_from_cost(self_cost).mean().item()),
+        "router_argmax_cost": float(pred_cost.mean().item()),
+        "oracle_best_pair_cost": float(oracle_cost.mean().item()),
+        "fixed_self_cost": float(self_cost.mean().item()),
     }
 
 
@@ -1127,7 +1058,6 @@ def evaluate(
     train_mode: str,
     pseudo_ce_weight: float,
     pseudo_ce_margin: float,
-    score_mode: str,
 ) -> Dict[str, float]:
     model.eval()
     total_loss = 0.0
@@ -1174,14 +1104,10 @@ def evaluate(
         loss_matrix = model.score_all_route_pairs(
             prompt_input_ids=prompt_input_ids,
             prompt_attention_mask=prompt_attention_mask,
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            labels=labels,
             targets=batch.targets,
             source_texts=batch.source_texts,
             task_names=batch.task_names,
             llm_tokenizer=llm_tokenizer,
-            score_mode=score_mode,
         )
         pair_logits, logits_first, logits_mid = model.forward_router(
             bert_input_ids=bert_input_ids,
@@ -1211,6 +1137,11 @@ def evaluate(
             best_mid=best_mid,
             task_ids=batch.task_ids,
         )
+        score_stats = compute_route_score_stats(
+            loss_matrix=loss_matrix,
+            pred_pair=pred_pair,
+            task_ids=batch.task_ids,
+        )
         pred_first_all.extend(pred_first.cpu().tolist())
         pred_mid_all.extend(pred_mid.cpu().tolist())
         best_first_all.extend(best_first.cpu().tolist())
@@ -1221,16 +1152,18 @@ def evaluate(
         total_samples += batch_size
         for key, value in batch_stats.items():
             metric_totals[key] = metric_totals.get(key, 0.0) + value * batch_size
-        for key in ["expected_loss", "pseudo_ce_pair", "pseudo_ce_first", "pseudo_ce_mid", "best_pair_loss", "margin_active_ratio"]:
+        for key, value in score_stats.items():
+            metric_totals[key] = metric_totals.get(key, 0.0) + value * batch_size
+        for key in ["expected_loss", "main_pair_ce", "pseudo_ce_pair", "pseudo_ce_first", "pseudo_ce_mid", "best_pair_loss", "margin_active_ratio"]:
             if key in metrics:
                 metric_totals[key] = metric_totals.get(key, 0.0) + metrics[key] * batch_size
 
         if tqdm is not None:
             progress.set_postfix(
                 loss=f"{(total_loss / max(total_samples, 1)):.4f}",
-                first=f"{(metric_totals.get('first_acc', 0.0) / max(total_samples, 1)):.4f}",
-                mid=f"{(metric_totals.get('mid_acc', 0.0) / max(total_samples, 1)):.4f}",
-                self_acc=f"{(metric_totals.get('self_joint_acc', 0.0) / max(total_samples, 1)):.4f}",
+                pair=f"{(metric_totals.get('pair_acc', 0.0) / max(total_samples, 1)):.4f}",
+                router=f"{(metric_totals.get('router_argmax_score', 0.0) / max(total_samples, 1)):.2f}",
+                self=f"{(metric_totals.get('fixed_self_score', 0.0) / max(total_samples, 1)):.2f}",
             )
 
     denom = max(total_samples, 1)
@@ -1342,7 +1275,6 @@ def main():
     parser.add_argument("--train_mode", type=str, default="joint", choices=["stage1", "stage2", "joint"])
     parser.add_argument("--pseudo_ce_weight", type=float, default=0.5)
     parser.add_argument("--pseudo_ce_margin", type=float, default=0.0)
-    parser.add_argument("--score_mode", type=str, default="dataset_auto", choices=["dataset_auto", "token_nll"])
     parser.add_argument("--add_eos_to_target", action="store_true")
     parser.add_argument("--num_workers", type=int, default=0)
     parser.add_argument("--seed", type=int, default=42)
@@ -1539,10 +1471,12 @@ def main():
             train_mode=args.train_mode,
             pseudo_ce_weight=args.pseudo_ce_weight,
             pseudo_ce_margin=args.pseudo_ce_margin,
-            score_mode=args.score_mode,
         )
         print(
             f"[EVAL] split={args.eval_split} loss={eval_metrics['loss']:.4f} "
+            f"router_score={eval_metrics['router_argmax_score']:.2f} "
+            f"self_score={eval_metrics['fixed_self_score']:.2f} "
+            f"oracle_score={eval_metrics['oracle_best_pair_score']:.2f} "
             f"first_acc={eval_metrics['first_acc']:.4f} "
             f"mid_acc={eval_metrics['mid_acc']:.4f} "
             f"joint_acc={eval_metrics['joint_acc']:.4f} "
@@ -1580,7 +1514,7 @@ def main():
         num_training_steps=total_steps,
     )
 
-    best_val = float("inf")
+    best_router_score = float("-inf")
     best_epoch = -1
 
     for epoch in range(1, args.epochs + 1):
@@ -1633,14 +1567,10 @@ def main():
                 loss_matrix = model.score_all_route_pairs(
                     prompt_input_ids=prompt_input_ids,
                     prompt_attention_mask=prompt_attention_mask,
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    labels=labels,
                     targets=batch.targets,
                     source_texts=batch.source_texts,
                     task_names=batch.task_names,
                     llm_tokenizer=llm_tokenizer,
-                    score_mode=args.score_mode,
                 )
 
             pair_logits, logits_first, logits_mid = model.forward_router(
@@ -1709,6 +1639,7 @@ def main():
                             "train/epoch": epoch,
                             "train/step": step + (epoch - 1) * len(train_loader),
                             "train/loss": avg_loss,
+                            "train/main_pair_ce": metrics["main_pair_ce"],
                             "train/expected_loss": metrics["expected_loss"],
                             "train/best_pair_loss": metrics["best_pair_loss"],
                             "train/first_acc": batch_stats["first_acc"],
@@ -1729,7 +1660,7 @@ def main():
                     )
                 print(
                     f"[TRAIN] epoch={epoch} step={step}/{len(train_loader)} "
-                    f"loss={avg_loss:.4f} expected={metrics['expected_loss']:.4f} "
+                    f"loss={avg_loss:.4f} pair_ce={metrics['main_pair_ce']:.4f} expected={metrics['expected_loss']:.4f} "
                     f"best_pair={metrics['best_pair_loss']:.4f} "
                     f"first_acc={batch_stats['first_acc']:.4f} mid_acc={batch_stats['mid_acc']:.4f} "
                     f"pair_acc={batch_stats['pair_acc']:.4f} "
@@ -1763,10 +1694,12 @@ def main():
             train_mode=args.train_mode,
             pseudo_ce_weight=args.pseudo_ce_weight,
             pseudo_ce_margin=args.pseudo_ce_margin,
-            score_mode=args.score_mode,
         )
         print(
             f"[VAL] epoch={epoch} loss={val_metrics['loss']:.4f} "
+            f"router_score={val_metrics['router_argmax_score']:.2f} "
+            f"self_score={val_metrics['fixed_self_score']:.2f} "
+            f"oracle_score={val_metrics['oracle_best_pair_score']:.2f} "
             f"first_acc={val_metrics['first_acc']:.4f} "
             f"mid_acc={val_metrics['mid_acc']:.4f} "
             f"pair_acc={val_metrics['pair_acc']:.4f} "
@@ -1783,11 +1716,16 @@ def main():
             payload = {
                 "val/epoch": epoch,
                 "val/loss": val_metrics["loss"],
+                "val/main_pair_ce": val_metrics["main_pair_ce"],
+                "val/expected_loss": val_metrics["expected_loss"],
+                "val/router_argmax_score": val_metrics["router_argmax_score"],
+                "val/fixed_self_score": val_metrics["fixed_self_score"],
+                "val/oracle_best_pair_score": val_metrics["oracle_best_pair_score"],
                 "val/first_acc": val_metrics["first_acc"],
                 "val/mid_acc": val_metrics["mid_acc"],
                 "val/pair_acc": val_metrics["pair_acc"],
                 "val/joint_acc": val_metrics["joint_acc"],
-                "val/best_val": min(best_val, val_metrics["loss"]),
+                "val/best_router_argmax_score": max(best_router_score, val_metrics["router_argmax_score"]),
             }
             wandb_run.log(payload)
 
@@ -1803,8 +1741,8 @@ def main():
         if args.save_every_epoch:
             torch.save(state, os.path.join(args.output_dir, f"router_heads_epoch{epoch}.pt"))
 
-        if val_metrics["loss"] < best_val:
-            best_val = val_metrics["loss"]
+        if val_metrics["router_argmax_score"] > best_router_score:
+            best_router_score = val_metrics["router_argmax_score"]
             best_epoch = epoch
             save_runtime_compatible_router_bundle(
                 model=model,
@@ -1820,19 +1758,22 @@ def main():
                     "router_max_len": args.max_bert_len,
                     "router_feature_type": "answer_supervision_prompt_last_valid_token",
                     "train_mode": args.train_mode,
-                    "score_mode": args.score_mode,
                     "router_pooling": args.router_pooling,
                     "router_pooling_last_k": args.router_pooling_last_k,
                     "pseudo_ce_margin": args.pseudo_ce_margin,
+                    "best_router_argmax_score": best_router_score,
                     "best_epoch": best_epoch,
-                    "best_val_loss": best_val,
+                    "best_val_loss": val_metrics["loss"],
                 },
             )
-            print(f"[SAVE] best checkpoint updated at epoch={epoch}")
+            print(
+                f"[SAVE] best checkpoint updated at epoch={epoch} "
+                f"router_score={best_router_score:.2f}"
+            )
 
-    print(f"[DONE] best_val={best_val:.4f} best_epoch={best_epoch}")
+    print(f"[DONE] best_router_argmax_score={best_router_score:.2f} best_epoch={best_epoch}")
     if wandb_run is not None:
-        wandb_run.summary["best_val"] = best_val
+        wandb_run.summary["best_router_argmax_score"] = best_router_score
         wandb_run.summary["best_epoch"] = best_epoch
         wandb_run.finish()
 

@@ -76,19 +76,60 @@ class CompactRouterFeatureEncoder(nn.Module):
 
 
 class CachedLossMatrixDataset(Dataset):
-    def __init__(self, feature_root: str, split: str):
+    def __init__(self, feature_root: str, split: str, selected_task_names: Optional[Sequence[str]] = None):
         split_dir = os.path.join(feature_root, split)
         manifest_path = os.path.join(split_dir, "manifest.json")
         with open(manifest_path, "r", encoding="utf-8") as f:
             manifest = json.load(f)
 
+        source_task_names = list(manifest.get("task_names") or manifest.get("expert_names") or [])
+        if not source_task_names:
+            raise ValueError(f"Missing task_names/expert_names in {manifest_path}")
+
+        if selected_task_names:
+            resolved_task_names = [str(name) for name in selected_task_names]
+        else:
+            resolved_task_names = list(source_task_names)
+
+        missing = [name for name in resolved_task_names if name not in source_task_names]
+        if missing:
+            raise ValueError(
+                f"Requested task_names={missing} are not present in cached feature manifest {manifest_path}. "
+                f"Available={source_task_names}"
+            )
+
+        selected_indices = [source_task_names.index(name) for name in resolved_task_names]
+        old_to_new_task_id = {old_idx: new_idx for new_idx, old_idx in enumerate(selected_indices)}
+
         self.items = []
         for fn in manifest["files"]:
             payload = torch.load(os.path.join(split_dir, fn), map_location="cpu")
-            self.items.extend(payload["items"])
+            for item in payload["items"]:
+                task_name = str(item["task"])
+                if task_name not in resolved_task_names:
+                    continue
+
+                loss_matrix = item["loss_matrix"]
+                sliced_loss_matrix = loss_matrix.index_select(0, torch.tensor(selected_indices)).index_select(
+                    1, torch.tensor(selected_indices)
+                )
+                flat_loss = sliced_loss_matrix.view(-1)
+                best_pair = int(flat_loss.argmin().item())
+                num_tasks = len(resolved_task_names)
+                best_first = best_pair // num_tasks
+                best_mid = best_pair % num_tasks
+
+                remapped = dict(item)
+                remapped["task_id"] = int(old_to_new_task_id[int(item["task_id"])])
+                remapped["loss_matrix"] = sliced_loss_matrix
+                remapped["pair_label"] = best_pair
+                remapped["first_label"] = best_first
+                remapped["mid_label"] = best_mid
+                self.items.append(remapped)
         if not self.items:
             raise ValueError(f"No items loaded from {split_dir}")
-        self.task_names = list(manifest.get("task_names") or manifest.get("expert_names") or [])
+        self.task_names = resolved_task_names
+        self.source_task_names = source_task_names
 
     def __len__(self):
         return len(self.items)
@@ -195,14 +236,21 @@ def compute_pair_losses(
         margin_mask = torch.ones_like(flat_best, dtype=torch.bool)
     ce_pair_all = nn.functional.cross_entropy(pair_logits, flat_best, reduction="none")
     ce_pair = ce_pair_all[margin_mask].mean() if margin_mask.any() else torch.tensor(0.0, device=pair_logits.device)
-    total_loss = expected_loss + float(pseudo_ce_weight) * ce_pair if pseudo_ce_weight > 0 else expected_loss
+    total_loss = ce_pair
+    if pseudo_ce_weight > 0:
+        total_loss = total_loss + float(pseudo_ce_weight) * expected_loss
     metrics = {
         "expected_loss": float(expected_loss.detach().item()),
+        "main_pair_ce": float(ce_pair.detach().item()),
         "pseudo_ce_pair": float(ce_pair.detach().item()),
         "best_pair_loss": float(sorted_loss[:, 0].mean().item()),
         "margin_active_ratio": float(margin_mask.float().mean().item()),
     }
     return total_loss, metrics, best_first, best_mid, flat_best
+
+
+def score_from_cost(cost: torch.Tensor) -> torch.Tensor:
+    return (1.0 - cost) * 100.0
 
 
 def compute_routing_accuracy_stats(pred_first, pred_mid, best_first, best_mid, task_ids):
@@ -221,6 +269,26 @@ def compute_routing_accuracy_stats(pred_first, pred_mid, best_first, best_mid, t
         "self_joint_acc": float(0.5 * (((pred_first == task_ids).float().mean().item()) + ((pred_mid == task_ids).float().mean().item()))),
         "self_pair_acc": float(((pred_first == task_ids) & (pred_mid == task_ids)).float().mean().item()),
         "oracle_self_pair_acc": float(((best_first == task_ids) & (best_mid == task_ids)).float().mean().item()),
+    }
+
+
+def compute_route_score_stats(loss_matrix: torch.Tensor, pred_pair: torch.Tensor, task_ids: torch.Tensor):
+    flat_loss = loss_matrix.view(loss_matrix.size(0), -1)
+    best_pair = flat_loss.argmin(dim=-1)
+    batch_idx = torch.arange(loss_matrix.size(0), device=loss_matrix.device)
+    task_ids = task_ids.to(loss_matrix.device)
+
+    pred_cost = flat_loss[batch_idx, pred_pair]
+    oracle_cost = flat_loss[batch_idx, best_pair]
+    self_cost = loss_matrix[batch_idx, task_ids, task_ids]
+
+    return {
+        "router_argmax_score": float(score_from_cost(pred_cost).mean().item()),
+        "oracle_best_pair_score": float(score_from_cost(oracle_cost).mean().item()),
+        "fixed_self_score": float(score_from_cost(self_cost).mean().item()),
+        "router_argmax_cost": float(pred_cost.mean().item()),
+        "oracle_best_pair_cost": float(oracle_cost.mean().item()),
+        "fixed_self_cost": float(self_cost.mean().item()),
     }
 
 
@@ -399,6 +467,7 @@ def evaluate(model, loader, bert_tokenizer, device, max_bert_len, task_names, ps
         pred_first = pred_pair // num_tasks
         pred_mid = pred_pair % num_tasks
         batch_stats = compute_routing_accuracy_stats(pred_first, pred_mid, best_first, best_mid, batch.task_ids)
+        score_stats = compute_route_score_stats(batch.loss_matrix.to(device), pred_pair, batch.task_ids)
 
         bs = batch.task_ids.size(0)
         total_loss += loss.item() * bs
@@ -406,6 +475,8 @@ def evaluate(model, loader, bert_tokenizer, device, max_bert_len, task_names, ps
         for key, value in metrics.items():
             metric_totals[key] = metric_totals.get(key, 0.0) + value * bs
         for key, value in batch_stats.items():
+            metric_totals[key] = metric_totals.get(key, 0.0) + value * bs
+        for key, value in score_stats.items():
             metric_totals[key] = metric_totals.get(key, 0.0) + value * bs
         pred_first_all.extend(pred_first.cpu().tolist())
         pred_mid_all.extend(pred_mid.cpu().tolist())
@@ -442,8 +513,9 @@ def save_ckpt(model, out_dir, task_names, max_bert_len, metrics, epoch):
             "num_pairs": len(task_names) * len(task_names),
             "router_max_len": max_bert_len,
             "router_feature_type": "cached_prompt_vectors_with_loss_matrix",
-            "supervision_type": "cached_expected_loss",
+            "supervision_type": "cached_pair_ce_main",
             "best_epoch": epoch,
+            "best_router_argmax_score": metrics.get("router_argmax_score"),
             "best_val_loss": metrics.get("loss"),
         },
         os.path.join(out_dir, "router_config.json"),
@@ -501,9 +573,11 @@ def main():
         )
         print(f"[INFO] wandb enabled project={args.wandb_project}")
 
-    train_ds = CachedLossMatrixDataset(args.feature_root, "train")
-    val_ds = CachedLossMatrixDataset(args.feature_root, "validation")
-    task_names = parse_task_names(args.task_names, fallback=train_ds.task_names or val_ds.task_names)
+    probe_train_ds = CachedLossMatrixDataset(args.feature_root, "train")
+    probe_val_ds = CachedLossMatrixDataset(args.feature_root, "validation")
+    task_names = parse_task_names(args.task_names, fallback=probe_train_ds.task_names or probe_val_ds.task_names)
+    train_ds = CachedLossMatrixDataset(args.feature_root, "train", selected_task_names=task_names)
+    val_ds = CachedLossMatrixDataset(args.feature_root, "validation", selected_task_names=task_names)
     print(f"[INFO] task_names={task_names}")
     print(f"[INFO] num_pairs={len(task_names) * len(task_names)}")
     train_cfg = vars(args).copy()
@@ -556,7 +630,7 @@ def main():
     warmup_steps = int(total_steps * args.warmup_ratio)
     scheduler = get_linear_schedule_with_warmup(optimizer, warmup_steps, total_steps)
 
-    best_val = float("inf")
+    best_router_score = float("-inf")
     best_epoch = -1
     no_improve_epochs = 0
     global_step = 0
@@ -611,6 +685,7 @@ def main():
             pred_first = pred_pair // num_tasks
             pred_mid = pred_pair % num_tasks
             batch_stats = compute_routing_accuracy_stats(pred_first, pred_mid, best_first, best_mid, batch.task_ids)
+            score_stats = compute_route_score_stats(batch.loss_matrix.to(device), pred_pair, batch.task_ids)
 
             bs = batch.task_ids.size(0)
             running_loss += loss.item() * bs
@@ -618,6 +693,8 @@ def main():
             for key, value in metrics.items():
                 running_metric_totals[key] = running_metric_totals.get(key, 0.0) + float(value) * bs
             for key, value in batch_stats.items():
+                running_metric_totals[key] = running_metric_totals.get(key, 0.0) + float(value) * bs
+            for key, value in score_stats.items():
                 running_metric_totals[key] = running_metric_totals.get(key, 0.0) + float(value) * bs
             train_pred_first_all.extend(pred_first.detach().cpu().tolist())
             train_pred_mid_all.extend(pred_mid.detach().cpu().tolist())
@@ -632,8 +709,10 @@ def main():
                 }
                 print(
                     f"[TRAIN] epoch={epoch} step={step}/{len(train_loader)} "
-                    f"loss={avg_loss:.4f} expected={avg_metrics['expected_loss']:.4f} "
+                    f"loss={avg_loss:.4f} pair_ce={avg_metrics['main_pair_ce']:.4f} expected={avg_metrics['expected_loss']:.4f} "
                     f"best_pair={avg_metrics['best_pair_loss']:.4f} "
+                    f"router_score={avg_metrics['router_argmax_score']:.2f} "
+                    f"self_score={avg_metrics['fixed_self_score']:.2f} "
                     f"first_acc={avg_metrics['first_acc']:.4f} mid_acc={avg_metrics['mid_acc']:.4f} "
                     f"pair_acc={avg_metrics['pair_acc']:.4f} "
                     f"self_first={avg_metrics['self_first_acc']:.4f} self_mid={avg_metrics['self_mid_acc']:.4f} "
@@ -645,10 +724,14 @@ def main():
                             "train/epoch": epoch,
                             "train/step": global_step,
                             "train/loss": avg_loss,
+                            "train/main_pair_ce": avg_metrics["main_pair_ce"],
                             "train/expected_loss": avg_metrics["expected_loss"],
                             "train/best_pair_loss": avg_metrics["best_pair_loss"],
                             "train/pseudo_ce_pair": avg_metrics["pseudo_ce_pair"],
                             "train/margin_active_ratio": avg_metrics["margin_active_ratio"],
+                            "train/router_argmax_score": avg_metrics["router_argmax_score"],
+                            "train/fixed_self_score": avg_metrics["fixed_self_score"],
+                            "train/oracle_best_pair_score": avg_metrics["oracle_best_pair_score"],
                             "train/first_acc": avg_metrics["first_acc"],
                             "train/mid_acc": avg_metrics["mid_acc"],
                             "train/joint_acc": avg_metrics["joint_acc"],
@@ -688,6 +771,9 @@ def main():
         )
         print(
             f"[VAL] epoch={epoch} loss={val_metrics['loss']:.4f} "
+            f"router_score={val_metrics['router_argmax_score']:.2f} "
+            f"self_score={val_metrics['fixed_self_score']:.2f} "
+            f"oracle_score={val_metrics['oracle_best_pair_score']:.2f} "
             f"first_acc={val_metrics['first_acc']:.4f} "
             f"mid_acc={val_metrics['mid_acc']:.4f} "
             f"pair_acc={val_metrics['pair_acc']:.4f} "
@@ -701,9 +787,13 @@ def main():
             wandb_payload = {
                 "val/epoch": epoch,
                 "val/loss": val_metrics["loss"],
+                "val/main_pair_ce": val_metrics.get("main_pair_ce", 0.0),
                 "val/expected_loss": val_metrics.get("expected_loss", 0.0),
                 "val/best_pair_loss": val_metrics.get("best_pair_loss", 0.0),
                 "val/pseudo_ce_pair": val_metrics.get("pseudo_ce_pair", 0.0),
+                "val/router_argmax_score": val_metrics["router_argmax_score"],
+                "val/fixed_self_score": val_metrics["fixed_self_score"],
+                "val/oracle_best_pair_score": val_metrics["oracle_best_pair_score"],
                 "val/first_acc": val_metrics["first_acc"],
                 "val/mid_acc": val_metrics["mid_acc"],
                 "val/joint_acc": val_metrics["joint_acc"],
@@ -713,14 +803,14 @@ def main():
                 "val/self_joint_acc": val_metrics["self_joint_acc"],
                 "val/self_pair_acc": val_metrics["self_pair_acc"],
                 "val/oracle_self_pair_acc": val_metrics["oracle_self_pair_acc"],
-                "val/best_val": min(best_val, val_metrics["loss"]),
+                "val/best_router_argmax_score": max(best_router_score, val_metrics["router_argmax_score"]),
             }
             wandb_payload.update(flatten_routing_summary(val_metrics["routing_summary"], prefix="val_route"))
             wandb_run.log(wandb_payload, step=global_step)
 
-        improved = val_metrics["loss"] < (best_val - args.early_stop_min_delta)
+        improved = val_metrics["router_argmax_score"] > (best_router_score + args.early_stop_min_delta)
         if improved:
-            best_val = val_metrics["loss"]
+            best_router_score = val_metrics["router_argmax_score"]
             best_epoch = epoch
             no_improve_epochs = 0
             save_ckpt(
@@ -731,19 +821,22 @@ def main():
                 metrics={"epoch": epoch, **val_metrics},
                 epoch=epoch,
             )
-            print(f"[SAVE] best checkpoint updated at epoch={epoch}")
+            print(f"[SAVE] best checkpoint updated at epoch={epoch} router_score={best_router_score:.2f}")
         else:
             no_improve_epochs += 1
-            print(f"[EARLY_STOP] no improvement for {no_improve_epochs} epoch(s). best_loss={best_val:.6f} at epoch={best_epoch}")
+            print(
+                f"[EARLY_STOP] no improvement for {no_improve_epochs} epoch(s). "
+                f"best_router_score={best_router_score:.2f} at epoch={best_epoch}"
+            )
             if no_improve_epochs >= args.early_stop_patience:
                 print(f"[EARLY_STOP] stop training because patience={args.early_stop_patience} is reached.")
                 break
 
     if wandb_run is not None:
-        wandb_run.summary["best_val"] = best_val
+        wandb_run.summary["best_router_argmax_score"] = best_router_score
         wandb_run.summary["best_epoch"] = best_epoch
         wandb_run.finish()
-    print(f"[DONE] best_val={best_val:.6f} best_epoch={best_epoch}")
+    print(f"[DONE] best_router_argmax_score={best_router_score:.2f} best_epoch={best_epoch}")
 
 
 if __name__ == "__main__":
