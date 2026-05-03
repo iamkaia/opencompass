@@ -1213,7 +1213,7 @@ def evaluate(
                 loss=f"{(total_loss / max(total_samples, 1)):.4f}",
                 pair=f"{(metric_totals.get('pair_acc', 0.0) / max(total_samples, 1)):.4f}",
                 router=f"{(metric_totals.get('router_argmax_score', 0.0) / max(total_samples, 1)):.2f}",
-                self=f"{(metric_totals.get('fixed_self_score', 0.0) / max(total_samples, 1)):.2f}",
+                self_score=f"{(metric_totals.get('fixed_self_score', 0.0) / max(total_samples, 1)):.2f}",
             )
 
     denom = max(total_samples, 1)
