@@ -10,7 +10,9 @@ import torch
 import torch.nn as nn
 from sklearn.metrics import classification_report, confusion_matrix
 from torch.utils.data import DataLoader, Dataset
-from transformers import AutoModel, AutoTokenizer, get_linear_schedule_with_warmup
+from transformers import AutoTokenizer, get_linear_schedule_with_warmup
+
+from opencompass.models.router_moe_components import BertExternalEncoder, CompactCrossAttentionRouter
 
 
 TASK_NAMES = ["iwslt2017", "medmcqa", "race", "squad2", "sst2"]
@@ -19,77 +21,6 @@ TASK_NAMES = ["iwslt2017", "medmcqa", "race", "squad2", "sst2"]
 def save_json(obj: Dict, path: str):
     with open(path, "w", encoding="utf-8") as f:
         json.dump(obj, f, ensure_ascii=False, indent=2)
-
-
-class BertExternalEncoder(nn.Module):
-    def __init__(self, bert_name_or_path: str):
-        super().__init__()
-        self.encoder = AutoModel.from_pretrained(bert_name_or_path)
-
-    def forward(self, input_ids, attention_mask, token_type_ids=None):
-        kwargs = {
-            "input_ids": input_ids,
-            "attention_mask": attention_mask,
-            "output_hidden_states": True,
-            "return_dict": True,
-        }
-        if token_type_ids is not None:
-            kwargs["token_type_ids"] = token_type_ids
-
-        out = self.encoder(**kwargs)
-        h_prev = out.hidden_states[-2]
-        h_last = out.hidden_states[-1]
-        return h_prev, h_last
-
-
-class CompactCrossAttentionRouter(nn.Module):
-    """
-    query: 單一向量 [B, H_llama]
-    key/value: BERT 最後兩層 hidden states [B, S, H_bert]
-    """
-    def __init__(self, llama_hidden_size: int, bert_hidden_size: int, router_dim: int, num_tasks: int):
-        super().__init__()
-        self.q_proj = nn.Linear(llama_hidden_size, router_dim)
-        self.k_proj = nn.Linear(bert_hidden_size, router_dim)
-        self.v_proj = nn.Linear(bert_hidden_size, router_dim)
-
-        self.out_norm = nn.LayerNorm(router_dim * 2)
-        self.classifier = nn.Linear(router_dim * 2, num_tasks)
-
-    def forward(
-        self,
-        llama_vec: torch.Tensor,      # [B, H_llama]
-        bert_prev: torch.Tensor,      # [B, S, H_bert]
-        bert_last: torch.Tensor,      # [B, S, H_bert]
-        bert_attention_mask: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        router_dtype = self.q_proj.weight.dtype
-        router_device = self.q_proj.weight.device
-
-        llama_vec = llama_vec.to(device=router_device, dtype=router_dtype)
-        bert_prev = bert_prev.to(device=router_device, dtype=router_dtype)
-        bert_last = bert_last.to(device=router_device, dtype=router_dtype)
-
-        q = self.q_proj(llama_vec).unsqueeze(1)   # [B,1,D]
-        mem = torch.cat([bert_prev, bert_last], dim=1)
-        k = self.k_proj(mem)
-        v = self.v_proj(mem)
-
-        scores = torch.matmul(q, k.transpose(-1, -2)) / (q.size(-1) ** 0.5)
-
-        if bert_attention_mask is not None:
-            mask = torch.cat([bert_attention_mask, bert_attention_mask], dim=1)
-            mask = (mask == 0).unsqueeze(1).to(device=router_device)
-            scores = scores.masked_fill(mask, float("-inf"))
-
-        attn = torch.softmax(scores, dim=-1)
-        ctx = torch.matmul(attn, v).squeeze(1)
-        qv = q.squeeze(1)
-
-        feat = torch.cat([qv, ctx], dim=-1)
-        feat = self.out_norm(feat)
-        logits = self.classifier(feat)
-        return logits
 
 
 class ChunkedCompactFeatureDataset(Dataset):

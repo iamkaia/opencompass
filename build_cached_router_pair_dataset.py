@@ -5,12 +5,16 @@ from typing import Dict, List, Optional, Sequence
 import torch
 from torch.utils.data import DataLoader
 from transformers import AutoTokenizer
+try:
+    from tqdm.auto import tqdm
+except Exception:
+    tqdm = None
 
 from train_joint_answer_supervision_router import (
     Collator,
     JointAnswerSupervisionRouterModel,
-    build_dataset,
     build_lm_batch,
+    build_dataset,
     discover_expert_names,
     save_json,
 )
@@ -89,20 +93,48 @@ def process_split(
     device = next(model.parameters()).device
     num_tasks = len(model.expert_names)
     total_items = 0
+    total_batches = len(loader)
+    progress = tqdm(
+        loader,
+        total=total_batches,
+        desc=f"cache:{split}",
+        dynamic_ncols=True,
+        mininterval=5.0,
+        file=None,
+    ) if tqdm is not None else loader
+    print(
+        f"[CACHE] start split={split} batches={total_batches} "
+        f"tasks={task_names} num_experts={num_tasks}",
+        flush=True,
+    )
 
-    for batch in loader:
-        lm_batch = build_lm_batch(
-            tokenizer=llm_tokenizer,
-            prompts=batch.texts,
-            targets=batch.targets,
-            max_length=max_llm_len,
-            add_eos_to_target=add_eos_to_target,
-        )
-        prompt_input_ids = lm_batch["prompt_input_ids"].to(device)
-        prompt_attention_mask = lm_batch["prompt_attention_mask"].to(device)
-        input_ids = lm_batch["input_ids"].to(device)
-        attention_mask = lm_batch["attention_mask"].to(device)
-        labels = lm_batch["labels"].to(device)
+    for batch_idx, batch in enumerate(progress, start=1):
+        if str(score_mode) == "token_nll":
+            lm_batch = build_lm_batch(
+                tokenizer=llm_tokenizer,
+                prompts=batch.texts,
+                targets=batch.targets,
+                max_length=max_llm_len,
+                add_eos_to_target=add_eos_to_target,
+            )
+            prompt_input_ids = lm_batch["prompt_input_ids"].to(device)
+            prompt_attention_mask = lm_batch["prompt_attention_mask"].to(device)
+            input_ids = lm_batch["input_ids"].to(device)
+            attention_mask = lm_batch["attention_mask"].to(device)
+            labels = lm_batch["labels"].to(device)
+        else:
+            prompt_batch = llm_tokenizer(
+                batch.texts,
+                return_tensors="pt",
+                padding=True,
+                truncation=True,
+                max_length=max_llm_len,
+            )
+            prompt_input_ids = prompt_batch["input_ids"].to(device)
+            prompt_attention_mask = prompt_batch["attention_mask"].to(device)
+            input_ids = None
+            attention_mask = None
+            labels = None
 
         with torch.no_grad():
             first_vec, mid_vec = model.extract_prompt_vectors(
@@ -155,11 +187,41 @@ def process_split(
 
         if len(chunk_items) >= chunk_size:
             save_chunk(chunk_items, split_dir, chunk_idx, manifest_files)
+            print(
+                f"[CACHE] split={split} saved chunk={chunk_idx:05d} "
+                f"items_in_chunk={len(chunk_items)} total_items={total_items}",
+                flush=True,
+            )
             chunk_items = []
             chunk_idx += 1
 
+        if tqdm is not None:
+            progress.set_postfix(
+                batch=batch_idx,
+                items=total_items,
+                chunks=chunk_idx,
+            )
+            if batch_idx == 1 or batch_idx % 5 == 0 or batch_idx == total_batches:
+                progress.write(
+                    f"[CACHE] split={split} batch={batch_idx}/{total_batches} "
+                    f"accumulated_items={total_items}"
+                )
+        elif batch_idx == 1 or batch_idx % 5 == 0 or batch_idx == total_batches:
+            print(
+                f"[CACHE] split={split} batch={batch_idx}/{total_batches} "
+                f"accumulated_items={total_items}",
+                flush=True,
+            )
+
     if chunk_items:
         save_chunk(chunk_items, split_dir, chunk_idx, manifest_files)
+        print(
+            f"[CACHE] split={split} saved final chunk={chunk_idx:05d} "
+            f"items_in_chunk={len(chunk_items)} total_items={total_items}",
+            flush=True,
+        )
+    if tqdm is not None:
+        progress.close()
 
     save_json(
         {
@@ -170,7 +232,7 @@ def process_split(
             "expert_names": list(model.expert_names),
             "num_tasks": len(model.expert_names),
             "supervision_type": "cached_loss_matrix",
-            "score_mode": score_mode,
+            "score_mode": str(score_mode),
         },
         os.path.join(split_dir, "manifest.json"),
     )
@@ -197,7 +259,12 @@ def main():
     parser.add_argument("--dtype", type=str, default="float16", choices=["float16", "bfloat16"])
     parser.add_argument("--r", type=int, default=8)
     parser.add_argument("--alpha", type=int, default=32)
-    parser.add_argument("--score_mode", type=str, default="dataset_auto", choices=["dataset_auto", "token_nll"])
+    parser.add_argument(
+        "--score_mode",
+        type=str,
+        default="official_eval_aligned_generation",
+        choices=["official_eval_aligned_generation", "token_nll"],
+    )
     parser.add_argument("--add_eos_to_target", action="store_true")
     parser.add_argument("--num_workers", type=int, default=0)
     parser.add_argument("--chunk_size", type=int, default=2048)
@@ -273,7 +340,7 @@ def main():
             "router_pooling": args.router_pooling,
             "router_pooling_last_k": args.router_pooling_last_k,
             "dtype": args.dtype,
-            "score_mode": args.score_mode,
+            "score_mode": str(args.score_mode),
             "chunk_size": args.chunk_size,
             "seed": args.seed,
         },

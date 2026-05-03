@@ -1,6 +1,5 @@
 import argparse
 import importlib
-import importlib.util
 import json
 import math
 import os
@@ -23,6 +22,18 @@ from opencompass.utils.text_postprocessors import (
     general_postprocess,
 )
 from model_backbone_specs import get_decoder_layers, get_pre_attn_norm, infer_backbone_spec
+from opencompass.models.router_moe_components import (
+    BertExternalEncoder,
+    CompactRouterFeatureEncoder,
+    PromptVectorExtractor,
+)
+from opencompass.models.router_moe_shared import (
+    NULL_EXPERT_ID,
+    load_lora_into_expert,
+    patch_llama_with_hard_routed_lora,
+    set_all_experts,
+    set_layer_range_expert,
+)
 from task_eval_specs import (
     TASK_EVAL_SPECS,
     TaskEvalSpec,
@@ -33,31 +44,6 @@ from task_eval_specs import (
 )
 
 
-def _load_router_core_module():
-    module_path = os.path.join(
-        os.path.dirname(__file__),
-        "opencompass",
-        "models",
-        "unified_moe_core_internal_router_compact.py",
-    )
-    spec = importlib.util.spec_from_file_location("router_core_module", module_path)
-    if spec is None or spec.loader is None:
-        raise ImportError(f"Unable to load router core module from {module_path}")
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
-
-
-_router_core = _load_router_core_module()
-NULL_EXPERT_ID = _router_core.NULL_EXPERT_ID
-BertExternalEncoder = _router_core.BertExternalEncoder
-CompactCrossAttentionRouter = _router_core.CompactCrossAttentionRouter
-load_lora_into_expert = _router_core.load_lora_into_expert
-patch_llama_with_hard_routed_lora = _router_core.patch_llama_with_hard_routed_lora
-set_all_experts = _router_core.set_all_experts
-set_layer_range_expert = _router_core.set_layer_range_expert
-
-
 DEFAULT_EXPERT_NAMES = ["iwslt2017", "medmcqa", "race", "squad2", "sst2"]
 MCQ_STYLE_TASKS = {"race", "medmcqa", "hellaswag", "piqa", "copa", "siqa"}
 BINARY_STYLE_TASKS = {"sst2", "boolq"}
@@ -66,7 +52,7 @@ TRANSLATION_STYLE_TASKS = {"iwslt2017"}
 
 _OPENCOMPASS_EVAL_RUNTIME = None
 
-
+####只是建立 evaluator 實例，例如：AccEvaluator, BleuEvaluator, MedmcqaEvaluator, SQuAD20Evaluator, 避免每次 sample 評分都重建。
 def _get_opencompass_eval_runtime():
     global _OPENCOMPASS_EVAL_RUNTIME
     if _OPENCOMPASS_EVAL_RUNTIME is not None:
@@ -92,43 +78,6 @@ def _get_opencompass_eval_runtime():
         "squad20": squad20_mod.SQuAD20Evaluator(),
     }
     return _OPENCOMPASS_EVAL_RUNTIME
-
-
-class CompactRouterFeatureEncoder(nn.Module):
-    def __init__(self, llama_hidden_size: int, bert_hidden_size: int, router_dim: int):
-        super().__init__()
-        self.q_proj = nn.Linear(llama_hidden_size, router_dim)
-        self.k_proj = nn.Linear(bert_hidden_size, router_dim)
-        self.v_proj = nn.Linear(bert_hidden_size, router_dim)
-        self.out_norm = nn.LayerNorm(router_dim * 2)
-
-    def forward(
-        self,
-        llama_vec: torch.Tensor,
-        bert_prev: torch.Tensor,
-        bert_last: torch.Tensor,
-        bert_attention_mask: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        router_dtype = self.q_proj.weight.dtype
-        router_device = self.q_proj.weight.device
-        llama_vec = llama_vec.to(device=router_device, dtype=router_dtype)
-        bert_prev = bert_prev.to(device=router_device, dtype=router_dtype)
-        bert_last = bert_last.to(device=router_device, dtype=router_dtype)
-
-        q = self.q_proj(llama_vec).unsqueeze(1)
-        mem = torch.cat([bert_prev, bert_last], dim=1)
-        k = self.k_proj(mem)
-        v = self.v_proj(mem)
-        scores = torch.matmul(q, k.transpose(-1, -2)) / (q.size(-1) ** 0.5)
-        if bert_attention_mask is not None:
-            mask = torch.cat([bert_attention_mask, bert_attention_mask], dim=1)
-            mask = (mask == 0).unsqueeze(1).to(device=router_device)
-            scores = scores.masked_fill(mask, float("-inf"))
-        attn = torch.softmax(scores, dim=-1)
-        ctx = torch.matmul(attn, v).squeeze(1)
-        qv = q.squeeze(1)
-        feat = torch.cat([qv, ctx], dim=-1)
-        return self.out_norm(feat)
 
 
 def save_json(obj: Dict, path: str):
@@ -162,7 +111,7 @@ def discover_tasks(data_root: str, requested_tasks: Optional[Sequence[str]] = No
         raise ValueError(f"No tasks found under data_root={data_root}")
     return tasks
 
-
+###這次要拿哪些 expert 進來玩 routing
 def discover_expert_names(
     requested_experts: Optional[Sequence[str]],
     all_lora_paths: Dict[str, Optional[str]],
@@ -267,94 +216,6 @@ class Collator:
             task_ids=torch.tensor([x["task_id"] for x in batch], dtype=torch.long),
             task_names=[x["task"] for x in batch],
         )
-
-
-class PromptVectorExtractor(nn.Module):
-    def __init__(
-        self,
-        model: AutoModelForCausalLM,
-        first_layer_idx: int,
-        middle_layer_idx: int,
-        pooling: str = "last_token",
-        pooling_last_k: int = 4,
-    ):
-        super().__init__()
-        self.model = model
-        self.backbone_spec = infer_backbone_spec(model)
-        self.first_layer_idx = int(first_layer_idx)
-        self.middle_layer_idx = int(middle_layer_idx)
-        self.pooling = str(pooling)
-        self.pooling_last_k = int(pooling_last_k)
-        self.cached_first = None
-        self.cached_mid = None
-        self._install_hooks()
-
-    def _install_hooks(self):
-        def first_pre_hook(module, args):
-            self.cached_first = args[0].detach()
-            return None
-
-        def mid_pre_hook(module, args):
-            self.cached_mid = args[0].detach()
-            return None
-
-        layers = get_decoder_layers(self.model, spec=self.backbone_spec)
-        get_pre_attn_norm(layers[self.first_layer_idx], self.backbone_spec).register_forward_pre_hook(
-            first_pre_hook)
-        get_pre_attn_norm(layers[self.middle_layer_idx], self.backbone_spec).register_forward_pre_hook(
-            mid_pre_hook)
-
-    @staticmethod
-    def gather_last_valid(hidden_states: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
-        last_idx = attention_mask.sum(dim=1) - 1
-        last_idx = last_idx.clamp(min=0)
-        batch_idx = torch.arange(hidden_states.size(0), device=hidden_states.device)
-        return hidden_states[batch_idx, last_idx, :]
-
-    @staticmethod
-    def gather_mean_valid(hidden_states: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
-        mask = attention_mask.unsqueeze(-1).to(hidden_states.dtype)
-        denom = mask.sum(dim=1).clamp_min(1.0)
-        return (hidden_states * mask).sum(dim=1) / denom
-
-    @staticmethod
-    def gather_last_k_mean(hidden_states: torch.Tensor, attention_mask: torch.Tensor, k: int) -> torch.Tensor:
-        k = max(int(k), 1)
-        outputs = []
-        lengths = attention_mask.sum(dim=1)
-        for i in range(hidden_states.size(0)):
-            valid_len = int(lengths[i].item())
-            if valid_len <= 0:
-                outputs.append(hidden_states[i, 0])
-                continue
-            start = max(0, valid_len - k)
-            outputs.append(hidden_states[i, start:valid_len].mean(dim=0))
-        return torch.stack(outputs, dim=0)
-
-    def gather_pooled(self, hidden_states: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
-        if self.pooling == "last_token":
-            return self.gather_last_valid(hidden_states, attention_mask)
-        if self.pooling == "mean":
-            return self.gather_mean_valid(hidden_states, attention_mask)
-        if self.pooling == "lastk_mean":
-            return self.gather_last_k_mean(hidden_states, attention_mask, self.pooling_last_k)
-        raise ValueError(f"Unknown pooling mode: {self.pooling}")
-    @torch.no_grad()
-    def extract(self, input_ids: torch.Tensor, attention_mask: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        self.cached_first = None
-        self.cached_mid = None
-        _ = self.model(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            use_cache=False,
-            output_attentions=False,
-            return_dict=True,
-        )
-        if self.cached_first is None or self.cached_mid is None:
-            raise RuntimeError("Failed to capture hidden states for router vectors.")
-        first_vec = self.gather_pooled(self.cached_first, attention_mask)
-        mid_vec = self.gather_pooled(self.cached_mid, attention_mask)
-        return first_vec, mid_vec
 
 
 class JointAnswerSupervisionRouterModel(nn.Module):
@@ -530,31 +391,99 @@ class JointAnswerSupervisionRouterModel(nn.Module):
         source_texts: Sequence[str],
         task_names: Sequence[str],
         llm_tokenizer,
+        score_mode: str = "official_eval_aligned_generation",
+        input_ids: Optional[torch.Tensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        labels: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         batch_size = prompt_input_ids.size(0)
         num_tasks = len(self.expert_names)
         loss_matrix = torch.empty(batch_size, num_tasks, num_tasks, dtype=torch.float32, device=prompt_input_ids.device)
+        score_mode = str(score_mode)
+
+        if score_mode == "token_nll":
+            if input_ids is None or attention_mask is None or labels is None:
+                raise ValueError("token_nll score_mode requires input_ids, attention_mask, and labels")
+
+            for first_tid, first_task in enumerate(self.expert_names):
+                first_eid = self.task_to_expert_id[first_task]
+                for mid_tid, mid_task in enumerate(self.expert_names):
+                    mid_eid = self.task_to_expert_id[mid_task]
+                    set_all_experts(self.model, NULL_EXPERT_ID)
+                    set_layer_range_expert(self.model, self.first_layer_idx, self.middle_layer_idx - 1, first_eid)
+                    set_layer_range_expert(self.model, self.middle_layer_idx, self.num_layers - 1, mid_eid)
+                    logits = self.model(
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
+                        use_cache=False,
+                        return_dict=True,
+                    ).logits
+                    combo_loss = compute_sequence_nll(logits=logits, labels=labels)
+                    loss_matrix[:, first_tid, mid_tid] = combo_loss
+
+            set_all_experts(self.model, NULL_EXPERT_ID)
+            return loss_matrix
 
         for first_tid, first_task in enumerate(self.expert_names):
             first_eid = self.task_to_expert_id[first_task]
             for mid_tid, mid_task in enumerate(self.expert_names):
                 mid_eid = self.task_to_expert_id[mid_task]
+                ######不是說刪掉token_NIL 那條嘛？那是什麼意思？Ans. 不曉得, 不是 token，是「不啟用任何 task expert」的 base 狀態。
                 set_all_experts(self.model, NULL_EXPERT_ID)
                 set_layer_range_expert(self.model, self.first_layer_idx, self.middle_layer_idx - 1, first_eid)
                 set_layer_range_expert(self.model, self.middle_layer_idx, self.num_layers - 1, mid_eid)
+                combo_loss = torch.empty(batch_size, dtype=torch.float32, device=prompt_input_ids.device)
 
-                generated_texts = self.generate_under_current_pair(
-                    prompt_input_ids=prompt_input_ids,
-                    prompt_attention_mask=prompt_attention_mask,
-                    tokenizer=llm_tokenizer,
-                    task_names=task_names,
-                )
-                combo_loss = compute_generated_dataset_scores(
-                    predictions=generated_texts,
-                    targets=targets,
-                    task_names=task_names,
-                    source_texts=source_texts,
-                ).to(device=prompt_input_ids.device, dtype=torch.float32)
+                proxy_indices = [
+                    idx for idx, task_name in enumerate(task_names)
+                    if not _task_uses_generation_evaluator(task_name)
+                ]
+                if proxy_indices:
+                    proxy_index_tensor = torch.tensor(proxy_indices, dtype=torch.long, device=prompt_input_ids.device)
+                    proxy_prompt_ids = prompt_input_ids.index_select(0, proxy_index_tensor)
+                    proxy_prompt_mask = prompt_attention_mask.index_select(0, proxy_index_tensor)
+                    proxy_logits = self.model(
+                        input_ids=proxy_prompt_ids,
+                        attention_mask=proxy_prompt_mask,
+                        use_cache=False,
+                        return_dict=True,
+                    ).logits
+                    proxy_targets = [targets[idx] for idx in proxy_indices]
+                    proxy_tasks = [task_names[idx] for idx in proxy_indices]
+                    proxy_loss = compute_option_nll_proxy_scores(
+                        logits=proxy_logits,
+                        prompt_attention_mask=proxy_prompt_mask,
+                        targets=proxy_targets,
+                        task_names=proxy_tasks,
+                        tokenizer=llm_tokenizer,
+                    ).to(device=prompt_input_ids.device, dtype=torch.float32)
+                    combo_loss.index_copy_(0, proxy_index_tensor, proxy_loss)
+
+                generation_indices = [
+                    idx for idx, task_name in enumerate(task_names)
+                    if _task_uses_generation_evaluator(task_name)
+                ]
+                if generation_indices:
+                    generation_index_tensor = torch.tensor(
+                        generation_indices, dtype=torch.long, device=prompt_input_ids.device)
+                    generation_prompt_ids = prompt_input_ids.index_select(0, generation_index_tensor)
+                    generation_prompt_mask = prompt_attention_mask.index_select(0, generation_index_tensor)
+                    generation_tasks = [task_names[idx] for idx in generation_indices]
+                    generated_texts = self.generate_under_current_pair(
+                        prompt_input_ids=generation_prompt_ids,
+                        prompt_attention_mask=generation_prompt_mask,
+                        tokenizer=llm_tokenizer,
+                        task_names=generation_tasks,
+                    )
+                    generation_targets = [targets[idx] for idx in generation_indices]
+                    generation_source_texts = [source_texts[idx] for idx in generation_indices]
+                    generation_loss = compute_generated_dataset_scores(
+                        predictions=generated_texts,
+                        targets=generation_targets,
+                        task_names=generation_tasks,
+                        source_texts=generation_source_texts,
+                    ).to(device=prompt_input_ids.device, dtype=torch.float32)
+                    combo_loss.index_copy_(0, generation_index_tensor, generation_loss)
                 loss_matrix[:, first_tid, mid_tid] = combo_loss
 
         set_all_experts(self.model, NULL_EXPERT_ID)
@@ -595,11 +524,13 @@ class JointAnswerSupervisionRouterModel(nn.Module):
         first_vec: torch.Tensor,
         mid_vec: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        ####回傳的形狀長這樣[B, S, H_bert]，這些分別代表什麼意思？:就是 batch、token 長度、BERT hidden size
         bert_prev, bert_last = self.bert(
             input_ids=bert_input_ids,
             attention_mask=bert_attention_mask,
             token_type_ids=bert_token_type_ids,
         )
+        ####它做的事情是：用 first_vec 當 query, 用 BERT 倒數兩層 hidden states 當 memory, 做一個 cross-attention 風格的 feature extraction, 輸出一個 feature vector
         first_feat = self.router_first(
             llama_vec=first_vec,
             bert_prev=bert_prev,
@@ -612,8 +543,11 @@ class JointAnswerSupervisionRouterModel(nn.Module):
             bert_last=bert_last,
             bert_attention_mask=bert_attention_mask,
         )
+        ####把兩個 feature 串起來。因為現在不是分開做 first/mid task classification，而是要直接做 pair classification。所以最自然的做法就是：先分別抽 first 與 mid feature, 再把它們拼在一起，讓最後 classifier 看兩邊的聯合資訊
         pair_feat = torch.cat([first_feat, mid_feat], dim=-1)
+        ####輸出[B, num_pairs]
         pair_logits = self.pair_classifier(pair_feat)
+        ####reshape成[B, T, T]
         pair_prob = torch.softmax(pair_logits, dim=-1).view(pair_logits.size(0), len(self.expert_names), len(self.expert_names))
         first_logits = torch.log(pair_prob.sum(dim=2).clamp_min(1e-12))
         mid_logits = torch.log(pair_prob.sum(dim=1).clamp_min(1e-12))
@@ -679,21 +613,102 @@ def build_lm_batch(
     }
 
 
+def compute_sequence_nll(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+    shift_logits = logits[:, :-1, :].contiguous()
+    shift_labels = labels[:, 1:].contiguous()
+    vocab_size = shift_logits.size(-1)
+    per_token_loss = nn.functional.cross_entropy(
+        shift_logits.view(-1, vocab_size),
+        shift_labels.view(-1),
+        reduction="none",
+        ignore_index=-100,
+    ).view(shift_labels.size())
+    valid_mask = (shift_labels != -100).to(per_token_loss.dtype)
+    denom = valid_mask.sum(dim=1).clamp_min(1.0)
+    return (per_token_loss * valid_mask).sum(dim=1) / denom
+
+
+def _first_token_id(tokenizer, text: str) -> Optional[int]:
+    ids = tokenizer.encode(str(text), add_special_tokens=False)
+    return ids[0] if ids else None
+
+
+def _task_uses_generation_evaluator(task_name: str) -> bool:
+    task_name = str(task_name)
+    return task_name in QA_STYLE_TASKS or task_name in TRANSLATION_STYLE_TASKS
+
+
+def _task_option_labels(task_name: str) -> Optional[List[str]]:
+    task_name = str(task_name)
+    if task_name in {"race", "medmcqa", "hellaswag"}:
+        return ["A", "B", "C", "D"]
+    if task_name in {"piqa", "copa", "boolq"}:
+        return ["A", "B"]
+    if task_name == "siqa":
+        return ["A", "B", "C"]
+    if task_name == "sst2":
+        return ["0", "1"]
+    return None
+
+
+def _normalize_task_label(task_name: str, target: str) -> str:
+    task_name = str(task_name)
+    if task_name == "sst2":
+        return normalize_sst2_label(target)
+    if task_name == "boolq":
+        return normalize_boolq_label(target)
+    return str(target).strip().upper()[:1]
+
+
+def compute_option_nll_proxy_scores(
+    logits: torch.Tensor,
+    prompt_attention_mask: torch.Tensor,
+    targets: Sequence[str],
+    task_names: Sequence[str],
+    tokenizer,
+) -> torch.Tensor:
+    prompt_lens = prompt_attention_mask.sum(dim=1).clamp_min(1)
+    batch_idx = torch.arange(logits.size(0), device=logits.device)
+    answer_logits = logits[batch_idx, prompt_lens - 1, :]
+    costs: List[torch.Tensor] = []
+
+    for idx, task_name in enumerate(task_names):
+        option_labels = _task_option_labels(task_name)
+        if not option_labels:
+            raise ValueError(f"No option-label proxy defined for task={task_name}")
+        option_token_ids = []
+        for label in option_labels:
+            token_id = _first_token_id(tokenizer, label)
+            if token_id is None:
+                raise ValueError(f"Tokenizer cannot encode option label {label!r} for task={task_name}")
+            option_token_ids.append(token_id)
+        option_token_ids_tensor = torch.tensor(option_token_ids, dtype=torch.long, device=logits.device)
+        option_logits = answer_logits[idx].index_select(dim=-1, index=option_token_ids_tensor)
+        log_probs = torch.log_softmax(option_logits, dim=-1)
+        gold_label = _normalize_task_label(task_name, targets[idx])
+        gold_idx = option_labels.index(gold_label) if gold_label in option_labels else 0
+        costs.append(-log_probs[gold_idx])
+
+    return torch.stack(costs, dim=0).to(torch.float32)
+
+
 def compute_official_evaluator_sample_score(
     prediction: str,
     target: str,
     task_name: str,
     source_text: Optional[str] = None,
 ) -> float:
+    ###lazy-load OpenCompass evaluator (這是什麼意思？): 是第一次用才 import/建立 evaluator，後面重用。
     runtime = _get_opencompass_eval_runtime()
     task = str(task_name)
+    #####不同 task 有不同規則，/home/kaia/opencompass/task_eval_specs.py, 例如：race：選項抽取 + accuracy, squad2：SQuAD evaluator, iwslt2017：BLEU
     spec: Optional[TaskEvalSpec] = TASK_EVAL_SPECS.get(task)
     if spec is None:
         pred = normalize_qa_text(prediction)
         gold = normalize_qa_text(target)
         result = runtime["acc"].score([pred], [gold])
         return 1.0 - float(result["accuracy"]) / 100.0
-
+    ####prediction 後處理, 例如選擇題可能只抽出 A/B/C/D
     processed_prediction = apply_postprocessor([prediction],
                                                spec.pred_postprocessor)[0]
     prediction_for_eval = prediction if spec.use_raw_prediction else processed_prediction
@@ -706,6 +721,7 @@ def compute_official_evaluator_sample_score(
     else:
         reference = target
 
+    #####這段在講什麼？是在湊每個 task evaluator 真正需要的 references/test_set/origin_prompt 等參數
     score_kwargs = {}
     if spec.extra_score_kwargs_builder is not None:
         score_kwargs.update(
@@ -721,11 +737,15 @@ def compute_official_evaluator_sample_score(
             refs = apply_postprocessor(refs, spec.dataset_postprocessor)
         score_kwargs["references"] = refs
 
+    ###這步就是evaluator打分的部份
     result = runtime[spec.evaluator_key].score(
         predictions=[prediction_for_eval], **score_kwargs)
     metric_name = spec.score_family if spec.score_family in result else None
     if metric_name is None:
         metric_name = "accuracy" if "accuracy" in result else "score"
+    
+    ###放入loss_matrix的東西，就是cost = 1.0 - float(result[metric_name]) / 100.0
+    ###這個算loss的方法是不是有一些問題呢？我們跑出來的score的範圍絕對會是1-100嘛？會不會不到啊？：你現在這批 evaluator 回傳的確是 0~100，所以 1 - score/100 目前是對的，但這寫法對未來新 evaluator 有脆弱性, 我現在一直在懷疑這邊有問題
     return 1.0 - float(result[metric_name]) / 100.0
 
 
@@ -751,6 +771,7 @@ def compute_generated_dataset_scores(
     scores = []
     if source_texts is None:
         source_texts = [""] * len(predictions)
+    ###對 batch 每一筆 sample, 用它自己的 task evaluator 打分, 回傳一個 cost tensor, 分數的部份可能會有問題, 因為不確定是不是範圍都是(1~100)：sst2跟medmcqa很有可能有問題，已知sst2只有全對跟全錯
     for pred, target, task, source_text in zip(predictions, targets, task_names, source_texts):
         scores.append(
             compute_official_evaluator_sample_score(
@@ -761,36 +782,50 @@ def compute_generated_dataset_scores(
             ))
     return torch.tensor(scores, dtype=torch.float32)
 
-
+####用 oracle loss_matrix 找出最佳 pair，再把 router 預測跟這個 oracle 對齊，算出訓練 loss。
 def compute_pair_losses(
     pair_logits: torch.Tensor,
     logits_first: torch.Tensor,
     logits_mid: torch.Tensor,
     loss_matrix: torch.Tensor,
     mode: str,
+    joint_loss: str,
     pseudo_ce_weight: float,
     margin: float,
 ) -> tuple[torch.Tensor, Dict[str, float], torch.Tensor, torch.Tensor, torch.Tensor]:
     mode = str(mode)
+    joint_loss = str(joint_loss)
     flat_loss = loss_matrix.view(loss_matrix.size(0), -1)
     flat_best = flat_loss.argmin(dim=-1)
     best_first = flat_best // loss_matrix.size(2)
     best_mid = flat_best % loss_matrix.size(2)
     pair_prob = torch.softmax(pair_logits, dim=-1)
+    ####在 router 目前預測的整個 pair distribution 下，期望成本是多少
+    ####但不是有問題因為如果我要用expected_loss的話，會有成本比較低但沒辦法選到最優解的問題不是嘛？
+    ###E[cost] = sum_k P(pair=k) * oracle_cost(pair=k)
+    ####是soft supervision, 不是只看argmax而已，是看整個distribution的品質，這是什麼意思？
+    ####:expected_loss 是 soft regularization，不保證 argmax 最優，所以它只能當輔助；主 supervision 還是 ce_pair(但這版已經確定會有問題了)
     expected_loss = (pair_prob * flat_loss).sum(dim=-1).mean()
 
+    ####把每個 sample 的所有 pair cost 排序。等等要用來判斷：最佳 pair 跟次佳 pair 差距夠不夠大
     sorted_loss, _ = flat_loss.sort(dim=-1)
     if flat_loss.size(1) > 1:
         margin_mask = (sorted_loss[:, 1] - sorted_loss[:, 0]) >= float(margin)
     else:
         margin_mask = torch.ones_like(flat_best, dtype=torch.bool)
 
+    ####對 pair classification 做逐 sample cross entropy。
     ce_pair_all = nn.functional.cross_entropy(pair_logits, flat_best, reduction="none")
     ce_first_all = nn.functional.cross_entropy(logits_first, best_first, reduction="none")
     ce_mid_all = nn.functional.cross_entropy(logits_mid, best_mid, reduction="none")
+    #####只保留 supervision 夠明確的 sample，再平均。如果一個 sample 的最佳 pair 和次佳 pair 差不多，就不拿它來做 hard CE。 ce_first、ce_mid 也是同樣邏輯。
+    ####hard ce是什麼意思啊？ cross-entropy是主要是要拿來做什麼的？ 講解一下邏輯 : CE 是「把 router 的分類結果對齊 oracle 最佳 pair label」的主要工具
+    ###expected_loss 是 soft regularization，不保證 argmax 最優，所以它只能當輔助；主 supervision 還是 ce_pair。
+    ###hard CE 就是用單一 oracle best pair label 做 cross-entropy 分類訓練。
     ce_pair = ce_pair_all[margin_mask].mean() if margin_mask.any() else torch.tensor(0.0, device=pair_logits.device)
     ce_first = ce_first_all[margin_mask].mean() if margin_mask.any() else torch.tensor(0.0, device=logits_first.device)
     ce_mid = ce_mid_all[margin_mask].mean() if margin_mask.any() else torch.tensor(0.0, device=logits_first.device)
+    #####記錄這個 batch 裡，有多少比例的 sample 被保留下來參與 hard CE。
     margin_active = float(margin_mask.float().mean().item())
 
     if mode == "stage1":
@@ -798,11 +833,20 @@ def compute_pair_losses(
     elif mode == "stage2":
         total_loss = ce_mid
     elif mode == "joint":
-        total_loss = ce_pair
-        if pseudo_ce_weight > 0:
-            total_loss = total_loss + pseudo_ce_weight * expected_loss
+        ####主 loss 是 pair-level hard CE, 如果有設定 pseudo_ce_weight, 再加上一個 soft 的 expected loss regularization
+        if joint_loss == "ce_pair":
+            total_loss = ce_pair
+        elif joint_loss == "expected_loss":
+            total_loss = expected_loss
+        elif joint_loss == "ce_pair_plus_expected":
+            total_loss = ce_pair
+            if pseudo_ce_weight > 0:
+                total_loss = total_loss + pseudo_ce_weight * expected_loss
+        else:
+            raise ValueError(f"Unknown joint_loss: {joint_loss}")
         metrics = {
             "expected_loss": float(expected_loss.detach().item()),
+            "joint_loss_type": joint_loss,
             "main_pair_ce": float(ce_pair.detach().item()),
             "pseudo_ce_pair": float(ce_pair.detach().item()),
             "pseudo_ce_first": float(ce_first.detach().item()),
@@ -816,6 +860,7 @@ def compute_pair_losses(
 
     metrics = {
         "expected_loss": float(expected_loss.detach().item()),
+        "joint_loss_type": joint_loss,
         "main_pair_ce": float(ce_pair.detach().item()),
         "pseudo_ce_pair": float(ce_pair.detach().item()),
         "pseudo_ce_first": float(ce_first.detach().item()),
@@ -823,6 +868,7 @@ def compute_pair_losses(
         "best_pair_loss": float(sorted_loss[:, 0].mean().item()),
         "margin_active_ratio": margin_active,
     }
+    ####total_loss才是真的可以拿來back propogation的東西
     return total_loss, metrics, best_first, best_mid, flat_best
 
 
@@ -830,6 +876,7 @@ def score_from_cost(cost: torch.Tensor) -> torch.Tensor:
     return (1.0 - cost) * 100.0
 
 
+####把 router 的預測結果，跟 oracle best route 比較，算出幾個核心 accuracy 指標。
 def compute_routing_accuracy_stats(
     pred_first: torch.Tensor,
     pred_mid: torch.Tensor,
@@ -891,7 +938,7 @@ def compute_route_score_stats(
         "fixed_self_cost": float(self_cost.mean().item()),
     }
 
-
+#####把整批資料的 routing 行為整理成一份結構化報告
 def build_routing_summary(
     pred_first_all: Sequence[int],
     pred_mid_all: Sequence[int],
@@ -1056,6 +1103,7 @@ def evaluate(
     max_bert_len: int,
     add_eos_to_target: bool,
     train_mode: str,
+    joint_loss: str,
     pseudo_ce_weight: float,
     pseudo_ce_margin: float,
 ) -> Dict[str, float]:
@@ -1097,6 +1145,7 @@ def evaluate(
         if bert_token_type_ids is not None:
             bert_token_type_ids = bert_token_type_ids.to(device)
 
+        ####先抽 prompt vector
         first_vec, mid_vec = model.extract_prompt_vectors(
             input_ids=prompt_input_ids,
             attention_mask=prompt_attention_mask,
@@ -1122,6 +1171,7 @@ def evaluate(
             logits_mid=logits_mid,
             loss_matrix=loss_matrix,
             mode=train_mode,
+            joint_loss=joint_loss,
             pseudo_ce_weight=pseudo_ce_weight,
             margin=pseudo_ce_margin,
         )
@@ -1180,7 +1230,7 @@ def evaluate(
     )
     return result
 
-
+## CLI 傳進來的逗號分隔字串 轉成 Python list。e.g. --expert_names iwslt2017,medmcqa,race 變成 ["iwslt2017", "medmcqa", "race"]
 def parse_csv_arg(raw: Optional[str]) -> Optional[List[str]]:
     if not raw:
         return None
@@ -1273,6 +1323,13 @@ def main():
     parser.add_argument("--freeze_router_first", action="store_true")
     parser.add_argument("--freeze_router_mid", action="store_true")
     parser.add_argument("--train_mode", type=str, default="joint", choices=["stage1", "stage2", "joint"])
+    parser.add_argument(
+        "--joint_loss",
+        type=str,
+        default="ce_pair_plus_expected",
+        choices=["ce_pair", "expected_loss", "ce_pair_plus_expected"],
+        help="Joint-mode objective. Ignored for stage1/stage2.",
+    )
     parser.add_argument("--pseudo_ce_weight", type=float, default=0.5)
     parser.add_argument("--pseudo_ce_margin", type=float, default=0.0)
     parser.add_argument("--add_eos_to_target", action="store_true")
@@ -1328,13 +1385,17 @@ def main():
         "race": args.lora_race,
         "squad2": args.lora_squad2,
         "sst2": args.lora_sst2,
-        "piqa": args.lora_piqa,
-        "copa": args.lora_copa,
-        "hellaswag": args.lora_hellaswag,
-        "boolq": args.lora_boolq,
-        "siqa": args.lora_siqa,
+        #####剩下幾個應該會是沒有expert的task才對吧？可以像這樣槓掉嘛？我本來就是想要只做5個expert而已
+        #"piqa": args.lora_piqa,
+        #"copa": args.lora_copa,
+        #"hellaswag": args.lora_hellaswag,
+        #"boolq": args.lora_boolq,
+        #"siqa": args.lora_siqa,
     }
+
+    ###解析 expert names
     requested_experts = parse_csv_arg(args.expert_names)
+    ###決定這次真正要用哪些 experts
     expert_names, expert_name_source = discover_expert_names(requested_experts, all_lora_paths)
     print(f"[INFO] expert_names={expert_names}")
     print(f"[INFO] expert_name_source={expert_name_source}")
@@ -1431,7 +1492,8 @@ def main():
     if args.load_router_ckpt_dir:
         model.load_router_weights(args.load_router_ckpt_dir)
         print(f"[INFO] loaded router weights from {args.load_router_ckpt_dir}")
-
+    
+    ###如果是joint的話是凍結哪一個
     freeze_router_first = args.freeze_router_first or (args.train_mode == "stage2")
     freeze_router_mid = args.freeze_router_mid or (args.train_mode == "stage1")
     model.set_trainable(
@@ -1449,6 +1511,10 @@ def main():
         f"router_first:{not freeze_router_first} "
         f"router_mid:{not freeze_router_mid} "
         f"num_params={trainable_param_count}"
+    )
+    print(
+        f"[INFO] train_mode={args.train_mode} joint_loss={args.joint_loss} "
+        f"pseudo_ce_weight={args.pseudo_ce_weight} pseudo_ce_margin={args.pseudo_ce_margin}"
     )
     config = vars(args).copy()
     config["train_task_names"] = train_task_names
@@ -1469,6 +1535,7 @@ def main():
             max_bert_len=args.max_bert_len,
             add_eos_to_target=args.add_eos_to_target,
             train_mode=args.train_mode,
+            joint_loss=args.joint_loss,
             pseudo_ce_weight=args.pseudo_ce_weight,
             pseudo_ce_margin=args.pseudo_ce_margin,
         )
@@ -1533,6 +1600,7 @@ def main():
             desc=f"train epoch {epoch}/{args.epochs}",
         )
         for step, batch in enumerate(train_progress, start=1):
+            ###產出：prompt_input_ids, prompt_attention_mask, input_ids, attention_mask, labels
             lm_batch = build_lm_batch(
                 tokenizer=llm_tokenizer,
                 prompts=batch.texts,
@@ -1559,6 +1627,7 @@ def main():
             if bert_token_type_ids is not None:
                 bert_token_type_ids = bert_token_type_ids.to(device)
 
+            ####開torch.no_grad(), 因為我不想對 base LLM/backbone 回傳梯度
             with torch.no_grad():
                 first_vec, mid_vec = model.extract_prompt_vectors(
                     input_ids=prompt_input_ids,
@@ -1586,11 +1655,14 @@ def main():
                 logits_mid=logits_mid,
                 loss_matrix=loss_matrix,
                 mode=args.train_mode,
+                joint_loss=args.joint_loss,
                 pseudo_ce_weight=args.pseudo_ce_weight,
                 margin=args.pseudo_ce_margin,
             )
 
             optimizer.zero_grad()
+            ####不是說把其他地方freeze了，這樣backward真的可以更新到嘛？這樣是合理的嘛？
+            ###freeze 後 loss.backward() 當然還能更新，因為它只會更新 requires_grad=True 的 router / bert 參數，這正是這支訓練的設計。
             loss.backward()
             optimizer.step()
             scheduler.step()
@@ -1692,6 +1764,7 @@ def main():
             max_bert_len=args.max_bert_len,
             add_eos_to_target=args.add_eos_to_target,
             train_mode=args.train_mode,
+            joint_loss=args.joint_loss,
             pseudo_ce_weight=args.pseudo_ce_weight,
             pseudo_ce_margin=args.pseudo_ce_margin,
         )
@@ -1758,9 +1831,11 @@ def main():
                     "router_max_len": args.max_bert_len,
                     "router_feature_type": "answer_supervision_prompt_last_valid_token",
                     "train_mode": args.train_mode,
+                    "joint_loss": args.joint_loss,
                     "router_pooling": args.router_pooling,
                     "router_pooling_last_k": args.router_pooling_last_k,
                     "pseudo_ce_margin": args.pseudo_ce_margin,
+                    "pseudo_ce_weight": args.pseudo_ce_weight,
                     "best_router_argmax_score": best_router_score,
                     "best_epoch": best_epoch,
                     "best_val_loss": val_metrics["loss"],

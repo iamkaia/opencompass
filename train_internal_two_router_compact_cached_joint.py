@@ -9,7 +9,9 @@ from typing import Dict, List, Optional, Sequence
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, Dataset
-from transformers import AutoModel, AutoTokenizer, get_linear_schedule_with_warmup
+from transformers import AutoTokenizer, get_linear_schedule_with_warmup
+
+from opencompass.models.router_moe_components import BertExternalEncoder, CompactRouterFeatureEncoder
 
 
 def save_json(obj: Dict, path: str):
@@ -26,55 +28,10 @@ def parse_task_names(raw: Optional[str], fallback: Optional[Sequence[str]] = Non
         return list(fallback)
     raise ValueError("Failed to resolve task names")
 
-
-class BertExternalEncoder(nn.Module):
-    def __init__(self, bert_name_or_path: str):
-        super().__init__()
-        self.encoder = AutoModel.from_pretrained(bert_name_or_path)
-
-    def forward(self, input_ids, attention_mask, token_type_ids=None):
-        kwargs = {
-            "input_ids": input_ids,
-            "attention_mask": attention_mask,
-            "output_hidden_states": True,
-            "return_dict": True,
-        }
-        if token_type_ids is not None:
-            kwargs["token_type_ids"] = token_type_ids
-        out = self.encoder(**kwargs)
-        return out.hidden_states[-2], out.hidden_states[-1]
-
-
-class CompactRouterFeatureEncoder(nn.Module):
-    def __init__(self, llama_hidden_size: int, bert_hidden_size: int, router_dim: int):
-        super().__init__()
-        self.q_proj = nn.Linear(llama_hidden_size, router_dim)
-        self.k_proj = nn.Linear(bert_hidden_size, router_dim)
-        self.v_proj = nn.Linear(bert_hidden_size, router_dim)
-        self.out_norm = nn.LayerNorm(router_dim * 2)
-
-    def forward(self, llama_vec, bert_prev, bert_last, bert_attention_mask=None):
-        router_dtype = self.q_proj.weight.dtype
-        router_device = self.q_proj.weight.device
-        llama_vec = llama_vec.to(device=router_device, dtype=router_dtype)
-        bert_prev = bert_prev.to(device=router_device, dtype=router_dtype)
-        bert_last = bert_last.to(device=router_device, dtype=router_dtype)
-
-        q = self.q_proj(llama_vec).unsqueeze(1)
-        mem = torch.cat([bert_prev, bert_last], dim=1)
-        k = self.k_proj(mem)
-        v = self.v_proj(mem)
-        scores = torch.matmul(q, k.transpose(-1, -2)) / (q.size(-1) ** 0.5)
-        if bert_attention_mask is not None:
-            mask = torch.cat([bert_attention_mask, bert_attention_mask], dim=1)
-            mask = (mask == 0).unsqueeze(1).to(device=router_device)
-            scores = scores.masked_fill(mask, float("-inf"))
-        attn = torch.softmax(scores, dim=-1)
-        ctx = torch.matmul(attn, v).squeeze(1)
-        feat = torch.cat([q.squeeze(1), ctx], dim=-1)
-        return self.out_norm(feat)
-
-
+#####它會讀 feature_root/<split>/manifest.json，再把 chunk 檔載進來。重要的是它在 66-81 行 (line 66) 做了兩件事：
+#####如果你只想訓練部分 task，它會先把 loss_matrix slice 成較小的子矩陣
+####再從 slice 後的 loss_matrix 重新算一次 pair_label / first_label / mid_label
+####所以 cache 可以先建大，再在 trainer 端選 task 子集
 class CachedLossMatrixDataset(Dataset):
     def __init__(self, feature_root: str, split: str, selected_task_names: Optional[Sequence[str]] = None):
         split_dir = os.path.join(feature_root, split)
@@ -174,7 +131,7 @@ class Collator:
             mid_labels=torch.tensor([x["mid_label"] for x in batch], dtype=torch.long),
         )
 
-
+#### router本人, 沒有base llm
 class InternalTwoRouterCachedJointModel(nn.Module):
     def __init__(self, bert_init: str, llama_hidden_size: int, router_dim: int, num_pairs: int):
         super().__init__()
@@ -218,9 +175,14 @@ def set_trainable(model, freeze_bert: bool = False):
 def compute_pair_losses(
     pair_logits: torch.Tensor,
     loss_matrix: torch.Tensor,
+    joint_loss: str,
     pseudo_ce_weight: float,
     margin: float,
 ):
+    ###flat_best = argmin(loss_matrix) 找 oracle 最佳 pair
+    ###expected_loss = sum P(pair) * oracle_cost(pair)
+    ###ce_pair = CE(pair_logits, flat_best)
+    joint_loss = str(joint_loss)
     flat_loss = loss_matrix.view(loss_matrix.size(0), -1)
     flat_best = flat_loss.argmin(dim=-1)
     num_tasks = loss_matrix.size(2)
@@ -236,9 +198,20 @@ def compute_pair_losses(
         margin_mask = torch.ones_like(flat_best, dtype=torch.bool)
     ce_pair_all = nn.functional.cross_entropy(pair_logits, flat_best, reduction="none")
     ce_pair = ce_pair_all[margin_mask].mean() if margin_mask.any() else torch.tensor(0.0, device=pair_logits.device)
-    total_loss = ce_pair
-    if pseudo_ce_weight > 0:
-        total_loss = total_loss + float(pseudo_ce_weight) * expected_loss
+
+    ###ce_pair
+    ###expected_loss
+    ###ce_pair_plus_expected
+    if joint_loss == "ce_pair":
+        total_loss = ce_pair
+    elif joint_loss == "expected_loss":
+        total_loss = expected_loss
+    elif joint_loss == "ce_pair_plus_expected":
+        total_loss = ce_pair
+        if pseudo_ce_weight > 0:
+            total_loss = total_loss + float(pseudo_ce_weight) * expected_loss
+    else:
+        raise ValueError(f"Unknown joint_loss: {joint_loss}")
     metrics = {
         "expected_loss": float(expected_loss.detach().item()),
         "main_pair_ce": float(ce_pair.detach().item()),
@@ -424,7 +397,17 @@ def flatten_routing_summary(summary: Dict, prefix: str) -> Dict[str, float]:
 
 
 @torch.no_grad()
-def evaluate(model, loader, bert_tokenizer, device, max_bert_len, task_names, pseudo_ce_weight, pseudo_ce_margin):
+def evaluate(
+    model,
+    loader,
+    bert_tokenizer,
+    device,
+    max_bert_len,
+    task_names,
+    joint_loss,
+    pseudo_ce_weight,
+    pseudo_ce_margin,
+):
     model.eval()
     total_loss = 0.0
     total_samples = 0
@@ -459,6 +442,7 @@ def evaluate(model, loader, bert_tokenizer, device, max_bert_len, task_names, ps
         loss, metrics, best_first, best_mid, flat_best = compute_pair_losses(
             pair_logits=pair_logits,
             loss_matrix=batch.loss_matrix.to(device),
+            joint_loss=joint_loss,
             pseudo_ce_weight=pseudo_ce_weight,
             margin=pseudo_ce_margin,
         )
@@ -494,7 +478,7 @@ def evaluate(model, loader, bert_tokenizer, device, max_bert_len, task_names, ps
     return result
 
 
-def save_ckpt(model, out_dir, task_names, max_bert_len, metrics, epoch):
+def save_ckpt(model, out_dir, task_names, max_bert_len, metrics, epoch, joint_loss, pseudo_ce_weight):
     os.makedirs(out_dir, exist_ok=True)
     model.bert.encoder.save_pretrained(os.path.join(out_dir, "encoder"))
     torch.save(
@@ -514,6 +498,8 @@ def save_ckpt(model, out_dir, task_names, max_bert_len, metrics, epoch):
             "router_max_len": max_bert_len,
             "router_feature_type": "cached_prompt_vectors_with_loss_matrix",
             "supervision_type": "cached_pair_ce_main",
+            "joint_loss": str(joint_loss),
+            "pseudo_ce_weight": float(pseudo_ce_weight),
             "best_epoch": epoch,
             "best_router_argmax_score": metrics.get("router_argmax_score"),
             "best_val_loss": metrics.get("loss"),
@@ -538,6 +524,12 @@ def main():
     parser.add_argument("--max_bert_len", type=int, default=512)
     parser.add_argument("--router_dim", type=int, default=512)
     parser.add_argument("--freeze_bert", action="store_true")
+    parser.add_argument(
+        "--joint_loss",
+        type=str,
+        default="ce_pair_plus_expected",
+        choices=["ce_pair", "expected_loss", "ce_pair_plus_expected"],
+    )
     parser.add_argument("--pseudo_ce_weight", type=float, default=0.0)
     parser.add_argument("--pseudo_ce_margin", type=float, default=0.0)
     parser.add_argument("--early_stop_patience", type=int, default=2)
@@ -580,6 +572,10 @@ def main():
     val_ds = CachedLossMatrixDataset(args.feature_root, "validation", selected_task_names=task_names)
     print(f"[INFO] task_names={task_names}")
     print(f"[INFO] num_pairs={len(task_names) * len(task_names)}")
+    print(
+        f"[INFO] joint_loss={args.joint_loss} "
+        f"pseudo_ce_weight={args.pseudo_ce_weight} pseudo_ce_margin={args.pseudo_ce_margin}"
+    )
     train_cfg = vars(args).copy()
     train_cfg["resolved_task_names"] = task_names
     save_json(train_cfg, os.path.join(args.out_dir, "train_config.json"))
@@ -671,6 +667,7 @@ def main():
             loss, metrics, best_first, best_mid, flat_best = compute_pair_losses(
                 pair_logits=pair_logits,
                 loss_matrix=batch.loss_matrix.to(device),
+                joint_loss=args.joint_loss,
                 pseudo_ce_weight=args.pseudo_ce_weight,
                 margin=args.pseudo_ce_margin,
             )
@@ -766,6 +763,7 @@ def main():
             device=device,
             max_bert_len=args.max_bert_len,
             task_names=task_names,
+            joint_loss=args.joint_loss,
             pseudo_ce_weight=args.pseudo_ce_weight,
             pseudo_ce_margin=args.pseudo_ce_margin,
         )
@@ -820,6 +818,8 @@ def main():
                 max_bert_len=args.max_bert_len,
                 metrics={"epoch": epoch, **val_metrics},
                 epoch=epoch,
+                joint_loss=args.joint_loss,
+                pseudo_ce_weight=args.pseudo_ce_weight,
             )
             print(f"[SAVE] best checkpoint updated at epoch={epoch} router_score={best_router_score:.2f}")
         else:
