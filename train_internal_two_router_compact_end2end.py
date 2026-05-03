@@ -1,5 +1,4 @@
 import argparse
-import importlib.util
 import json
 import math
 import os
@@ -18,30 +17,14 @@ try:
 except Exception:
     tqdm = None
 
-
-def _load_router_core_module():
-    module_path = os.path.join(
-        os.path.dirname(__file__),
-        "opencompass",
-        "models",
-        "unified_moe_core_internal_router_compact.py",
-    )
-    spec = importlib.util.spec_from_file_location("router_core_module", module_path)
-    if spec is None or spec.loader is None:
-        raise ImportError(f"Unable to load router core module from {module_path}")
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
-
-
-_router_core = _load_router_core_module()
-NULL_EXPERT_ID = _router_core.NULL_EXPERT_ID
-BertExternalEncoder = _router_core.BertExternalEncoder
-CompactCrossAttentionRouter = _router_core.CompactCrossAttentionRouter
-load_lora_into_expert = _router_core.load_lora_into_expert
-patch_llama_with_hard_routed_lora = _router_core.patch_llama_with_hard_routed_lora
-set_all_experts = _router_core.set_all_experts
-set_layer_range_expert = _router_core.set_layer_range_expert
+from opencompass.models.router_moe_components import BertExternalEncoder, CompactCrossAttentionRouter
+from opencompass.models.router_moe_shared import (
+    NULL_EXPERT_ID,
+    load_lora_into_expert,
+    patch_llama_with_hard_routed_lora,
+    set_all_experts,
+    set_layer_range_expert,
+)
 
 
 DEFAULT_TASK_NAMES = ["iwslt2017", "medmcqa", "race", "squad2", "sst2"]
