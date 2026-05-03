@@ -1,3 +1,25 @@
+'''
+這是你現在較新的「joint pair router core」。它和上面最大的差別是：
+
+不再分開做 first 分類、mid 分類
+改成先抽 first_vec / mid_vec
+再一次直接預測 (first_task, mid_task) 這個 pair
+流程是：
+
+載入 base LLM、tokenizer、所有 LoRA expert。
+載入 BERT encoder。
+載入兩個 feature encoder：
+router_first
+router_mid
+再載入一個 pair_classifier。
+每個 prompt 先做一次 prepass，拿到：
+hidden_states[first_layer_idx]
+hidden_states[middle_layer_idx]
+用這兩個向量加上 BERT memory 算出 pair logits。
+一次決定前半段 expert 和後半段 expert。
+設好 layer range expert 後，再正式 generate。
+所以它是「先 route、後 generate」，而且 route 的 supervision 是 pair 級別，不是兩個 task head 各自獨立。
+'''
 import json
 import os
 from collections import Counter
@@ -6,45 +28,16 @@ from typing import Dict, Optional
 import torch
 import torch.nn as nn
 from transformers import AutoModelForCausalLM, AutoTokenizer
+from model_backbone_specs import get_decoder_layers, infer_backbone_spec
 
-from opencompass.models.unified_moe_core_internal_router_compact import (
+from opencompass.models.router_moe_components import BertExternalEncoder, CompactRouterFeatureEncoder
+from opencompass.models.router_moe_shared import (
     NULL_EXPERT_ID,
-    BertExternalEncoder,
     load_lora_into_expert,
     patch_llama_with_hard_routed_lora,
     set_all_experts,
     set_layer_range_expert,
 )
-
-
-class CompactRouterFeatureEncoder(nn.Module):
-    def __init__(self, llama_hidden_size: int, bert_hidden_size: int, router_dim: int):
-        super().__init__()
-        self.q_proj = nn.Linear(llama_hidden_size, router_dim)
-        self.k_proj = nn.Linear(bert_hidden_size, router_dim)
-        self.v_proj = nn.Linear(bert_hidden_size, router_dim)
-        self.out_norm = nn.LayerNorm(router_dim * 2)
-
-    def forward(self, llama_vec, bert_prev, bert_last, bert_attention_mask=None):
-        router_dtype = self.q_proj.weight.dtype
-        router_device = self.q_proj.weight.device
-        llama_vec = llama_vec.to(device=router_device, dtype=router_dtype)
-        bert_prev = bert_prev.to(device=router_device, dtype=router_dtype)
-        bert_last = bert_last.to(device=router_device, dtype=router_dtype)
-
-        q = self.q_proj(llama_vec).unsqueeze(1)
-        mem = torch.cat([bert_prev, bert_last], dim=1)
-        k = self.k_proj(mem)
-        v = self.v_proj(mem)
-        scores = torch.matmul(q, k.transpose(-1, -2)) / (q.size(-1) ** 0.5)
-        if bert_attention_mask is not None:
-            mask = torch.cat([bert_attention_mask, bert_attention_mask], dim=1)
-            mask = (mask == 0).unsqueeze(1).to(device=router_device)
-            scores = scores.masked_fill(mask, float("-inf"))
-        attn = torch.softmax(scores, dim=-1)
-        ctx = torch.matmul(attn, v).squeeze(1)
-        feat = torch.cat([q.squeeze(1), ctx], dim=-1)
-        return self.out_norm(feat)
 
 
 class UnifiedMoECoreInternalRouterCompactCachedJoint:
@@ -64,14 +57,26 @@ class UnifiedMoECoreInternalRouterCompactCachedJoint:
         middle_layer_idx: int = 15,
         force_first_task: Optional[str] = None,
         force_mid_task: Optional[str] = None,
+        local_files_only: bool = False,
+        debug_router_topk: int = 0,
+        debug_router_max_prints: int = 0,
     ):
         self.max_seq_len = int(max_seq_len)
         self.route_counter = Counter()
         self.force_first_task = force_first_task
         self.force_mid_task = force_mid_task
+        self.debug_router_topk = max(0, int(debug_router_topk))
+        self.debug_router_max_prints = max(0, int(debug_router_max_prints))
+        self.debug_router_print_count = 0
         torch_dtype = torch.float16 if dtype == "float16" else torch.bfloat16
 
-        with open(os.path.join(router_ckpt_dir, "router_config.json"), "r", encoding="utf-8") as f:
+        cfg_path = os.path.join(router_ckpt_dir, "router_config.json")
+        if not os.path.exists(cfg_path):
+            raise FileNotFoundError(
+                f"Missing router_config.json under router_ckpt_dir={router_ckpt_dir!r}. "
+                "Please ensure the OpenCompass run cwd matches the relative path."
+            )
+        with open(cfg_path, "r", encoding="utf-8") as f:
             cfg = json.load(f)
 
         self.task_names = cfg["task_names"]
@@ -79,8 +84,31 @@ class UnifiedMoECoreInternalRouterCompactCachedJoint:
         self.first_layer_idx = int(cfg.get("first_layer_idx", first_layer_idx))
         self.middle_layer_idx = int(cfg.get("middle_layer_idx", middle_layer_idx))
         self.router_max_len = int(cfg.get("router_max_len", 512))
+        requested_lora_tasks = list(lora_paths.keys())
+        missing_lora_tasks = [task for task in self.task_names if task not in lora_paths]
+        extra_lora_tasks = [task for task in requested_lora_tasks if task not in self.task_names]
+        if missing_lora_tasks or extra_lora_tasks:
+            raise ValueError(
+                "LoRA task mismatch between router checkpoint and eval config. "
+                f"ckpt task_names={self.task_names}, "
+                f"config lora_paths keys={requested_lora_tasks}, "
+                f"missing_in_lora_paths={missing_lora_tasks}, "
+                f"extra_in_lora_paths={extra_lora_tasks}"
+            )
+        print(
+            "[INFO] loaded router ckpt config: "
+            f"task_names={self.task_names}, "
+            f"first_layer_idx={self.first_layer_idx}, "
+            f"middle_layer_idx={self.middle_layer_idx}, "
+            f"router_max_len={self.router_max_len}",
+            flush=True,
+        )
 
-        self.tokenizer = AutoTokenizer.from_pretrained(base_model_path)
+        self.local_files_only = bool(local_files_only)
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            base_model_path,
+            local_files_only=self.local_files_only,
+        )
         self.tokenizer.padding_side = "left"
         self.tokenizer.truncation_side = "left"
 
@@ -88,6 +116,7 @@ class UnifiedMoECoreInternalRouterCompactCachedJoint:
             base_model_path,
             torch_dtype=torch_dtype,
             device_map=device_map,
+            local_files_only=self.local_files_only,
         )
         self.model.eval()
 
@@ -96,7 +125,8 @@ class UnifiedMoECoreInternalRouterCompactCachedJoint:
         self.model.config.pad_token_id = self.tokenizer.pad_token_id
         self.model.config.eos_token_id = self.tokenizer.eos_token_id
 
-        self.num_layers = len(self.model.model.layers)
+        self.backbone_spec = infer_backbone_spec(self.model)
+        self.num_layers = len(get_decoder_layers(self.model, spec=self.backbone_spec))
         self.model = patch_llama_with_hard_routed_lora(
             self.model,
             num_experts=1 + len(self.task_names),
@@ -104,13 +134,17 @@ class UnifiedMoECoreInternalRouterCompactCachedJoint:
             alpha=alpha,
         )
 
-        for task, adapter_dir in lora_paths.items():
+        for task in self.task_names:
+            adapter_dir = lora_paths[task]
             task_id = self.task_names.index(task)
             expert_id = task_id + 1
             load_lora_into_expert(self.model, adapter_dir, expert_id)
 
         encoder_dir = os.path.join(router_ckpt_dir, "encoder")
-        self.router_tokenizer = AutoTokenizer.from_pretrained(router_bert_init)
+        self.router_tokenizer = AutoTokenizer.from_pretrained(
+            router_bert_init,
+            local_files_only=self.local_files_only,
+        )
         self.bert_encoder = BertExternalEncoder(encoder_dir)
 
         bert_hidden = self.bert_encoder.encoder.config.hidden_size
@@ -124,7 +158,10 @@ class UnifiedMoECoreInternalRouterCompactCachedJoint:
             nn.Linear(router_dim * 2, len(self.task_names) * len(self.task_names)),
         )
 
-        state = torch.load(os.path.join(router_ckpt_dir, "router_heads.pt"), map_location="cpu")
+        state_path = os.path.join(router_ckpt_dir, "router_heads.pt")
+        if not os.path.exists(state_path):
+            raise FileNotFoundError(f"Missing router heads checkpoint: {state_path}")
+        state = torch.load(state_path, map_location="cpu")
         first_state = state.get("router_first") or state.get("pair_first_encoder")
         mid_state = state.get("router_mid") or state.get("pair_mid_encoder")
         if first_state is None or mid_state is None:
@@ -181,8 +218,49 @@ class UnifiedMoECoreInternalRouterCompactCachedJoint:
             raise ValueError(f"Unknown forced task: {task_name}. Available tasks: {self.task_names}")
         return self.task_to_eid[task_name]
 
+    def _pair_idx_to_name(self, pair_idx: int) -> str:
+        num_tasks = len(self.task_names)
+        first_idx = int(pair_idx) // num_tasks
+        mid_idx = int(pair_idx) % num_tasks
+        return f"{self.task_names[first_idx]}->{self.task_names[mid_idx]}"
+
+    def _maybe_print_topk_pair_logits(
+        self,
+        pair_logits: torch.Tensor,
+        dataset_name: Optional[str],
+        prompt_preview: Optional[str],
+    ):
+        if self.debug_router_topk <= 0 or self.debug_router_max_prints <= 0:
+            return
+        if self.debug_router_print_count >= self.debug_router_max_prints:
+            return
+
+        topk = min(self.debug_router_topk, pair_logits.size(-1))
+        probs = torch.softmax(pair_logits.float(), dim=-1)
+        top_vals, top_idx = torch.topk(pair_logits.float(), k=topk, dim=-1)
+        top_probs = torch.gather(probs, dim=-1, index=top_idx)
+        preview = (prompt_preview or "").replace("\n", "\\n")[:160]
+        pieces = []
+        for rank in range(topk):
+            pair_name = self._pair_idx_to_name(int(top_idx[0, rank].item()))
+            logit = float(top_vals[0, rank].item())
+            prob = float(top_probs[0, rank].item())
+            pieces.append(f"{pair_name}:logit={logit:.4f},prob={prob:.4f}")
+        print(
+            f"[ROUTING_DEBUG][dataset={dataset_name or 'unknown'}] "
+            f"topk_pairs={' | '.join(pieces)} prompt={preview}",
+            flush=True,
+        )
+        self.debug_router_print_count += 1
+
     @torch.no_grad()
-    def _route_pair_from_vecs(self, first_vec: torch.Tensor, mid_vec: torch.Tensor):
+    def _route_pair_from_vecs(
+        self,
+        first_vec: torch.Tensor,
+        mid_vec: torch.Tensor,
+        dataset_name: Optional[str] = None,
+        prompt_preview: Optional[str] = None,
+    ):
         forced_first_eid = self._forced_task_to_eid(self.force_first_task)
         forced_mid_eid = self._forced_task_to_eid(self.force_mid_task)
         num_tasks = len(self.task_names)
@@ -214,6 +292,12 @@ class UnifiedMoECoreInternalRouterCompactCachedJoint:
                 mask[..., pair_idx] = keep
             pair_logits = pair_logits.masked_fill(~mask, float("-inf"))
 
+        self._maybe_print_topk_pair_logits(
+            pair_logits=pair_logits,
+            dataset_name=dataset_name,
+            prompt_preview=prompt_preview,
+        )
+
         pred_pair = int(pair_logits.argmax(dim=-1).item())
         first_eid = (pred_pair // num_tasks) + 1
         mid_eid = (pred_pair % num_tasks) + 1
@@ -225,6 +309,7 @@ class UnifiedMoECoreInternalRouterCompactCachedJoint:
 
     @torch.no_grad()
     def generate(self, prompts, max_new_tokens=None, gen_kwargs=None, **kwargs):
+        dataset_name = kwargs.pop("dataset_name", None)
         if isinstance(prompts, str):
             prompts = [prompts]
         if gen_kwargs is None:
@@ -252,7 +337,12 @@ class UnifiedMoECoreInternalRouterCompactCachedJoint:
             first_vec = hidden_states[self.first_layer_idx][:, -1, :]
             mid_vec = hidden_states[self.middle_layer_idx][:, -1, :]
 
-            first_eid, mid_eid = self._route_pair_from_vecs(first_vec, mid_vec)
+            first_eid, mid_eid = self._route_pair_from_vecs(
+                first_vec,
+                mid_vec,
+                dataset_name=dataset_name,
+                prompt_preview=prompt,
+            )
             self.cached_first_eid = first_eid
             self.cached_mid_eid = mid_eid
 

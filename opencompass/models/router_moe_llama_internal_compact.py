@@ -1,3 +1,4 @@
+####這是 OpenCompass wrapper，真正 eval config 通常是透過它來呼叫 core
 import json
 import os
 from typing import List, Optional

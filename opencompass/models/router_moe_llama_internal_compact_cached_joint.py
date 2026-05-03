@@ -56,8 +56,17 @@ class RouterMoELlamaInternalCompactCachedJoint(HuggingFacewithChatTemplate):
         max_seq_len: int = 2048,
         first_layer_idx: int = 0,
         middle_layer_idx: int = 15,
+        local_files_only: bool = False,
+        hf_offline: bool = False,
+        debug_router_topk: int = 0,
+        debug_router_max_prints: int = 0,
         **kwargs,
     ):
+        if hf_offline:
+            os.environ.setdefault("HF_DATASETS_OFFLINE", "1")
+            os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+            os.environ.setdefault("HF_EVALUATE_OFFLINE", "1")
+            os.environ.setdefault("HF_HUB_OFFLINE", "1")
         super().__init__(
             path=path,
             max_out_len=max_out_len,
@@ -81,6 +90,9 @@ class RouterMoELlamaInternalCompactCachedJoint(HuggingFacewithChatTemplate):
             middle_layer_idx=middle_layer_idx,
             force_first_task=None,
             force_mid_task=None,
+            local_files_only=local_files_only or hf_offline,
+            debug_router_topk=debug_router_topk,
+            debug_router_max_prints=debug_router_max_prints,
         )
         self._active_dataset_name = None
         self._printed_dataset_totals = {}
@@ -211,7 +223,11 @@ class RouterMoELlamaInternalCompactCachedJoint(HuggingFacewithChatTemplate):
 
         outputs = []
         for prompt in prompt_strs:
-            one_out = self.core.generate([prompt], gen_kwargs=gen_kwargs)
+            one_out = self.core.generate(
+                [prompt],
+                gen_kwargs=gen_kwargs,
+                dataset_name=dataset_name,
+            )
             if isinstance(one_out, list):
                 outputs.extend(one_out)
             else:
