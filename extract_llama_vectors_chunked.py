@@ -10,7 +10,8 @@ import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 from transformers import AutoModel, AutoModelForCausalLM, AutoTokenizer
-from opencompass.models.unified_moe_core_internal_router_compact import (
+from opencompass.models.router_moe_components import BertExternalEncoder, CompactCrossAttentionRouter
+from opencompass.models.router_moe_shared import (
     NULL_EXPERT_ID,
     load_lora_into_expert,
     patch_llama_with_hard_routed_lora,
@@ -191,61 +192,6 @@ class Collator:
             "label": [x["label"] for x in batch],
             "task": [x["task"] for x in batch],
         }
-
-
-class BertExternalEncoder(nn.Module):
-    def __init__(self, bert_name_or_path: str):
-        super().__init__()
-        self.encoder = AutoModel.from_pretrained(bert_name_or_path)
-
-    def forward(self, input_ids, attention_mask, token_type_ids=None):
-        kwargs = {
-            "input_ids": input_ids,
-            "attention_mask": attention_mask,
-            "output_hidden_states": True,
-            "return_dict": True,
-        }
-        if token_type_ids is not None:
-            kwargs["token_type_ids"] = token_type_ids
-        out = self.encoder(**kwargs)
-        return out.hidden_states[-2], out.hidden_states[-1]
-
-
-class CompactCrossAttentionRouter(nn.Module):
-    def __init__(self, llama_hidden_size: int, bert_hidden_size: int, router_dim: int, num_tasks: int):
-        super().__init__()
-        self.q_proj = nn.Linear(llama_hidden_size, router_dim)
-        self.k_proj = nn.Linear(bert_hidden_size, router_dim)
-        self.v_proj = nn.Linear(bert_hidden_size, router_dim)
-        self.out_norm = nn.LayerNorm(router_dim * 2)
-        self.classifier = nn.Linear(router_dim * 2, num_tasks)
-
-    def forward(self, llama_vec, bert_prev, bert_last, bert_attention_mask=None):
-        router_dtype = self.q_proj.weight.dtype
-        router_device = self.q_proj.weight.device
-
-        llama_vec = llama_vec.to(device=router_device, dtype=router_dtype)
-        bert_prev = bert_prev.to(device=router_device, dtype=router_dtype)
-        bert_last = bert_last.to(device=router_device, dtype=router_dtype)
-
-        q = self.q_proj(llama_vec).unsqueeze(1)
-        mem = torch.cat([bert_prev, bert_last], dim=1)
-        k = self.k_proj(mem)
-        v = self.v_proj(mem)
-
-        scores = torch.matmul(q, k.transpose(-1, -2)) / (q.size(-1) ** 0.5)
-        if bert_attention_mask is not None:
-            mask = torch.cat([bert_attention_mask, bert_attention_mask], dim=1)
-            mask = (mask == 0).unsqueeze(1).to(device=router_device)
-            scores = scores.masked_fill(mask, float("-inf"))
-
-        attn = torch.softmax(scores, dim=-1)
-        ctx = torch.matmul(attn, v).squeeze(1)
-        qv = q.squeeze(1)
-        feat = torch.cat([qv, ctx], dim=-1)
-        feat = self.out_norm(feat)
-        logits = self.classifier(feat)
-        return logits
 
 
 class LlamaVectorExtractor(torch.nn.Module):

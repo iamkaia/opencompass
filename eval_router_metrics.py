@@ -1,5 +1,4 @@
 import argparse
-import importlib.util
 import json
 import os
 from collections import defaultdict
@@ -11,30 +10,19 @@ import torch.nn as nn
 from torch.utils.data import DataLoader, Dataset
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-
-def _load_router_core_module():
-    module_path = os.path.join(
-        os.path.dirname(__file__),
-        "opencompass",
-        "models",
-        "unified_moe_core_internal_router_compact.py",
-    )
-    spec = importlib.util.spec_from_file_location("router_core_module", module_path)
-    if spec is None or spec.loader is None:
-        raise ImportError(f"Unable to load router core module from {module_path}")
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
-
-
-_router_core = _load_router_core_module()
-NULL_EXPERT_ID = _router_core.NULL_EXPERT_ID
-BertExternalEncoder = _router_core.BertExternalEncoder
-CompactCrossAttentionRouter = _router_core.CompactCrossAttentionRouter
-load_lora_into_expert = _router_core.load_lora_into_expert
-patch_llama_with_hard_routed_lora = _router_core.patch_llama_with_hard_routed_lora
-set_all_experts = _router_core.set_all_experts
-set_layer_range_expert = _router_core.set_layer_range_expert
+from model_backbone_specs import get_decoder_layers, infer_backbone_spec
+from opencompass.models.router_moe_components import (
+    BertExternalEncoder,
+    CompactCrossAttentionRouter,
+    PromptVectorExtractor,
+)
+from opencompass.models.router_moe_shared import (
+    NULL_EXPERT_ID,
+    load_lora_into_expert,
+    patch_llama_with_hard_routed_lora,
+    set_all_experts,
+    set_layer_range_expert,
+)
 
 
 DEFAULT_EXPERT_NAMES = ["iwslt2017", "medmcqa", "race", "squad2", "sst2"]
@@ -141,51 +129,6 @@ class Collator:
         )
 
 
-class PromptVectorExtractor(nn.Module):
-    def __init__(self, model: AutoModelForCausalLM, first_layer_idx: int, middle_layer_idx: int):
-        super().__init__()
-        self.model = model
-        self.first_layer_idx = int(first_layer_idx)
-        self.middle_layer_idx = int(middle_layer_idx)
-        self.cached_first = None
-        self.cached_mid = None
-        self._install_hooks()
-
-    def _install_hooks(self):
-        def first_pre_hook(module, args):
-            self.cached_first = args[0].detach()
-            return None
-
-        def mid_pre_hook(module, args):
-            self.cached_mid = args[0].detach()
-            return None
-
-        self.model.model.layers[self.first_layer_idx].input_layernorm.register_forward_pre_hook(first_pre_hook)
-        self.model.model.layers[self.middle_layer_idx].input_layernorm.register_forward_pre_hook(mid_pre_hook)
-
-    @staticmethod
-    def gather_last_valid(hidden_states: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
-        last_idx = attention_mask.sum(dim=1) - 1
-        last_idx = last_idx.clamp(min=0)
-        batch_idx = torch.arange(hidden_states.size(0), device=hidden_states.device)
-        return hidden_states[batch_idx, last_idx, :]
-
-    @torch.no_grad()
-    def extract(self, input_ids: torch.Tensor, attention_mask: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        self.cached_first = None
-        self.cached_mid = None
-        _ = self.model(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            use_cache=False,
-            output_attentions=False,
-            return_dict=True,
-        )
-        first_vec = self.gather_last_valid(self.cached_first, attention_mask)
-        mid_vec = self.gather_last_valid(self.cached_mid, attention_mask)
-        return first_vec, mid_vec
-
-
 class RouterEvalModel(nn.Module):
     def __init__(
         self,
@@ -212,6 +155,7 @@ class RouterEvalModel(nn.Module):
         self.model.eval()
         for p in self.model.parameters():
             p.requires_grad = False
+        self.backbone_spec = infer_backbone_spec(self.model)
 
         self.model = patch_llama_with_hard_routed_lora(
             self.model,
@@ -221,13 +165,19 @@ class RouterEvalModel(nn.Module):
         )
         self.first_layer_idx = int(first_layer_idx)
         self.middle_layer_idx = int(middle_layer_idx)
-        self.num_layers = len(self.model.model.layers)
+        self.num_layers = len(get_decoder_layers(self.model, spec=self.backbone_spec))
         self.task_to_expert_id = {task: self.expert2id[task] + 1 for task in self.expert_names}
 
         for task in self.expert_names:
             load_lora_into_expert(self.model, lora_paths[task], self.task_to_expert_id[task])
 
-        self.vector_extractor = PromptVectorExtractor(self.model, self.first_layer_idx, self.middle_layer_idx)
+        self.vector_extractor = PromptVectorExtractor(
+            self.model,
+            self.first_layer_idx,
+            self.middle_layer_idx,
+            pooling="last_token",
+            pooling_last_k=1,
+        )
         self.bert = BertExternalEncoder(router_bert_init)
         bert_hidden_size = self.bert.encoder.config.hidden_size
         llama_hidden_size = self.model.config.hidden_size
