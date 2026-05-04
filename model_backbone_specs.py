@@ -36,6 +36,11 @@ BACKBONE_SPECS: Dict[str, BackboneSpec] = {
         layers_attr_path=("model", "layers"),
         pre_attn_norm_name="input_layernorm",
     ),
+    "qwen3": BackboneSpec(
+        family="qwen3",
+        layers_attr_path=("model", "layers"),
+        pre_attn_norm_name="input_layernorm",
+    ),
     "qwen2_moe": BackboneSpec(
         family="qwen2_moe",
         layers_attr_path=("model", "layers"),
@@ -79,4 +84,3 @@ def set_decoder_layer(model: Any, layer_idx: int, new_layer: Any, spec: Backbone
 
 def get_pre_attn_norm(layer: Any, spec: BackboneSpec) -> Any:
     return getattr(layer, spec.pre_attn_norm_name)
-
