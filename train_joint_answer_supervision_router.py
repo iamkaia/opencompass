@@ -1326,7 +1326,7 @@ def main():
     parser.add_argument(
         "--joint_loss",
         type=str,
-        default="expected_loss"
+        default="expected_loss",
         choices=["ce_pair", "expected_loss", "ce_pair_plus_expected"],
         help="Joint-mode objective. Ignored for stage1/stage2.",
     )
