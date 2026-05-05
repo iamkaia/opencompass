@@ -928,6 +928,7 @@ def main():
             f"self_mid={val_metrics['self_mid_acc']:.4f} "
             f"oracle_self_pair={val_metrics['oracle_self_pair_acc']:.4f}"
         )
+        '''
         print_routing_summary(f"VAL-EPOCH{epoch}", val_metrics["routing_summary"])
         save_json(val_metrics["routing_summary"], os.path.join(args.out_dir, f"routing_summary_val_epoch{epoch}.json"))
         print_oracle_debug_summary(f"VAL-EPOCH{epoch}", val_metrics["oracle_debug_summary"])
@@ -959,7 +960,7 @@ def main():
             }
             wandb_payload.update(flatten_routing_summary(val_metrics["routing_summary"], prefix="val_route"))
             wandb_run.log(wandb_payload, step=global_step)
-
+        '''
         improved = val_metrics["router_argmax_score"] > (best_router_score + args.early_stop_min_delta)
         if improved:
             best_router_score = val_metrics["router_argmax_score"]
