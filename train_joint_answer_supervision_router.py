@@ -907,6 +907,55 @@ def score_from_cost(cost: torch.Tensor) -> torch.Tensor:
     return (1.0 - cost) * 100.0
 
 
+def task_names_from_ids(task_ids: Sequence[int], expert_names: Sequence[str]) -> List[str]:
+    names = []
+    for task_id in task_ids:
+        idx = int(task_id)
+        if 0 <= idx < len(expert_names):
+            names.append(str(expert_names[idx]))
+        else:
+            names.append(f"task_id:{idx}")
+    return names
+
+
+def optional_float(value: Optional[float], digits: int = 4) -> str:
+    if value is None or not math.isfinite(float(value)):
+        return "n/a"
+    return f"{float(value):.{digits}f}"
+
+
+def optional_rate(value: Optional[float]) -> str:
+    if value is None or not math.isfinite(float(value)):
+        return "n/a"
+    return f"{float(value):.2%}"
+
+
+def resolve_self_expert_ids(
+    task_ids: torch.Tensor,
+    expert_names: Sequence[str],
+    sample_task_names: Optional[Sequence[str]],
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if sample_task_names is None:
+        ids = task_ids.to(device=device, dtype=torch.long)
+        valid = (ids >= 0) & (ids < len(expert_names))
+        return ids, valid
+
+    expert2id = {name: idx for idx, name in enumerate(expert_names)}
+    ids = torch.tensor(
+        [expert2id.get(str(task_name), -1) for task_name in sample_task_names],
+        dtype=torch.long,
+        device=device,
+    )
+    return ids, ids >= 0
+
+
+def masked_mean(values: torch.Tensor, mask: torch.Tensor) -> float:
+    if bool(mask.any().item()):
+        return float(values[mask].float().mean().item())
+    return 0.0
+
+
 ####把 router 的預測結果，跟 oracle best route 比較，算出幾個核心 accuracy 指標。
 def compute_routing_accuracy_stats(
     pred_first: torch.Tensor,
@@ -914,21 +963,29 @@ def compute_routing_accuracy_stats(
     best_first: torch.Tensor,
     best_mid: torch.Tensor,
     task_ids: torch.Tensor,
+    expert_names: Sequence[str],
+    sample_task_names: Optional[Sequence[str]] = None,
 ) -> Dict[str, float]:
     pred_first = pred_first.detach()
     pred_mid = pred_mid.detach()
     best_first = best_first.detach()
     best_mid = best_mid.detach()
     task_ids = task_ids.to(device=pred_first.device)
+    self_ids, self_valid = resolve_self_expert_ids(
+        task_ids=task_ids,
+        expert_names=expert_names,
+        sample_task_names=sample_task_names,
+        device=pred_first.device,
+    )
 
     first_correct = (pred_first == best_first).float().mean().item()
     mid_correct = (pred_mid == best_mid).float().mean().item()
-    self_first_acc = (pred_first == task_ids).float().mean().item()
-    self_mid_acc = (pred_mid == task_ids).float().mean().item()
-    oracle_first_self_acc = (best_first == task_ids).float().mean().item()
-    oracle_mid_self_acc = (best_mid == task_ids).float().mean().item()
-    pred_self_pair_acc = ((pred_first == task_ids) & (pred_mid == task_ids)).float().mean().item()
-    oracle_self_pair_acc = ((best_first == task_ids) & (best_mid == task_ids)).float().mean().item()
+    self_first_acc = masked_mean(pred_first == self_ids, self_valid)
+    self_mid_acc = masked_mean(pred_mid == self_ids, self_valid)
+    oracle_first_self_acc = masked_mean(best_first == self_ids, self_valid)
+    oracle_mid_self_acc = masked_mean(best_mid == self_ids, self_valid)
+    pred_self_pair_acc = masked_mean((pred_first == self_ids) & (pred_mid == self_ids), self_valid)
+    oracle_self_pair_acc = masked_mean((best_first == self_ids) & (best_mid == self_ids), self_valid)
     pair_acc = ((pred_first == best_first) & (pred_mid == best_mid)).float().mean().item()
 
     return {
@@ -944,6 +1001,7 @@ def compute_routing_accuracy_stats(
         "oracle_mid_self_acc": oracle_mid_self_acc,
         "oracle_self_joint_acc": 0.5 * (oracle_first_self_acc + oracle_mid_self_acc),
         "oracle_self_pair_acc": oracle_self_pair_acc,
+        "self_applicable_ratio": float(self_valid.float().mean().item()),
     }
 
 
@@ -952,6 +1010,8 @@ def compute_route_score_stats(
     pred_pair: torch.Tensor,
     task_ids: torch.Tensor,
     loss_normalization: str = "sample_minmax",
+    expert_names: Optional[Sequence[str]] = None,
+    sample_task_names: Optional[Sequence[str]] = None,
 ) -> Dict[str, float]:
     score_loss_matrix = normalize_pair_loss_matrix(
         loss_matrix=loss_matrix,
@@ -963,16 +1023,29 @@ def compute_route_score_stats(
 
     pred_cost = flat_loss[batch_idx, pred_pair]
     oracle_cost = flat_loss[batch_idx, best_pair]
-    task_ids = task_ids.to(score_loss_matrix.device)
-    self_cost = score_loss_matrix[batch_idx, task_ids, task_ids]
+    if expert_names is None:
+        expert_names = [str(idx) for idx in range(score_loss_matrix.size(1))]
+    self_ids, self_valid = resolve_self_expert_ids(
+        task_ids=task_ids,
+        expert_names=expert_names,
+        sample_task_names=sample_task_names,
+        device=score_loss_matrix.device,
+    )
+    self_cost = score_loss_matrix[batch_idx, self_ids.clamp_min(0), self_ids.clamp_min(0)]
+    if bool(self_valid.any().item()):
+        fixed_self_score = float(score_from_cost(self_cost[self_valid]).mean().item())
+        fixed_self_cost = float(self_cost[self_valid].mean().item())
+    else:
+        fixed_self_score = float("nan")
+        fixed_self_cost = float("nan")
 
     return {
         "router_argmax_score": float(score_from_cost(pred_cost).mean().item()),
         "oracle_best_pair_score": float(score_from_cost(oracle_cost).mean().item()),
-        "fixed_self_score": float(score_from_cost(self_cost).mean().item()),
+        "fixed_self_score": fixed_self_score,
         "router_argmax_cost": float(pred_cost.mean().item()),
         "oracle_best_pair_cost": float(oracle_cost.mean().item()),
-        "fixed_self_cost": float(self_cost.mean().item()),
+        "fixed_self_cost": fixed_self_cost,
     }
 
 #####把整批資料的 routing 行為整理成一份結構化報告
@@ -983,10 +1056,13 @@ def build_routing_summary(
     best_mid_all: Sequence[int],
     task_ids_all: Sequence[int],
     expert_names: Sequence[str],
+    sample_task_names_all: Optional[Sequence[str]] = None,
     top_k: int = 5,
 ) -> Dict:
     if not pred_first_all:
         return {"num_samples": 0, "top_pred_pairs": [], "per_task": []}
+    if sample_task_names_all is None:
+        sample_task_names_all = task_names_from_ids(task_ids_all, expert_names)
 
     stats = compute_routing_accuracy_stats(
         pred_first=torch.tensor(pred_first_all, dtype=torch.long),
@@ -994,12 +1070,15 @@ def build_routing_summary(
         best_first=torch.tensor(best_first_all, dtype=torch.long),
         best_mid=torch.tensor(best_mid_all, dtype=torch.long),
         task_ids=torch.tensor(task_ids_all, dtype=torch.long),
+        expert_names=expert_names,
+        sample_task_names=sample_task_names_all,
     )
 
     num_samples = len(pred_first_all)
+    expert2id = {name: idx for idx, name in enumerate(expert_names)}
     pred_pair_counter = Counter()
     gold_pair_counter = Counter()
-    task_bucket: Dict[int, Dict[str, Counter]] = defaultdict(
+    task_bucket: Dict[str, Dict[str, Counter]] = defaultdict(
         lambda: {
             "pred_first": Counter(),
             "pred_mid": Counter(),
@@ -1008,15 +1087,15 @@ def build_routing_summary(
         }
     )
 
-    for pred_first, pred_mid, best_first, best_mid, task_id in zip(
-        pred_first_all, pred_mid_all, best_first_all, best_mid_all, task_ids_all
+    for pred_first, pred_mid, best_first, best_mid, task_name in zip(
+        pred_first_all, pred_mid_all, best_first_all, best_mid_all, sample_task_names_all
     ):
         pred_pair_name = f"{expert_names[pred_first]}->{expert_names[pred_mid]}"
         gold_pair_name = f"{expert_names[best_first]}->{expert_names[best_mid]}"
         pred_pair_counter[pred_pair_name] += 1
         gold_pair_counter[gold_pair_name] += 1
 
-        bucket = task_bucket[int(task_id)]
+        bucket = task_bucket[str(task_name)]
         bucket["pred_first"][expert_names[pred_first]] += 1
         bucket["pred_mid"][expert_names[pred_mid]] += 1
         bucket["pred_pair"][pred_pair_name] += 1
@@ -1035,31 +1114,43 @@ def build_routing_summary(
         return rows
 
     per_task = []
-    for task_id, task_name in enumerate(expert_names):
-        mask_count = sum(1 for x in task_ids_all if x == task_id)
+    for task_name in sorted(set(str(name) for name in sample_task_names_all)):
+        mask_count = sum(1 for name in sample_task_names_all if str(name) == task_name)
         if mask_count == 0:
             continue
 
-        pred_self_first = sum(
-            1 for pf, tid in zip(pred_first_all, task_ids_all) if tid == task_id and pf == task_id
-        )
-        pred_self_mid = sum(
-            1 for pm, tid in zip(pred_mid_all, task_ids_all) if tid == task_id and pm == task_id
-        )
-        gold_self_pair = sum(
-            1
-            for bf, bm, tid in zip(best_first_all, best_mid_all, task_ids_all)
-            if tid == task_id and bf == task_id and bm == task_id
-        )
+        self_expert_id = expert2id.get(task_name)
+        if self_expert_id is None:
+            pred_self_first_rate = None
+            pred_self_mid_rate = None
+            gold_self_pair_rate = None
+        else:
+            pred_self_first = sum(
+                1 for pf, name in zip(pred_first_all, sample_task_names_all)
+                if str(name) == task_name and pf == self_expert_id
+            )
+            pred_self_mid = sum(
+                1 for pm, name in zip(pred_mid_all, sample_task_names_all)
+                if str(name) == task_name and pm == self_expert_id
+            )
+            gold_self_pair = sum(
+                1
+                for bf, bm, name in zip(best_first_all, best_mid_all, sample_task_names_all)
+                if str(name) == task_name and bf == self_expert_id and bm == self_expert_id
+            )
+            pred_self_first_rate = float(pred_self_first / mask_count)
+            pred_self_mid_rate = float(pred_self_mid / mask_count)
+            gold_self_pair_rate = float(gold_self_pair / mask_count)
 
-        bucket = task_bucket[task_id]
+        bucket = task_bucket[task_name]
         per_task.append(
             {
                 "task": task_name,
                 "count": int(mask_count),
-                "pred_self_first_rate": float(pred_self_first / mask_count),
-                "pred_self_mid_rate": float(pred_self_mid / mask_count),
-                "gold_self_pair_rate": float(gold_self_pair / mask_count),
+                "has_self_expert": self_expert_id is not None,
+                "pred_self_first_rate": pred_self_first_rate,
+                "pred_self_mid_rate": pred_self_mid_rate,
+                "gold_self_pair_rate": gold_self_pair_rate,
                 "top_pred_first": _counter_rows(bucket["pred_first"], mask_count, limit=3),
                 "top_pred_mid": _counter_rows(bucket["pred_mid"], mask_count, limit=3),
                 "top_pred_pairs": _counter_rows(bucket["pred_pair"], mask_count, limit=3),
@@ -1076,6 +1167,7 @@ def build_routing_summary(
         "self_mid_acc": float(stats["self_mid_acc"]),
         "self_pair_acc": float(stats["self_pair_acc"]),
         "oracle_self_pair_acc": float(stats["oracle_self_pair_acc"]),
+        "self_applicable_ratio": float(stats["self_applicable_ratio"]),
         "top_pred_pairs": _counter_rows(pred_pair_counter, num_samples, limit=top_k),
         "top_gold_pairs": _counter_rows(gold_pair_counter, num_samples, limit=top_k),
         "per_task": per_task,
@@ -1093,8 +1185,8 @@ def print_routing_summary(tag: str, summary: Dict):
     )
     print(
         f"[ROUTE][{tag}] pair_acc={summary.get('pair_acc', 0.0):.4f} "
-        f"self_pair={summary.get('self_pair_acc', 0.0):.4f} "
-        f"oracle_self_pair={summary.get('oracle_self_pair_acc', 0.0):.4f} "
+        f"self_pair={optional_float(summary.get('self_pair_acc') if summary.get('self_applicable_ratio', 1.0) > 0 else None)} "
+        f"oracle_self_pair={optional_float(summary.get('oracle_self_pair_acc') if summary.get('self_applicable_ratio', 1.0) > 0 else None)} "
         f"top_pred_pairs={top_pairs}"
     )
     for row in summary.get("per_task", []):
@@ -1106,9 +1198,9 @@ def print_routing_summary(tag: str, summary: Dict):
         pair_name = top_pair[0]["name"] if top_pair else "-"
         print(
             f"[ROUTE][{tag}][{row['task']}] n={row['count']} "
-            f"self_first={row['pred_self_first_rate']:.2%} "
-            f"self_mid={row['pred_self_mid_rate']:.2%} "
-            f"oracle_self_pair={row['gold_self_pair_rate']:.2%} "
+            f"self_first={optional_rate(row.get('pred_self_first_rate'))} "
+            f"self_mid={optional_rate(row.get('pred_self_mid_rate'))} "
+            f"oracle_self_pair={optional_rate(row.get('gold_self_pair_rate'))} "
             f"top_first={first_name} top_mid={mid_name} top_pair={pair_name}"
         )
 
@@ -1120,15 +1212,15 @@ def init_oracle_debug_accumulator(expert_names: Sequence[str]) -> Dict:
         "global_gold_pair_counter": Counter(),
         "global_gap_values": [],
         "global_self_minus_oracle_values": [],
-        "per_task": {
-            task_name: {
+        "per_task": defaultdict(
+            lambda: {
                 "count": 0,
                 "gold_pair_counter": Counter(),
                 "gap_values": [],
                 "self_minus_oracle_values": [],
+                "has_self_expert": False,
             }
-            for task_name in expert_names
-        },
+        ),
     }
 
 
@@ -1136,6 +1228,7 @@ def update_oracle_debug_accumulator(
     acc: Dict,
     loss_matrix: torch.Tensor,
     task_ids: torch.Tensor,
+    sample_task_names: Optional[Sequence[str]] = None,
 ):
     expert_names = acc["expert_names"]
     num_pairs = loss_matrix.size(1) * loss_matrix.size(2)
@@ -1146,33 +1239,42 @@ def update_oracle_debug_accumulator(
     second_cost = sorted_loss[:, 1] if num_pairs > 1 else sorted_loss[:, 0]
     gap = second_cost - best_cost
     batch_idx = torch.arange(loss_matrix.size(0), device=loss_matrix.device)
-    task_ids = task_ids.to(loss_matrix.device)
-    self_cost = loss_matrix[batch_idx, task_ids, task_ids]
+    self_ids, self_valid = resolve_self_expert_ids(
+        task_ids=task_ids,
+        expert_names=expert_names,
+        sample_task_names=sample_task_names,
+        device=loss_matrix.device,
+    )
+    self_cost = loss_matrix[batch_idx, self_ids.clamp_min(0), self_ids.clamp_min(0)]
     self_minus_oracle = self_cost - best_cost
 
     best_pair_cpu = best_pair.detach().cpu().tolist()
     gap_cpu = gap.detach().cpu().tolist()
     self_minus_oracle_cpu = self_minus_oracle.detach().cpu().tolist()
-    task_ids_cpu = task_ids.detach().cpu().tolist()
+    self_valid_cpu = self_valid.detach().cpu().tolist()
+    if sample_task_names is None:
+        sample_task_names = task_names_from_ids(task_ids.detach().cpu().tolist(), expert_names)
 
     acc["num_samples"] += len(best_pair_cpu)
     acc["global_gap_values"].extend(float(x) for x in gap_cpu)
-    acc["global_self_minus_oracle_values"].extend(float(x) for x in self_minus_oracle_cpu)
 
-    for pair_id, gap_value, delta_value, task_id in zip(
-        best_pair_cpu, gap_cpu, self_minus_oracle_cpu, task_ids_cpu
+    for pair_id, gap_value, delta_value, has_self_expert, task_name in zip(
+        best_pair_cpu, gap_cpu, self_minus_oracle_cpu, self_valid_cpu, sample_task_names
     ):
         first_idx = int(pair_id) // loss_matrix.size(2)
         mid_idx = int(pair_id) % loss_matrix.size(2)
         pair_name = f"{expert_names[first_idx]}->{expert_names[mid_idx]}"
-        task_name = expert_names[int(task_id)]
+        task_name = str(task_name)
 
         acc["global_gold_pair_counter"][pair_name] += 1
         task_bucket = acc["per_task"][task_name]
         task_bucket["count"] += 1
         task_bucket["gold_pair_counter"][pair_name] += 1
         task_bucket["gap_values"].append(float(gap_value))
-        task_bucket["self_minus_oracle_values"].append(float(delta_value))
+        if bool(has_self_expert):
+            task_bucket["has_self_expert"] = True
+            task_bucket["self_minus_oracle_values"].append(float(delta_value))
+            acc["global_self_minus_oracle_values"].append(float(delta_value))
 
 
 def build_oracle_debug_summary(acc: Dict, top_k: int = 5) -> Dict:
@@ -1206,10 +1308,11 @@ def build_oracle_debug_summary(acc: Dict, top_k: int = 5) -> Dict:
     global_gaps = acc["global_gap_values"]
     global_deltas = acc["global_self_minus_oracle_values"]
     per_task = []
-    for task_name in acc["expert_names"]:
+    for task_name in sorted(acc["per_task"].keys()):
         bucket = acc["per_task"][task_name]
         if bucket["count"] <= 0:
             continue
+        delta_values = bucket["self_minus_oracle_values"]
         per_task.append(
             {
                 "task": task_name,
@@ -1217,7 +1320,8 @@ def build_oracle_debug_summary(acc: Dict, top_k: int = 5) -> Dict:
                 "avg_gap": _mean(bucket["gap_values"]),
                 "p50_gap": _quantile(bucket["gap_values"], 0.5),
                 "p90_gap": _quantile(bucket["gap_values"], 0.9),
-                "avg_self_minus_oracle": _mean(bucket["self_minus_oracle_values"]),
+                "has_self_expert": bool(bucket.get("has_self_expert", False)),
+                "avg_self_minus_oracle": _mean(delta_values) if delta_values else None,
                 "top_gold_pairs": _counter_rows(bucket["gold_pair_counter"], bucket["count"], top_k),
             }
         )
@@ -1227,7 +1331,7 @@ def build_oracle_debug_summary(acc: Dict, top_k: int = 5) -> Dict:
         "avg_gap": _mean(global_gaps),
         "p50_gap": _quantile(global_gaps, 0.5),
         "p90_gap": _quantile(global_gaps, 0.9),
-        "avg_self_minus_oracle": _mean(global_deltas),
+        "avg_self_minus_oracle": _mean(global_deltas) if global_deltas else None,
         "top_gold_pairs": _counter_rows(acc["global_gold_pair_counter"], num_samples, top_k),
         "per_task": per_task,
     }
@@ -1245,7 +1349,7 @@ def print_oracle_debug_summary(tag: str, summary: Dict):
         f"[ORACLE][{tag}] avg_gap={summary.get('avg_gap', 0.0):.4f} "
         f"p50_gap={summary.get('p50_gap', 0.0):.4f} "
         f"p90_gap={summary.get('p90_gap', 0.0):.4f} "
-        f"avg_self_minus_oracle={summary.get('avg_self_minus_oracle', 0.0):.4f} "
+        f"avg_self_minus_oracle={optional_float(summary.get('avg_self_minus_oracle'))} "
         f"top_gold_pairs={top_gold}"
     )
     for row in summary.get("per_task", []):
@@ -1255,7 +1359,7 @@ def print_oracle_debug_summary(tag: str, summary: Dict):
             f"[ORACLE][{tag}][{row['task']}] n={row['count']} "
             f"avg_gap={row['avg_gap']:.4f} "
             f"p50_gap={row['p50_gap']:.4f} "
-            f"avg_self_minus_oracle={row['avg_self_minus_oracle']:.4f} "
+            f"avg_self_minus_oracle={optional_float(row.get('avg_self_minus_oracle'))} "
             f"top_gold_pair={top_gold_name}"
         )
 
@@ -1301,6 +1405,7 @@ def evaluate(
     best_first_all: List[int] = []
     best_mid_all: List[int] = []
     task_ids_all: List[int] = []
+    task_names_all: List[str] = []
     oracle_debug_acc = init_oracle_debug_accumulator(model.expert_names)
 
     progress = make_progress(loader, total=len(loader), desc="eval")
@@ -1376,23 +1481,29 @@ def evaluate(
             best_first=best_first,
             best_mid=best_mid,
             task_ids=batch.task_ids,
+            expert_names=model.expert_names,
+            sample_task_names=batch.task_names,
         )
         score_stats = compute_route_score_stats(
             loss_matrix=loss_matrix,
             pred_pair=pred_pair,
             task_ids=batch.task_ids,
             loss_normalization=pair_loss_normalization,
+            expert_names=model.expert_names,
+            sample_task_names=batch.task_names,
         )
         update_oracle_debug_accumulator(
             acc=oracle_debug_acc,
             loss_matrix=loss_matrix,
             task_ids=batch.task_ids,
+            sample_task_names=batch.task_names,
         )
         pred_first_all.extend(pred_first.cpu().tolist())
         pred_mid_all.extend(pred_mid.cpu().tolist())
         best_first_all.extend(best_first.cpu().tolist())
         best_mid_all.extend(best_mid.cpu().tolist())
         task_ids_all.extend(batch.task_ids.cpu().tolist())
+        task_names_all.extend(str(name) for name in batch.task_names)
 
         total_loss += loss.item() * batch_size
         total_samples += batch_size
@@ -1423,6 +1534,7 @@ def evaluate(
         best_mid_all=best_mid_all,
         task_ids_all=task_ids_all,
         expert_names=model.expert_names,
+        sample_task_names_all=task_names_all,
     )
     result["oracle_debug_summary"] = build_oracle_debug_summary(oracle_debug_acc)
     return result
@@ -1748,19 +1860,19 @@ def main():
         print(
             f"[EVAL] split={args.eval_split} loss={eval_metrics['loss']:.4f} "
             f"router_score={eval_metrics['router_argmax_score']:.2f} "
-            f"self_score={eval_metrics['fixed_self_score']:.2f} "
+            f"self_score={optional_float(eval_metrics.get('fixed_self_score'), digits=2)} "
             f"oracle_score={eval_metrics['oracle_best_pair_score']:.2f} "
             f"first_acc={eval_metrics['first_acc']:.4f} "
             f"mid_acc={eval_metrics['mid_acc']:.4f} "
             f"joint_acc={eval_metrics['joint_acc']:.4f} "
             f"pair_acc={eval_metrics['pair_acc']:.4f} "
-            f"self_first={eval_metrics['self_first_acc']:.4f} "
-            f"self_mid={eval_metrics['self_mid_acc']:.4f} "
-            f"self_joint={eval_metrics['self_joint_acc']:.4f} "
-            f"self_pair={eval_metrics['self_pair_acc']:.4f} "
-            f"oracle_first_self={eval_metrics['oracle_first_self_acc']:.4f} "
-            f"oracle_mid_self={eval_metrics['oracle_mid_self_acc']:.4f} "
-            f"oracle_self_pair={eval_metrics['oracle_self_pair_acc']:.4f}"
+            f"self_first={optional_float(eval_metrics.get('self_first_acc') if eval_metrics.get('self_applicable_ratio', 1.0) > 0 else None)} "
+            f"self_mid={optional_float(eval_metrics.get('self_mid_acc') if eval_metrics.get('self_applicable_ratio', 1.0) > 0 else None)} "
+            f"self_joint={optional_float(eval_metrics.get('self_joint_acc') if eval_metrics.get('self_applicable_ratio', 1.0) > 0 else None)} "
+            f"self_pair={optional_float(eval_metrics.get('self_pair_acc') if eval_metrics.get('self_applicable_ratio', 1.0) > 0 else None)} "
+            f"oracle_first_self={optional_float(eval_metrics.get('oracle_first_self_acc') if eval_metrics.get('self_applicable_ratio', 1.0) > 0 else None)} "
+            f"oracle_mid_self={optional_float(eval_metrics.get('oracle_mid_self_acc') if eval_metrics.get('self_applicable_ratio', 1.0) > 0 else None)} "
+            f"oracle_self_pair={optional_float(eval_metrics.get('oracle_self_pair_acc') if eval_metrics.get('self_applicable_ratio', 1.0) > 0 else None)}"
         )
         print_routing_summary(tag=f"EVAL-{args.eval_split}", summary=eval_metrics["routing_summary"])
         save_json(
@@ -1799,6 +1911,7 @@ def main():
         train_best_first_all: List[int] = []
         train_best_mid_all: List[int] = []
         train_task_ids_all: List[int] = []
+        train_task_names_all: List[str] = []
         train_oracle_debug_acc = init_oracle_debug_accumulator(expert_names)
 
         train_progress = make_progress(
@@ -1889,10 +2002,12 @@ def main():
             train_best_first_all.extend(best_first.detach().cpu().tolist())
             train_best_mid_all.extend(best_mid.detach().cpu().tolist())
             train_task_ids_all.extend(batch.task_ids.cpu().tolist())
+            train_task_names_all.extend(str(name) for name in batch.task_names)
             update_oracle_debug_accumulator(
                 acc=train_oracle_debug_acc,
                 loss_matrix=loss_matrix,
                 task_ids=batch.task_ids,
+                sample_task_names=batch.task_names,
             )
 
             if tqdm is not None:
@@ -1902,6 +2017,8 @@ def main():
                     best_first=best_first,
                     best_mid=best_mid,
                     task_ids=batch.task_ids,
+                    expert_names=expert_names,
+                    sample_task_names=batch.task_names,
                 )
                 train_progress.set_postfix(
                     loss=f"{(running_loss / max(running_count, 1)):.4f}",
@@ -1919,6 +2036,8 @@ def main():
                     best_first=best_first,
                     best_mid=best_mid,
                     task_ids=batch.task_ids,
+                    expert_names=expert_names,
+                    sample_task_names=batch.task_names,
                 )
                 avg_loss = running_loss / max(running_count, 1)
                 if wandb_run is not None:
@@ -1952,8 +2071,9 @@ def main():
                     f"best_pair={metrics['best_pair_loss']:.4f} "
                     f"first_acc={batch_stats['first_acc']:.4f} mid_acc={batch_stats['mid_acc']:.4f} "
                     f"pair_acc={batch_stats['pair_acc']:.4f} "
-                    f"self_first={batch_stats['self_first_acc']:.4f} self_mid={batch_stats['self_mid_acc']:.4f} "
-                    f"oracle_self_pair={batch_stats['oracle_self_pair_acc']:.4f}"
+                    f"self_first={optional_float(batch_stats.get('self_first_acc') if batch_stats.get('self_applicable_ratio', 1.0) > 0 else None)} "
+                    f"self_mid={optional_float(batch_stats.get('self_mid_acc') if batch_stats.get('self_applicable_ratio', 1.0) > 0 else None)} "
+                    f"oracle_self_pair={optional_float(batch_stats.get('oracle_self_pair_acc') if batch_stats.get('self_applicable_ratio', 1.0) > 0 else None)}"
                 )
 
         train_routing_summary = build_routing_summary(
@@ -1963,6 +2083,7 @@ def main():
             best_mid_all=train_best_mid_all,
             task_ids_all=train_task_ids_all,
             expert_names=expert_names,
+            sample_task_names_all=train_task_names_all,
         )
         print_routing_summary(tag=f"TRAIN-EPOCH{epoch}", summary=train_routing_summary)
         save_json(
@@ -1994,14 +2115,14 @@ def main():
         print(
             f"[VAL] epoch={epoch} loss={val_metrics['loss']:.4f} "
             f"router_score={val_metrics['router_argmax_score']:.2f} "
-            f"self_score={val_metrics['fixed_self_score']:.2f} "
+            f"self_score={optional_float(val_metrics.get('fixed_self_score'), digits=2)} "
             f"oracle_score={val_metrics['oracle_best_pair_score']:.2f} "
             f"first_acc={val_metrics['first_acc']:.4f} "
             f"mid_acc={val_metrics['mid_acc']:.4f} "
             f"pair_acc={val_metrics['pair_acc']:.4f} "
-            f"self_first={val_metrics['self_first_acc']:.4f} "
-            f"self_mid={val_metrics['self_mid_acc']:.4f} "
-            f"oracle_self_pair={val_metrics['oracle_self_pair_acc']:.4f}"
+            f"self_first={optional_float(val_metrics.get('self_first_acc') if val_metrics.get('self_applicable_ratio', 1.0) > 0 else None)} "
+            f"self_mid={optional_float(val_metrics.get('self_mid_acc') if val_metrics.get('self_applicable_ratio', 1.0) > 0 else None)} "
+            f"oracle_self_pair={optional_float(val_metrics.get('oracle_self_pair_acc') if val_metrics.get('self_applicable_ratio', 1.0) > 0 else None)}"
         )
         print_routing_summary(tag=f"VAL-EPOCH{epoch}", summary=val_metrics["routing_summary"])
         save_json(
