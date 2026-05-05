@@ -1586,6 +1586,17 @@ def main():
         help="skip training and only evaluate router checkpoint on eval datasets",
     )
     parser.add_argument(
+        "--eval_data_during_train",
+        action="store_true",
+        help="also evaluate eval_data_root after training epochs, useful for monitoring old tasks while training on new tasks",
+    )
+    parser.add_argument(
+        "--eval_data_every_epochs",
+        type=int,
+        default=1,
+        help="run eval_data_root evaluation every N epochs when --eval_data_during_train is set",
+    )
+    parser.add_argument(
         "--expert_names",
         type=str,
         default=None,
@@ -2153,6 +2164,62 @@ def main():
                 "val/best_router_argmax_score": max(best_router_score, val_metrics["router_argmax_score"]),
             }
             wandb_run.log(payload)
+
+        if args.eval_data_during_train and epoch % max(1, args.eval_data_every_epochs) == 0:
+            eval_data_metrics = evaluate(
+                model=model,
+                loader=eval_loader,
+                llm_tokenizer=llm_tokenizer,
+                bert_tokenizer=bert_tokenizer,
+                device=device,
+                max_llm_len=args.max_llm_len,
+                max_bert_len=args.max_bert_len,
+                add_eos_to_target=args.add_eos_to_target,
+                train_mode=args.train_mode,
+                joint_loss=args.joint_loss,
+                pseudo_ce_weight=args.pseudo_ce_weight,
+                pseudo_ce_margin=args.pseudo_ce_margin,
+                pair_loss_normalization=args.pair_loss_normalization,
+            )
+            print(
+                f"[EVAL-DATA] epoch={epoch} split={args.eval_split} "
+                f"loss={eval_data_metrics['loss']:.4f} "
+                f"router_score={eval_data_metrics['router_argmax_score']:.2f} "
+                f"self_score={optional_float(eval_data_metrics.get('fixed_self_score'), digits=2)} "
+                f"oracle_score={eval_data_metrics['oracle_best_pair_score']:.2f} "
+                f"first_acc={eval_data_metrics['first_acc']:.4f} "
+                f"mid_acc={eval_data_metrics['mid_acc']:.4f} "
+                f"pair_acc={eval_data_metrics['pair_acc']:.4f}"
+            )
+            print_routing_summary(
+                tag=f"EVAL-DATA-EPOCH{epoch}",
+                summary=eval_data_metrics["routing_summary"],
+            )
+            save_json(
+                eval_data_metrics["routing_summary"],
+                os.path.join(args.output_dir, f"routing_summary_eval_data_epoch{epoch}.json"),
+            )
+            print_oracle_debug_summary(
+                tag=f"EVAL-DATA-EPOCH{epoch}",
+                summary=eval_data_metrics["oracle_debug_summary"],
+            )
+            save_json(
+                eval_data_metrics["oracle_debug_summary"],
+                os.path.join(args.output_dir, f"oracle_debug_eval_data_epoch{epoch}.json"),
+            )
+            if wandb_run is not None:
+                wandb_run.log(
+                    {
+                        "eval_data/epoch": epoch,
+                        "eval_data/loss": eval_data_metrics["loss"],
+                        "eval_data/router_argmax_score": eval_data_metrics["router_argmax_score"],
+                        "eval_data/fixed_self_score": eval_data_metrics["fixed_self_score"],
+                        "eval_data/oracle_best_pair_score": eval_data_metrics["oracle_best_pair_score"],
+                        "eval_data/first_acc": eval_data_metrics["first_acc"],
+                        "eval_data/mid_acc": eval_data_metrics["mid_acc"],
+                        "eval_data/pair_acc": eval_data_metrics["pair_acc"],
+                    }
+                )
 
         state = {
             "pair_first_encoder": model.router_first.state_dict(),
