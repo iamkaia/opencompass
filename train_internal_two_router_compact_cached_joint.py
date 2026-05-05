@@ -94,7 +94,7 @@ class CachedLossMatrixDataset(Dataset):
     def __getitem__(self, idx):
         item = self.items[idx]
         return {
-            "text": item["text"],
+            "text": item.get("prompt_text", item["text"]),
             "task": item["task"],
             "task_id": int(item["task_id"]),
             "first_vec": item["first_vec"],
