@@ -139,6 +139,8 @@ def analyze_split(feature_root: str, split: str, task_names: Sequence[str]) -> D
     return {
         "split": split,
         "feature_root": feature_root,
+        "loss_normalization": str(manifest.get("loss_normalization") or "none"),
+        "loss_normalization_scope": str(manifest.get("loss_normalization_scope") or "raw"),
         "task_names": list(task_names),
         "num_samples": num_samples,
         "avg_gap": mean(global_gap_values),
@@ -152,7 +154,9 @@ def analyze_split(feature_root: str, split: str, task_names: Sequence[str]) -> D
 
 def print_summary(summary: Dict):
     print(
-        f"[ANALYZE][{summary['split']}] num_samples={summary['num_samples']} "
+        f"[ANALYZE][{summary['split']}] normalization={summary.get('loss_normalization', 'none')} "
+        f"scope={summary.get('loss_normalization_scope', 'raw')} "
+        f"num_samples={summary['num_samples']} "
         f"avg_gap={summary['avg_gap']:.4f} "
         f"p50_gap={summary['p50_gap']:.4f} "
         f"p90_gap={summary['p90_gap']:.4f} "
