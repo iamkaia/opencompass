@@ -1113,6 +1113,21 @@ def build_routing_summary(
             )
         return rows
 
+    def _all_pair_rows(counter: Counter, denom: int) -> List[Dict]:
+        rows = []
+        for first_name in expert_names:
+            for mid_name in expert_names:
+                pair_name = f"{first_name}->{mid_name}"
+                count = int(counter.get(pair_name, 0))
+                rows.append(
+                    {
+                        "name": pair_name,
+                        "count": count,
+                        "rate": float(count / max(denom, 1)),
+                    }
+                )
+        return rows
+
     per_task = []
     for task_name in sorted(set(str(name) for name in sample_task_names_all)):
         mask_count = sum(1 for name in sample_task_names_all if str(name) == task_name)
@@ -1155,6 +1170,8 @@ def build_routing_summary(
                 "top_pred_mid": _counter_rows(bucket["pred_mid"], mask_count, limit=3),
                 "top_pred_pairs": _counter_rows(bucket["pred_pair"], mask_count, limit=3),
                 "top_gold_pairs": _counter_rows(bucket["gold_pair"], mask_count, limit=3),
+                "all_pred_pairs": _all_pair_rows(bucket["pred_pair"], mask_count),
+                "all_gold_pairs": _all_pair_rows(bucket["gold_pair"], mask_count),
             }
         )
 
@@ -1170,6 +1187,8 @@ def build_routing_summary(
         "self_applicable_ratio": float(stats["self_applicable_ratio"]),
         "top_pred_pairs": _counter_rows(pred_pair_counter, num_samples, limit=top_k),
         "top_gold_pairs": _counter_rows(gold_pair_counter, num_samples, limit=top_k),
+        "all_pred_pairs": _all_pair_rows(pred_pair_counter, num_samples),
+        "all_gold_pairs": _all_pair_rows(gold_pair_counter, num_samples),
         "per_task": per_task,
     }
     return summary
@@ -1189,6 +1208,10 @@ def print_routing_summary(tag: str, summary: Dict):
         f"oracle_self_pair={optional_float(summary.get('oracle_self_pair_acc') if summary.get('self_applicable_ratio', 1.0) > 0 else None)} "
         f"top_pred_pairs={top_pairs}"
     )
+    all_pairs = summary.get("all_pred_pairs", [])
+    if all_pairs:
+        pair_dist = ", ".join(f"{row['name']}:{row['rate']:.2%}" for row in all_pairs)
+        print(f"[ROUTE][{tag}][PAIR_DIST] {pair_dist}")
     for row in summary.get("per_task", []):
         top_first = row.get("top_pred_first", [])
         top_mid = row.get("top_pred_mid", [])
@@ -1203,6 +1226,10 @@ def print_routing_summary(tag: str, summary: Dict):
             f"oracle_self_pair={optional_rate(row.get('gold_self_pair_rate'))} "
             f"top_first={first_name} top_mid={mid_name} top_pair={pair_name}"
         )
+        task_all_pairs = row.get("all_pred_pairs", [])
+        if task_all_pairs:
+            task_pair_dist = ", ".join(f"{pair_row['name']}:{pair_row['rate']:.2%}" for pair_row in task_all_pairs)
+            print(f"[ROUTE][{tag}][{row['task']}][PAIR_DIST] {task_pair_dist}")
 
 
 def init_oracle_debug_accumulator(expert_names: Sequence[str]) -> Dict:
@@ -1650,7 +1677,7 @@ def main():
         choices=["ce_pair", "expected_loss", "ce_pair_plus_expected"],
         help="Joint-mode objective. Ignored for stage1/stage2.",
     )
-    parser.add_argument("--pseudo_ce_weight", type=float, default=0.5)
+    parser.add_argument("--pseudo_ce_weight", type=float, default=0.0)
     parser.add_argument("--pseudo_ce_margin", type=float, default=0.0)
     parser.add_argument(
         "--pair_loss_normalization",
