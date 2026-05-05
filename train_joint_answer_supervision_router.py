@@ -784,6 +784,25 @@ def compute_generated_dataset_scores(
             ))
     return torch.tensor(scores, dtype=torch.float32)
 
+
+def normalize_pair_loss_matrix(
+    loss_matrix: torch.Tensor,
+    method: str,
+) -> torch.Tensor:
+    method = str(method)
+    loss_matrix = loss_matrix.to(torch.float32)
+    if method == "none":
+        return loss_matrix
+    if method != "sample_minmax":
+        raise ValueError(f"Unknown pair loss normalization: {method}")
+
+    flat_loss = loss_matrix.view(loss_matrix.size(0), -1)
+    min_values = flat_loss.min(dim=-1, keepdim=True).values
+    max_values = flat_loss.max(dim=-1, keepdim=True).values
+    denom = (max_values - min_values).clamp_min(1e-6)
+    normalized_flat = (flat_loss - min_values) / denom
+    return normalized_flat.view_as(loss_matrix)
+
 ####用 oracle loss_matrix 找出最佳 pair，再把 router 預測跟這個 oracle 對齊，算出訓練 loss。
 def compute_pair_losses(
     pair_logits: torch.Tensor,
@@ -794,10 +813,16 @@ def compute_pair_losses(
     joint_loss: str,
     pseudo_ce_weight: float,
     margin: float,
+    loss_normalization: str = "sample_minmax",
 ) -> tuple[torch.Tensor, Dict[str, float], torch.Tensor, torch.Tensor, torch.Tensor]:
     mode = str(mode)
     joint_loss = str(joint_loss)
+    normalized_loss_matrix = normalize_pair_loss_matrix(
+        loss_matrix=loss_matrix,
+        method=loss_normalization,
+    )
     flat_loss = loss_matrix.view(loss_matrix.size(0), -1)
+    normalized_flat_loss = normalized_loss_matrix.view(normalized_loss_matrix.size(0), -1)
     flat_best = flat_loss.argmin(dim=-1)
     best_first = flat_best // loss_matrix.size(2)
     best_mid = flat_best % loss_matrix.size(2)
@@ -807,11 +832,11 @@ def compute_pair_losses(
     ###E[cost] = sum_k P(pair=k) * oracle_cost(pair=k)
     ####是soft supervision, 不是只看argmax而已，是看整個distribution的品質，這是什麼意思？
     ####:expected_loss 是 soft regularization，不保證 argmax 最優，所以它只能當輔助；主 supervision 還是 ce_pair(但這版已經確定會有問題了)
-    expected_loss = (pair_prob * flat_loss).sum(dim=-1).mean()
+    expected_loss = (pair_prob * normalized_flat_loss).sum(dim=-1).mean()
 
     ####把每個 sample 的所有 pair cost 排序。等等要用來判斷：最佳 pair 跟次佳 pair 差距夠不夠大
-    sorted_loss, _ = flat_loss.sort(dim=-1)
-    if flat_loss.size(1) > 1:
+    sorted_loss, _ = normalized_flat_loss.sort(dim=-1)
+    if normalized_flat_loss.size(1) > 1:
         margin_mask = (sorted_loss[:, 1] - sorted_loss[:, 0]) >= float(margin)
     else:
         margin_mask = torch.ones_like(flat_best, dtype=torch.bool)
@@ -849,11 +874,13 @@ def compute_pair_losses(
         metrics = {
             "expected_loss": float(expected_loss.detach().item()),
             "joint_loss_type": joint_loss,
+            "pair_loss_normalization": str(loss_normalization),
             "main_pair_ce": float(ce_pair.detach().item()),
             "pseudo_ce_pair": float(ce_pair.detach().item()),
             "pseudo_ce_first": float(ce_first.detach().item()),
             "pseudo_ce_mid": float(ce_mid.detach().item()),
             "best_pair_loss": float(sorted_loss[:, 0].mean().item()),
+            "raw_best_pair_loss": float(flat_loss.gather(1, flat_best.unsqueeze(1)).mean().item()),
             "margin_active_ratio": margin_active,
         }
         return total_loss, metrics, best_first, best_mid, flat_best
@@ -863,11 +890,13 @@ def compute_pair_losses(
     metrics = {
         "expected_loss": float(expected_loss.detach().item()),
         "joint_loss_type": joint_loss,
+        "pair_loss_normalization": str(loss_normalization),
         "main_pair_ce": float(ce_pair.detach().item()),
         "pseudo_ce_pair": float(ce_pair.detach().item()),
         "pseudo_ce_first": float(ce_first.detach().item()),
         "pseudo_ce_mid": float(ce_mid.detach().item()),
         "best_pair_loss": float(sorted_loss[:, 0].mean().item()),
+        "raw_best_pair_loss": float(flat_loss.gather(1, flat_best.unsqueeze(1)).mean().item()),
         "margin_active_ratio": margin_active,
     }
     ####total_loss才是真的可以拿來back propogation的東西
@@ -922,14 +951,20 @@ def compute_route_score_stats(
     loss_matrix: torch.Tensor,
     pred_pair: torch.Tensor,
     task_ids: torch.Tensor,
+    loss_normalization: str = "sample_minmax",
 ) -> Dict[str, float]:
-    flat_loss = loss_matrix.view(loss_matrix.size(0), -1)
+    score_loss_matrix = normalize_pair_loss_matrix(
+        loss_matrix=loss_matrix,
+        method=loss_normalization,
+    )
+    flat_loss = score_loss_matrix.view(score_loss_matrix.size(0), -1)
     best_pair = flat_loss.argmin(dim=-1)
-    batch_idx = torch.arange(loss_matrix.size(0), device=loss_matrix.device)
+    batch_idx = torch.arange(score_loss_matrix.size(0), device=score_loss_matrix.device)
 
     pred_cost = flat_loss[batch_idx, pred_pair]
     oracle_cost = flat_loss[batch_idx, best_pair]
-    self_cost = loss_matrix[batch_idx, task_ids.to(loss_matrix.device), task_ids.to(loss_matrix.device)]
+    task_ids = task_ids.to(score_loss_matrix.device)
+    self_cost = score_loss_matrix[batch_idx, task_ids, task_ids]
 
     return {
         "router_argmax_score": float(score_from_cost(pred_cost).mean().item()),
@@ -1255,6 +1290,7 @@ def evaluate(
     joint_loss: str,
     pseudo_ce_weight: float,
     pseudo_ce_margin: float,
+    pair_loss_normalization: str,
 ) -> Dict[str, float]:
     model.eval()
     total_loss = 0.0
@@ -1327,6 +1363,7 @@ def evaluate(
             joint_loss=joint_loss,
             pseudo_ce_weight=pseudo_ce_weight,
             margin=pseudo_ce_margin,
+            loss_normalization=pair_loss_normalization,
         )
 
         pred_pair = pair_logits.argmax(dim=-1)
@@ -1344,6 +1381,7 @@ def evaluate(
             loss_matrix=loss_matrix,
             pred_pair=pred_pair,
             task_ids=batch.task_ids,
+            loss_normalization=pair_loss_normalization,
         )
         update_oracle_debug_accumulator(
             acc=oracle_debug_acc,
@@ -1491,6 +1529,13 @@ def main():
     )
     parser.add_argument("--pseudo_ce_weight", type=float, default=0.5)
     parser.add_argument("--pseudo_ce_margin", type=float, default=0.0)
+    parser.add_argument(
+        "--pair_loss_normalization",
+        type=str,
+        default="sample_minmax",
+        choices=["none", "sample_minmax"],
+        help="Normalize each sample's oracle pair-cost matrix before expected-loss and margin filtering.",
+    )
     parser.add_argument("--add_eos_to_target", action="store_true")
     parser.add_argument("--num_workers", type=int, default=0)
     parser.add_argument("--seed", type=int, default=42)
@@ -1673,7 +1718,8 @@ def main():
     )
     print(
         f"[INFO] train_mode={args.train_mode} joint_loss={args.joint_loss} "
-        f"pseudo_ce_weight={args.pseudo_ce_weight} pseudo_ce_margin={args.pseudo_ce_margin}"
+        f"pseudo_ce_weight={args.pseudo_ce_weight} pseudo_ce_margin={args.pseudo_ce_margin} "
+        f"pair_loss_normalization={args.pair_loss_normalization}"
     )
     config = vars(args).copy()
     config["train_task_names"] = train_task_names
@@ -1697,6 +1743,7 @@ def main():
             joint_loss=args.joint_loss,
             pseudo_ce_weight=args.pseudo_ce_weight,
             pseudo_ce_margin=args.pseudo_ce_margin,
+            pair_loss_normalization=args.pair_loss_normalization,
         )
         print(
             f"[EVAL] split={args.eval_split} loss={eval_metrics['loss']:.4f} "
@@ -1821,6 +1868,7 @@ def main():
                 joint_loss=args.joint_loss,
                 pseudo_ce_weight=args.pseudo_ce_weight,
                 margin=args.pseudo_ce_margin,
+                loss_normalization=args.pair_loss_normalization,
             )
 
             optimizer.zero_grad()
@@ -1941,6 +1989,7 @@ def main():
             joint_loss=args.joint_loss,
             pseudo_ce_weight=args.pseudo_ce_weight,
             pseudo_ce_margin=args.pseudo_ce_margin,
+            pair_loss_normalization=args.pair_loss_normalization,
         )
         print(
             f"[VAL] epoch={epoch} loss={val_metrics['loss']:.4f} "
@@ -2018,6 +2067,7 @@ def main():
                     "router_pooling_last_k": args.router_pooling_last_k,
                     "pseudo_ce_margin": args.pseudo_ce_margin,
                     "pseudo_ce_weight": args.pseudo_ce_weight,
+                    "pair_loss_normalization": args.pair_loss_normalization,
                     "best_router_argmax_score": best_router_score,
                     "best_epoch": best_epoch,
                     "best_val_loss": val_metrics["loss"],
