@@ -1076,6 +1076,153 @@ def print_routing_summary(tag: str, summary: Dict):
         )
 
 
+def init_oracle_debug_accumulator(expert_names: Sequence[str]) -> Dict:
+    return {
+        "num_samples": 0,
+        "expert_names": list(expert_names),
+        "global_gold_pair_counter": Counter(),
+        "global_gap_values": [],
+        "global_self_minus_oracle_values": [],
+        "per_task": {
+            task_name: {
+                "count": 0,
+                "gold_pair_counter": Counter(),
+                "gap_values": [],
+                "self_minus_oracle_values": [],
+            }
+            for task_name in expert_names
+        },
+    }
+
+
+def update_oracle_debug_accumulator(
+    acc: Dict,
+    loss_matrix: torch.Tensor,
+    task_ids: torch.Tensor,
+):
+    expert_names = acc["expert_names"]
+    num_pairs = loss_matrix.size(1) * loss_matrix.size(2)
+    flat_loss = loss_matrix.view(loss_matrix.size(0), num_pairs)
+    sorted_loss, sorted_idx = flat_loss.sort(dim=-1)
+    best_pair = sorted_idx[:, 0]
+    best_cost = sorted_loss[:, 0]
+    second_cost = sorted_loss[:, 1] if num_pairs > 1 else sorted_loss[:, 0]
+    gap = second_cost - best_cost
+    batch_idx = torch.arange(loss_matrix.size(0), device=loss_matrix.device)
+    task_ids = task_ids.to(loss_matrix.device)
+    self_cost = loss_matrix[batch_idx, task_ids, task_ids]
+    self_minus_oracle = self_cost - best_cost
+
+    best_pair_cpu = best_pair.detach().cpu().tolist()
+    gap_cpu = gap.detach().cpu().tolist()
+    self_minus_oracle_cpu = self_minus_oracle.detach().cpu().tolist()
+    task_ids_cpu = task_ids.detach().cpu().tolist()
+
+    acc["num_samples"] += len(best_pair_cpu)
+    acc["global_gap_values"].extend(float(x) for x in gap_cpu)
+    acc["global_self_minus_oracle_values"].extend(float(x) for x in self_minus_oracle_cpu)
+
+    for pair_id, gap_value, delta_value, task_id in zip(
+        best_pair_cpu, gap_cpu, self_minus_oracle_cpu, task_ids_cpu
+    ):
+        first_idx = int(pair_id) // loss_matrix.size(2)
+        mid_idx = int(pair_id) % loss_matrix.size(2)
+        pair_name = f"{expert_names[first_idx]}->{expert_names[mid_idx]}"
+        task_name = expert_names[int(task_id)]
+
+        acc["global_gold_pair_counter"][pair_name] += 1
+        task_bucket = acc["per_task"][task_name]
+        task_bucket["count"] += 1
+        task_bucket["gold_pair_counter"][pair_name] += 1
+        task_bucket["gap_values"].append(float(gap_value))
+        task_bucket["self_minus_oracle_values"].append(float(delta_value))
+
+
+def build_oracle_debug_summary(acc: Dict, top_k: int = 5) -> Dict:
+    num_samples = int(acc.get("num_samples", 0))
+    if num_samples <= 0:
+        return {"num_samples": 0, "top_gold_pairs": [], "per_task": []}
+
+    def _counter_rows(counter: Counter, denom: int, limit: int) -> List[Dict]:
+        rows = []
+        for name, count in counter.most_common(limit):
+            rows.append(
+                {
+                    "name": name,
+                    "count": int(count),
+                    "rate": float(count / max(denom, 1)),
+                }
+            )
+        return rows
+
+    def _mean(values: Sequence[float]) -> float:
+        return float(sum(values) / max(len(values), 1))
+
+    def _quantile(values: Sequence[float], q: float) -> float:
+        if not values:
+            return 0.0
+        sorted_values = sorted(float(v) for v in values)
+        idx = int(round((len(sorted_values) - 1) * q))
+        idx = max(0, min(idx, len(sorted_values) - 1))
+        return float(sorted_values[idx])
+
+    global_gaps = acc["global_gap_values"]
+    global_deltas = acc["global_self_minus_oracle_values"]
+    per_task = []
+    for task_name in acc["expert_names"]:
+        bucket = acc["per_task"][task_name]
+        if bucket["count"] <= 0:
+            continue
+        per_task.append(
+            {
+                "task": task_name,
+                "count": int(bucket["count"]),
+                "avg_gap": _mean(bucket["gap_values"]),
+                "p50_gap": _quantile(bucket["gap_values"], 0.5),
+                "p90_gap": _quantile(bucket["gap_values"], 0.9),
+                "avg_self_minus_oracle": _mean(bucket["self_minus_oracle_values"]),
+                "top_gold_pairs": _counter_rows(bucket["gold_pair_counter"], bucket["count"], top_k),
+            }
+        )
+
+    return {
+        "num_samples": num_samples,
+        "avg_gap": _mean(global_gaps),
+        "p50_gap": _quantile(global_gaps, 0.5),
+        "p90_gap": _quantile(global_gaps, 0.9),
+        "avg_self_minus_oracle": _mean(global_deltas),
+        "top_gold_pairs": _counter_rows(acc["global_gold_pair_counter"], num_samples, top_k),
+        "per_task": per_task,
+    }
+
+
+def print_oracle_debug_summary(tag: str, summary: Dict):
+    if int(summary.get("num_samples", 0)) <= 0:
+        print(f"[ORACLE][{tag}] no samples")
+        return
+
+    top_gold = ", ".join(
+        f"{row['name']}:{row['rate']:.2%}" for row in summary.get("top_gold_pairs", [])[:3]
+    )
+    print(
+        f"[ORACLE][{tag}] avg_gap={summary.get('avg_gap', 0.0):.4f} "
+        f"p50_gap={summary.get('p50_gap', 0.0):.4f} "
+        f"p90_gap={summary.get('p90_gap', 0.0):.4f} "
+        f"avg_self_minus_oracle={summary.get('avg_self_minus_oracle', 0.0):.4f} "
+        f"top_gold_pairs={top_gold}"
+    )
+    for row in summary.get("per_task", []):
+        top_gold_rows = row.get("top_gold_pairs", [])
+        top_gold_name = top_gold_rows[0]["name"] if top_gold_rows else "-"
+        print(
+            f"[ORACLE][{tag}][{row['task']}] n={row['count']} "
+            f"avg_gap={row['avg_gap']:.4f} "
+            f"p50_gap={row['p50_gap']:.4f} "
+            f"avg_self_minus_oracle={row['avg_self_minus_oracle']:.4f} "
+            f"top_gold_pair={top_gold_name}"
+        )
+
+
 def save_runtime_compatible_router_bundle(
     model: JointAnswerSupervisionRouterModel,
     bert_tokenizer,
@@ -1116,6 +1263,7 @@ def evaluate(
     best_first_all: List[int] = []
     best_mid_all: List[int] = []
     task_ids_all: List[int] = []
+    oracle_debug_acc = init_oracle_debug_accumulator(model.expert_names)
 
     progress = make_progress(loader, total=len(loader), desc="eval")
     for batch in progress:
@@ -1192,6 +1340,11 @@ def evaluate(
             pred_pair=pred_pair,
             task_ids=batch.task_ids,
         )
+        update_oracle_debug_accumulator(
+            acc=oracle_debug_acc,
+            loss_matrix=loss_matrix,
+            task_ids=batch.task_ids,
+        )
         pred_first_all.extend(pred_first.cpu().tolist())
         pred_mid_all.extend(pred_mid.cpu().tolist())
         best_first_all.extend(best_first.cpu().tolist())
@@ -1228,6 +1381,7 @@ def evaluate(
         task_ids_all=task_ids_all,
         expert_names=model.expert_names,
     )
+    result["oracle_debug_summary"] = build_oracle_debug_summary(oracle_debug_acc)
     return result
 
 ## CLI 傳進來的逗號分隔字串 轉成 Python list。e.g. --expert_names iwslt2017,medmcqa,race 變成 ["iwslt2017", "medmcqa", "race"]
@@ -1593,6 +1747,7 @@ def main():
         train_best_first_all: List[int] = []
         train_best_mid_all: List[int] = []
         train_task_ids_all: List[int] = []
+        train_oracle_debug_acc = init_oracle_debug_accumulator(expert_names)
 
         train_progress = make_progress(
             train_loader,
@@ -1678,6 +1833,11 @@ def main():
             train_best_first_all.extend(best_first.detach().cpu().tolist())
             train_best_mid_all.extend(best_mid.detach().cpu().tolist())
             train_task_ids_all.extend(batch.task_ids.cpu().tolist())
+            update_oracle_debug_accumulator(
+                acc=train_oracle_debug_acc,
+                loss_matrix=loss_matrix,
+                task_ids=batch.task_ids,
+            )
 
             if tqdm is not None:
                 batch_stats = compute_routing_accuracy_stats(
@@ -1753,6 +1913,12 @@ def main():
             train_routing_summary,
             os.path.join(args.output_dir, f"routing_summary_train_epoch{epoch}.json"),
         )
+        train_oracle_debug_summary = build_oracle_debug_summary(train_oracle_debug_acc)
+        print_oracle_debug_summary(tag=f"TRAIN-EPOCH{epoch}", summary=train_oracle_debug_summary)
+        save_json(
+            train_oracle_debug_summary,
+            os.path.join(args.output_dir, f"oracle_debug_train_epoch{epoch}.json"),
+        )
 
         val_metrics = evaluate(
             model=model,
@@ -1785,6 +1951,11 @@ def main():
             val_metrics["routing_summary"],
             os.path.join(args.output_dir, f"routing_summary_val_epoch{epoch}.json"),
         )
+        print_oracle_debug_summary(tag=f"VAL-EPOCH{epoch}", summary=val_metrics["oracle_debug_summary"])
+        save_json(
+            val_metrics["oracle_debug_summary"],
+            os.path.join(args.output_dir, f"oracle_debug_val_epoch{epoch}.json"),
+        )
         if wandb_run is not None:
             payload = {
                 "val/epoch": epoch,
@@ -1794,6 +1965,9 @@ def main():
                 "val/router_argmax_score": val_metrics["router_argmax_score"],
                 "val/fixed_self_score": val_metrics["fixed_self_score"],
                 "val/oracle_best_pair_score": val_metrics["oracle_best_pair_score"],
+                "val/oracle_avg_gap": val_metrics["oracle_debug_summary"]["avg_gap"],
+                "val/oracle_p50_gap": val_metrics["oracle_debug_summary"]["p50_gap"],
+                "val/oracle_avg_self_minus_oracle": val_metrics["oracle_debug_summary"]["avg_self_minus_oracle"],
                 "val/first_acc": val_metrics["first_acc"],
                 "val/mid_acc": val_metrics["mid_acc"],
                 "val/pair_acc": val_metrics["pair_acc"],
