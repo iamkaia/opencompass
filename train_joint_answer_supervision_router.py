@@ -434,30 +434,32 @@ class JointAnswerSupervisionRouterModel(nn.Module):
                 set_layer_range_expert(self.model, self.middle_layer_idx, self.num_layers - 1, mid_eid)
                 combo_loss = torch.empty(batch_size, dtype=torch.float32, device=prompt_input_ids.device)
 
-                proxy_indices = [
+                token_nll_indices = [
                     idx for idx, task_name in enumerate(task_names)
                     if not _task_uses_generation_evaluator(task_name)
                 ]
-                if proxy_indices:
-                    proxy_index_tensor = torch.tensor(proxy_indices, dtype=torch.long, device=prompt_input_ids.device)
-                    proxy_prompt_ids = prompt_input_ids.index_select(0, proxy_index_tensor)
-                    proxy_prompt_mask = prompt_attention_mask.index_select(0, proxy_index_tensor)
-                    proxy_logits = self.model(
-                        input_ids=proxy_prompt_ids,
-                        attention_mask=proxy_prompt_mask,
+                if token_nll_indices:
+                    if input_ids is None or attention_mask is None or labels is None:
+                        raise ValueError(
+                            "Mixed score_mode requires input_ids, attention_mask, and labels for non-generation tasks"
+                        )
+                    token_nll_index_tensor = torch.tensor(
+                        token_nll_indices, dtype=torch.long, device=prompt_input_ids.device
+                    )
+                    token_nll_input_ids = input_ids.index_select(0, token_nll_index_tensor)
+                    token_nll_attention_mask = attention_mask.index_select(0, token_nll_index_tensor)
+                    token_nll_labels = labels.index_select(0, token_nll_index_tensor)
+                    token_nll_logits = self.model(
+                        input_ids=token_nll_input_ids,
+                        attention_mask=token_nll_attention_mask,
                         use_cache=False,
                         return_dict=True,
                     ).logits
-                    proxy_targets = [targets[idx] for idx in proxy_indices]
-                    proxy_tasks = [task_names[idx] for idx in proxy_indices]
-                    proxy_loss = compute_option_nll_proxy_scores(
-                        logits=proxy_logits,
-                        prompt_attention_mask=proxy_prompt_mask,
-                        targets=proxy_targets,
-                        task_names=proxy_tasks,
-                        tokenizer=llm_tokenizer,
+                    token_nll_loss = compute_sequence_nll(
+                        logits=token_nll_logits,
+                        labels=token_nll_labels,
                     ).to(device=prompt_input_ids.device, dtype=torch.float32)
-                    combo_loss.index_copy_(0, proxy_index_tensor, proxy_loss)
+                    combo_loss.index_copy_(0, token_nll_index_tensor, token_nll_loss)
 
                 generation_indices = [
                     idx for idx, task_name in enumerate(task_names)
@@ -1301,6 +1303,9 @@ def evaluate(
         loss_matrix = model.score_all_route_pairs(
             prompt_input_ids=prompt_input_ids,
             prompt_attention_mask=prompt_attention_mask,
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            labels=labels,
             targets=batch.targets,
             source_texts=batch.source_texts,
             task_names=batch.task_names,
@@ -1791,6 +1796,9 @@ def main():
                 loss_matrix = model.score_all_route_pairs(
                     prompt_input_ids=prompt_input_ids,
                     prompt_attention_mask=prompt_attention_mask,
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    labels=labels,
                     targets=batch.targets,
                     source_texts=batch.source_texts,
                     task_names=batch.task_names,

@@ -109,32 +109,18 @@ def process_split(
     )
 
     for batch_idx, batch in enumerate(progress, start=1):
-        if str(score_mode) == "token_nll":
-            lm_batch = build_lm_batch(
-                tokenizer=llm_tokenizer,
-                prompts=batch.texts,
-                targets=batch.targets,
-                max_length=max_llm_len,
-                add_eos_to_target=add_eos_to_target,
-            )
-            prompt_input_ids = lm_batch["prompt_input_ids"].to(device)
-            prompt_attention_mask = lm_batch["prompt_attention_mask"].to(device)
-            input_ids = lm_batch["input_ids"].to(device)
-            attention_mask = lm_batch["attention_mask"].to(device)
-            labels = lm_batch["labels"].to(device)
-        else:
-            prompt_batch = llm_tokenizer(
-                batch.texts,
-                return_tensors="pt",
-                padding=True,
-                truncation=True,
-                max_length=max_llm_len,
-            )
-            prompt_input_ids = prompt_batch["input_ids"].to(device)
-            prompt_attention_mask = prompt_batch["attention_mask"].to(device)
-            input_ids = None
-            attention_mask = None
-            labels = None
+        lm_batch = build_lm_batch(
+            tokenizer=llm_tokenizer,
+            prompts=batch.texts,
+            targets=batch.targets,
+            max_length=max_llm_len,
+            add_eos_to_target=add_eos_to_target,
+        )
+        prompt_input_ids = lm_batch["prompt_input_ids"].to(device)
+        prompt_attention_mask = lm_batch["prompt_attention_mask"].to(device)
+        input_ids = lm_batch["input_ids"].to(device)
+        attention_mask = lm_batch["attention_mask"].to(device)
+        labels = lm_batch["labels"].to(device)
 
         with torch.no_grad():
             first_vec, mid_vec = model.extract_prompt_vectors(
