@@ -1286,19 +1286,19 @@ def main():
     parser.add_argument("--router_bert_init", type=str, required=True)
     parser.add_argument("--output_dir", type=str, required=True)
     parser.add_argument("--load_router_ckpt_dir", type=str, default=None)
-    parser.add_argument("--lora_iwslt", type=str, default=None)
-    parser.add_argument("--lora_medmcqa", type=str, default=None)
-    parser.add_argument("--lora_race", type=str, default=None)
-    parser.add_argument("--lora_squad2", type=str, default=None)
-    parser.add_argument("--lora_sst2", type=str, default=None)
+    parser.add_argument("--lora_iwslt", type=str, default='./saves/llama2-7b-chat-hf/lora/sft_iwslt')
+    parser.add_argument("--lora_medmcqa", type=str, default='./saves/llama2-7b-chat-hf/lora/sft_medmcqa')
+    parser.add_argument("--lora_race", type=str, default='./saves/llama2-7b-chat-hf/lora/sft_race')
+    parser.add_argument("--lora_squad2", type=str, default="./saves/llama2-7b-chat-hf/lora/sft_squad20")
+    parser.add_argument("--lora_sst2", type=str, default="./saves/llama2-7b-chat-hf/lora/sft_sst2")
     parser.add_argument("--lora_piqa", type=str, default=None)
     parser.add_argument("--lora_copa", type=str, default=None)
     parser.add_argument("--lora_hellaswag", type=str, default=None)
     parser.add_argument("--lora_boolq", type=str, default=None)
     parser.add_argument("--lora_siqa", type=str, default=None)
-    parser.add_argument("--batch_size", type=int, default=1)
-    parser.add_argument("--eval_batch_size", type=int, default=1)
-    parser.add_argument("--epochs", type=int, default=3)
+    parser.add_argument("--batch_size", type=int, default=128)
+    parser.add_argument("--eval_batch_size", type=int, default=128)
+    parser.add_argument("--epochs", type=int, default=2)
     parser.add_argument("--lr", type=float, default=2e-5)
     parser.add_argument("--weight_decay", type=float, default=0.01)
     parser.add_argument("--warmup_ratio", type=float, default=0.05)
@@ -1326,7 +1326,7 @@ def main():
     parser.add_argument(
         "--joint_loss",
         type=str,
-        default="ce_pair_plus_expected",
+        default="expected_loss"
         choices=["ce_pair", "expected_loss", "ce_pair_plus_expected"],
         help="Joint-mode objective. Ignored for stage1/stage2.",
     )
