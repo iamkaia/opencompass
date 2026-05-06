@@ -142,11 +142,15 @@ class RouterTrainDataset(Dataset):
         seed: int = 42,
     ):
         items: List[Dict] = []
+        rng = random.Random(seed)
         for task in tasks:
             path = os.path.join(data_root, task, f"{split}.jsonl")
             if not os.path.exists(path):
                 raise FileNotFoundError(f"Missing dataset file: {path}")
             rows = read_jsonl(path)
+            rng.shuffle(rows)
+            if max_samples is not None:
+                rows = rows[: int(max_samples)]
             for row in rows:
                 prompt = row.get("text") or row.get("source_text")
                 target = row.get("target") or row.get("answer") or row.get("output")
@@ -163,10 +167,7 @@ class RouterTrainDataset(Dataset):
                     }
                 )
 
-        rng = random.Random(seed)
         rng.shuffle(items)
-        if max_samples is not None:
-            items = items[: int(max_samples)]
         self.items = items
 
     def __len__(self) -> int:
@@ -1913,9 +1914,14 @@ def main():
             f"oracle_self_pair={optional_float(eval_metrics.get('oracle_self_pair_acc') if eval_metrics.get('self_applicable_ratio', 1.0) > 0 else None)}"
         )
         print_routing_summary(tag=f"EVAL-{args.eval_split}", summary=eval_metrics["routing_summary"])
+        print_oracle_debug_summary(tag=f"EVAL-{args.eval_split}", summary=eval_metrics["oracle_debug_summary"])
         save_json(
             eval_metrics["routing_summary"],
             os.path.join(args.output_dir, f"routing_summary_{args.eval_split}.json"),
+        )
+        save_json(
+            eval_metrics["oracle_debug_summary"],
+            os.path.join(args.output_dir, f"oracle_debug_summary_{args.eval_split}.json"),
         )
         if wandb_run is not None:
             wandb_run.log(
