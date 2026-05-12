@@ -56,7 +56,9 @@ def compute_pair_losses(
 
     correct_soft_ce = torch.tensor(0.0, device=pair_logits.device)
     correct_conf_ce = torch.tensor(0.0, device=pair_logits.device)
+    correct_max_margin = torch.tensor(0.0, device=pair_logits.device)
     correct_target_available = torch.zeros(loss_matrix.size(0), dtype=torch.bool, device=pair_logits.device)
+    correct_margin_available = torch.zeros(loss_matrix.size(0), dtype=torch.bool, device=pair_logits.device)
     avg_correct_pairs = torch.tensor(0.0, device=pair_logits.device)
     if correct_matrix is not None:
         flat_correct = correct_matrix.to(device=pair_logits.device, dtype=torch.float32).view(loss_matrix.size(0), -1)
@@ -89,6 +91,19 @@ def compute_pair_losses(
         correct_conf_ce = (
             correct_conf_ce_all[correct_target_available].mean()
             if correct_target_available.any()
+            else torch.tensor(0.0, device=pair_logits.device)
+        )
+        flat_correct_bool = flat_correct > 0
+        flat_wrong_bool = ~flat_correct_bool
+        correct_margin_available = flat_correct_bool.any(dim=-1) & flat_wrong_bool.any(dim=-1)
+        masked_correct_logits = pair_logits.masked_fill(~flat_correct_bool, -1e9)
+        masked_wrong_logits = pair_logits.masked_fill(~flat_wrong_bool, -1e9)
+        best_correct_logit = masked_correct_logits.max(dim=-1).values
+        best_wrong_logit = masked_wrong_logits.max(dim=-1).values
+        correct_max_margin_all = nn.functional.softplus(best_wrong_logit - best_correct_logit + float(margin))
+        correct_max_margin = (
+            correct_max_margin_all[correct_margin_available].mean()
+            if correct_margin_available.any()
             else torch.tensor(0.0, device=pair_logits.device)
         )
 
@@ -131,6 +146,14 @@ def compute_pair_losses(
             if correct_matrix is None:
                 raise ValueError("correct_conf_ce requires correct_matrix")
             total_loss = correct_conf_ce
+        elif joint_loss == "correct_max_margin":
+            if correct_matrix is None:
+                raise ValueError("correct_max_margin requires correct_matrix")
+            total_loss = correct_max_margin
+        elif joint_loss == "correct_conf_ce_plus_margin":
+            if correct_matrix is None:
+                raise ValueError("correct_conf_ce_plus_margin requires correct_matrix")
+            total_loss = correct_conf_ce + float(pseudo_ce_weight) * correct_max_margin
         elif joint_loss == "ce_pair_plus_expected":
             total_loss = ce_pair
             if pseudo_ce_weight > 0:
@@ -144,6 +167,8 @@ def compute_pair_losses(
         "expected_loss": float(expected_loss.detach().item()),
         "correct_soft_ce": float(correct_soft_ce.detach().item()),
         "correct_conf_ce": float(correct_conf_ce.detach().item()),
+        "correct_max_margin": float(correct_max_margin.detach().item()),
+        "correct_margin_available_ratio": float(correct_margin_available.float().mean().item()),
         "correct_soft_ce_temperature": float(correct_soft_ce_temperature),
         "correct_target_available_ratio": float(correct_target_available.float().mean().item()),
         "avg_correct_pairs": float(avg_correct_pairs.detach().item()),
