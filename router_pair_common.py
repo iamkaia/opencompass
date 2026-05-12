@@ -93,8 +93,6 @@ def compute_pair_losses(
 
     metrics = {
         "expected_loss": float(expected_loss.detach().item()),
-        "joint_loss_type": joint_loss,
-        "pair_loss_normalization": str(loss_normalization),
         "main_pair_ce": float(ce_pair.detach().item()),
         "pseudo_ce_pair": float(ce_pair.detach().item()),
         "best_pair_loss": float(sorted_loss[:, 0].mean().item()),
