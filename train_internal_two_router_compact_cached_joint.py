@@ -2,7 +2,6 @@ import argparse
 import json
 import math
 import os
-from collections import Counter, defaultdict
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Sequence
 
@@ -12,6 +11,18 @@ from torch.utils.data import DataLoader, Dataset
 from transformers import AutoTokenizer, get_linear_schedule_with_warmup
 
 from opencompass.models.router_moe_components import BertExternalEncoder, CompactRouterFeatureEncoder
+from router_pair_common import (
+    build_oracle_debug_summary,
+    build_routing_summary,
+    compute_pair_losses,
+    compute_route_score_stats,
+    compute_routing_accuracy_stats,
+    flatten_routing_summary,
+    init_oracle_debug_accumulator,
+    print_oracle_debug_summary,
+    print_routing_summary,
+    update_oracle_debug_accumulator,
+)
 
 
 def save_json(obj: Dict, path: str):
@@ -33,51 +44,71 @@ def parse_task_names(raw: Optional[str], fallback: Optional[Sequence[str]] = Non
 ####再從 slice 後的 loss_matrix 重新算一次 pair_label / first_label / mid_label
 ####所以 cache 可以先建大，再在 trainer 端選 task 子集
 class CachedLossMatrixDataset(Dataset):
-    def __init__(self, feature_root: str, split: str, selected_task_names: Optional[Sequence[str]] = None):
+    def __init__(
+        self,
+        feature_root: str,
+        split: str,
+        selected_sample_task_names: Optional[Sequence[str]] = None,
+        selected_expert_names: Optional[Sequence[str]] = None,
+    ):
         split_dir = os.path.join(feature_root, split)
         manifest_path = os.path.join(split_dir, "manifest.json")
         with open(manifest_path, "r", encoding="utf-8") as f:
             manifest = json.load(f)
 
-        source_task_names = list(manifest.get("task_names") or manifest.get("expert_names") or [])
-        if not source_task_names:
+        source_sample_task_names = list(manifest.get("task_names") or [])
+        source_expert_names = list(manifest.get("expert_names") or source_sample_task_names)
+        if not source_sample_task_names:
             raise ValueError(f"Missing task_names/expert_names in {manifest_path}")
+        if not source_expert_names:
+            raise ValueError(f"Missing expert_names in {manifest_path}")
 
-        if selected_task_names:
-            resolved_task_names = [str(name) for name in selected_task_names]
+        if selected_sample_task_names:
+            resolved_sample_task_names = [str(name) for name in selected_sample_task_names]
         else:
-            resolved_task_names = list(source_task_names)
+            resolved_sample_task_names = list(source_sample_task_names)
 
-        missing = [name for name in resolved_task_names if name not in source_task_names]
-        if missing:
+        if selected_expert_names:
+            resolved_expert_names = [str(name) for name in selected_expert_names]
+        else:
+            resolved_expert_names = list(source_expert_names)
+
+        missing_samples = [name for name in resolved_sample_task_names if name not in source_sample_task_names]
+        if missing_samples:
             raise ValueError(
-                f"Requested task_names={missing} are not present in cached feature manifest {manifest_path}. "
-                f"Available={source_task_names}"
+                f"Requested sample_task_names={missing_samples} are not present in cached feature manifest "
+                f"{manifest_path}. Available={source_sample_task_names}"
+            )
+        missing_experts = [name for name in resolved_expert_names if name not in source_expert_names]
+        if missing_experts:
+            raise ValueError(
+                f"Requested expert_names={missing_experts} are not present in cached feature manifest "
+                f"{manifest_path}. Available={source_expert_names}"
             )
 
-        selected_indices = [source_task_names.index(name) for name in resolved_task_names]
-        old_to_new_task_id = {old_idx: new_idx for new_idx, old_idx in enumerate(selected_indices)}
+        selected_expert_indices = [source_expert_names.index(name) for name in resolved_expert_names]
+        expert2id = {name: idx for idx, name in enumerate(resolved_expert_names)}
 
         self.items = []
         for fn in manifest["files"]:
             payload = torch.load(os.path.join(split_dir, fn), map_location="cpu")
             for item in payload["items"]:
                 task_name = str(item["task"])
-                if task_name not in resolved_task_names:
+                if task_name not in resolved_sample_task_names:
                     continue
 
                 loss_matrix = item["loss_matrix"]
-                sliced_loss_matrix = loss_matrix.index_select(0, torch.tensor(selected_indices)).index_select(
-                    1, torch.tensor(selected_indices)
+                sliced_loss_matrix = loss_matrix.index_select(0, torch.tensor(selected_expert_indices)).index_select(
+                    1, torch.tensor(selected_expert_indices)
                 )
                 flat_loss = sliced_loss_matrix.view(-1)
                 best_pair = int(flat_loss.argmin().item())
-                num_tasks = len(resolved_task_names)
+                num_tasks = len(resolved_expert_names)
                 best_first = best_pair // num_tasks
                 best_mid = best_pair % num_tasks
-
                 remapped = dict(item)
-                remapped["task_id"] = int(old_to_new_task_id[int(item["task_id"])])
+                ####把 sample 的 task name 對應到 expert id。
+                remapped["task_id"] = int(expert2id.get(task_name, -1))
                 remapped["loss_matrix"] = sliced_loss_matrix
                 remapped["pair_label"] = best_pair
                 remapped["first_label"] = best_first
@@ -85,8 +116,11 @@ class CachedLossMatrixDataset(Dataset):
                 self.items.append(remapped)
         if not self.items:
             raise ValueError(f"No items loaded from {split_dir}")
-        self.task_names = resolved_task_names
-        self.source_task_names = source_task_names
+        self.sample_task_names = resolved_sample_task_names
+        self.expert_names = resolved_expert_names
+        self.task_names = resolved_expert_names
+        self.source_sample_task_names = source_sample_task_names
+        self.source_expert_names = source_expert_names
 
     def __len__(self):
         return len(self.items)
@@ -131,7 +165,7 @@ class Collator:
             mid_labels=torch.tensor([x["mid_label"] for x in batch], dtype=torch.long),
         )
 
-#### router本人, 沒有base llm
+#### 沒有base llm
 class InternalTwoRouterCachedJointModel(nn.Module):
     def __init__(self, bert_init: str, llama_hidden_size: int, router_dim: int, num_pairs: int):
         super().__init__()
@@ -171,359 +205,14 @@ def set_trainable(model, freeze_bert: bool = False):
     for p in model.pair_classifier.parameters():
         p.requires_grad = True
 
-
-def compute_pair_losses(
-    pair_logits: torch.Tensor,
-    loss_matrix: torch.Tensor,
-    joint_loss: str,
-    pseudo_ce_weight: float,
-    margin: float,
-):
-    ###flat_best = argmin(loss_matrix) 找 oracle 最佳 pair
-    ###expected_loss = sum P(pair) * oracle_cost(pair)
-    ###ce_pair = CE(pair_logits, flat_best)
-    joint_loss = str(joint_loss)
-    flat_loss = loss_matrix.view(loss_matrix.size(0), -1)
-    flat_best = flat_loss.argmin(dim=-1)
-    num_tasks = loss_matrix.size(2)
-    best_first = flat_best // num_tasks
-    best_mid = flat_best % num_tasks
-    pair_prob = torch.softmax(pair_logits, dim=-1)
-    expected_loss = (pair_prob * flat_loss).sum(dim=-1).mean()
-
-    sorted_loss, _ = flat_loss.sort(dim=-1)
-    if flat_loss.size(1) > 1:
-        margin_mask = (sorted_loss[:, 1] - sorted_loss[:, 0]) >= float(margin)
-    else:
-        margin_mask = torch.ones_like(flat_best, dtype=torch.bool)
-    ce_pair_all = nn.functional.cross_entropy(pair_logits, flat_best, reduction="none")
-    ce_pair = ce_pair_all[margin_mask].mean() if margin_mask.any() else torch.tensor(0.0, device=pair_logits.device)
-
-    ###ce_pair
-    ###expected_loss
-    ###ce_pair_plus_expected
-    if joint_loss == "ce_pair":
-        total_loss = ce_pair
-    elif joint_loss == "expected_loss":
-        total_loss = expected_loss
-    elif joint_loss == "ce_pair_plus_expected":
-        total_loss = ce_pair
-        if pseudo_ce_weight > 0:
-            total_loss = total_loss + float(pseudo_ce_weight) * expected_loss
-    else:
-        raise ValueError(f"Unknown joint_loss: {joint_loss}")
-    metrics = {
-        "expected_loss": float(expected_loss.detach().item()),
-        "main_pair_ce": float(ce_pair.detach().item()),
-        "pseudo_ce_pair": float(ce_pair.detach().item()),
-        "best_pair_loss": float(sorted_loss[:, 0].mean().item()),
-        "margin_active_ratio": float(margin_mask.float().mean().item()),
-    }
-    return total_loss, metrics, best_first, best_mid, flat_best
-
-
-def score_from_cost(cost: torch.Tensor) -> torch.Tensor:
-    return (1.0 - cost) * 100.0
-
-
-def compute_routing_accuracy_stats(pred_first, pred_mid, best_first, best_mid, task_ids):
-    pred_first = pred_first.detach()
-    pred_mid = pred_mid.detach()
-    best_first = best_first.detach()
-    best_mid = best_mid.detach()
-    task_ids = task_ids.to(device=pred_first.device)
-    return {
-        "first_acc": float((pred_first == best_first).float().mean().item()),
-        "mid_acc": float((pred_mid == best_mid).float().mean().item()),
-        "joint_acc": float(0.5 * (((pred_first == best_first).float().mean().item()) + ((pred_mid == best_mid).float().mean().item()))),
-        "pair_acc": float(((pred_first == best_first) & (pred_mid == best_mid)).float().mean().item()),
-        "self_first_acc": float((pred_first == task_ids).float().mean().item()),
-        "self_mid_acc": float((pred_mid == task_ids).float().mean().item()),
-        "self_joint_acc": float(0.5 * (((pred_first == task_ids).float().mean().item()) + ((pred_mid == task_ids).float().mean().item()))),
-        "self_pair_acc": float(((pred_first == task_ids) & (pred_mid == task_ids)).float().mean().item()),
-        "oracle_self_pair_acc": float(((best_first == task_ids) & (best_mid == task_ids)).float().mean().item()),
-    }
-
-
-def compute_route_score_stats(loss_matrix: torch.Tensor, pred_pair: torch.Tensor, task_ids: torch.Tensor):
-    flat_loss = loss_matrix.view(loss_matrix.size(0), -1)
-    best_pair = flat_loss.argmin(dim=-1)
-    batch_idx = torch.arange(loss_matrix.size(0), device=loss_matrix.device)
-    task_ids = task_ids.to(loss_matrix.device)
-
-    pred_cost = flat_loss[batch_idx, pred_pair]
-    oracle_cost = flat_loss[batch_idx, best_pair]
-    self_cost = loss_matrix[batch_idx, task_ids, task_ids]
-
-    return {
-        "router_argmax_score": float(score_from_cost(pred_cost).mean().item()),
-        "oracle_best_pair_score": float(score_from_cost(oracle_cost).mean().item()),
-        "fixed_self_score": float(score_from_cost(self_cost).mean().item()),
-        "router_argmax_cost": float(pred_cost.mean().item()),
-        "oracle_best_pair_cost": float(oracle_cost.mean().item()),
-        "fixed_self_cost": float(self_cost.mean().item()),
-    }
-
-
-def build_routing_summary(
-    pred_first_all: Sequence[int],
-    pred_mid_all: Sequence[int],
-    best_first_all: Sequence[int],
-    best_mid_all: Sequence[int],
-    task_ids_all: Sequence[int],
-    task_names: Sequence[str],
-):
-    if not pred_first_all:
-        return {"num_samples": 0, "top_pred_pairs": [], "per_task": []}
-
-    num_samples = len(pred_first_all)
-    stats = compute_routing_accuracy_stats(
-        torch.tensor(pred_first_all, dtype=torch.long),
-        torch.tensor(pred_mid_all, dtype=torch.long),
-        torch.tensor(best_first_all, dtype=torch.long),
-        torch.tensor(best_mid_all, dtype=torch.long),
-        torch.tensor(task_ids_all, dtype=torch.long),
-    )
-    pred_pair_counter = Counter()
-    gold_pair_counter = Counter()
-    task_bucket = defaultdict(lambda: {"pred_first": Counter(), "pred_mid": Counter(), "pred_pair": Counter()})
-    for pf, pm, bf, bm, tid in zip(pred_first_all, pred_mid_all, best_first_all, best_mid_all, task_ids_all):
-        pred_pair = f"{task_names[pf]}->{task_names[pm]}"
-        gold_pair = f"{task_names[bf]}->{task_names[bm]}"
-        pred_pair_counter[pred_pair] += 1
-        gold_pair_counter[gold_pair] += 1
-        task_bucket[int(tid)]["pred_first"][task_names[pf]] += 1
-        task_bucket[int(tid)]["pred_mid"][task_names[pm]] += 1
-        task_bucket[int(tid)]["pred_pair"][pred_pair] += 1
-
-    def counter_rows(counter: Counter, denom: int, top_k: int = 3):
-        return [
-            {"name": name, "count": int(count), "rate": float(count / max(denom, 1))}
-            for name, count in counter.most_common(top_k)
-        ]
-
-    per_task = []
-    for task_id, task_name in enumerate(task_names):
-        n = sum(1 for x in task_ids_all if x == task_id)
-        if n == 0:
-            continue
-        pred_self_first = sum(1 for pf, tid in zip(pred_first_all, task_ids_all) if tid == task_id and pf == task_id)
-        pred_self_mid = sum(1 for pm, tid in zip(pred_mid_all, task_ids_all) if tid == task_id and pm == task_id)
-        gold_self_pair = sum(
-            1 for bf, bm, tid in zip(best_first_all, best_mid_all, task_ids_all) if tid == task_id and bf == task_id and bm == task_id
-        )
-        per_task.append(
-            {
-                "task": task_name,
-                "count": int(n),
-                "pred_self_first_rate": float(pred_self_first / n),
-                "pred_self_mid_rate": float(pred_self_mid / n),
-                "gold_self_pair_rate": float(gold_self_pair / n),
-                "top_pred_first": counter_rows(task_bucket[task_id]["pred_first"], n),
-                "top_pred_mid": counter_rows(task_bucket[task_id]["pred_mid"], n),
-                "top_pred_pairs": counter_rows(task_bucket[task_id]["pred_pair"], n),
-            }
-        )
-
-    return {
-        "num_samples": int(num_samples),
-        "first_acc": float(stats["first_acc"]),
-        "mid_acc": float(stats["mid_acc"]),
-        "pair_acc": float(stats["pair_acc"]),
-        "self_first_acc": float(stats["self_first_acc"]),
-        "self_mid_acc": float(stats["self_mid_acc"]),
-        "self_pair_acc": float(stats["self_pair_acc"]),
-        "oracle_self_pair_acc": float(stats["oracle_self_pair_acc"]),
-        "top_pred_pairs": counter_rows(pred_pair_counter, num_samples, top_k=5),
-        "top_gold_pairs": counter_rows(gold_pair_counter, num_samples, top_k=5),
-        "per_task": per_task,
-    }
-
-
-def print_routing_summary(tag: str, summary: Dict):
-    if int(summary.get("num_samples", 0)) <= 0:
-        print(f"[ROUTE][{tag}] no samples")
-        return
-    top_pairs = ", ".join(f"{row['name']}:{row['rate']:.2%}" for row in summary.get("top_pred_pairs", [])[:3])
-    print(
-        f"[ROUTE][{tag}] pair_acc={summary.get('pair_acc', 0.0):.4f} "
-        f"self_pair={summary.get('self_pair_acc', 0.0):.4f} "
-        f"oracle_self_pair={summary.get('oracle_self_pair_acc', 0.0):.4f} "
-        f"top_pred_pairs={top_pairs}"
-    )
-    for row in summary.get("per_task", []):
-        top_first = row["top_pred_first"][0]["name"] if row["top_pred_first"] else "-"
-        top_mid = row["top_pred_mid"][0]["name"] if row["top_pred_mid"] else "-"
-        top_pair = row["top_pred_pairs"][0]["name"] if row["top_pred_pairs"] else "-"
-        print(
-            f"[ROUTE][{tag}][{row['task']}] n={row['count']} "
-            f"self_first={row['pred_self_first_rate']:.2%} "
-            f"self_mid={row['pred_self_mid_rate']:.2%} "
-            f"oracle_self_pair={row['gold_self_pair_rate']:.2%} "
-            f"top_first={top_first} top_mid={top_mid} top_pair={top_pair}"
-        )
-
-
-def init_oracle_debug_accumulator(task_names: Sequence[str]) -> Dict:
-    return {
-        "num_samples": 0,
-        "task_names": list(task_names),
-        "global_gold_pair_counter": Counter(),
-        "global_gap_values": [],
-        "global_self_minus_oracle_values": [],
-        "per_task": {
-            task_name: {
-                "count": 0,
-                "gold_pair_counter": Counter(),
-                "gap_values": [],
-                "self_minus_oracle_values": [],
-            }
-            for task_name in task_names
-        },
-    }
-
-
-def update_oracle_debug_accumulator(acc: Dict, loss_matrix: torch.Tensor, task_ids: torch.Tensor):
-    task_names = acc["task_names"]
-    num_tasks = loss_matrix.size(2)
-    flat_loss = loss_matrix.view(loss_matrix.size(0), -1)
-    sorted_loss, sorted_idx = flat_loss.sort(dim=-1)
-    best_pair = sorted_idx[:, 0]
-    best_cost = sorted_loss[:, 0]
-    second_cost = sorted_loss[:, 1] if flat_loss.size(1) > 1 else sorted_loss[:, 0]
-    gap = second_cost - best_cost
-    batch_idx = torch.arange(loss_matrix.size(0), device=loss_matrix.device)
-    task_ids = task_ids.to(loss_matrix.device)
-    self_cost = loss_matrix[batch_idx, task_ids, task_ids]
-    self_minus_oracle = self_cost - best_cost
-
-    best_pair_cpu = best_pair.detach().cpu().tolist()
-    gap_cpu = gap.detach().cpu().tolist()
-    self_minus_oracle_cpu = self_minus_oracle.detach().cpu().tolist()
-    task_ids_cpu = task_ids.detach().cpu().tolist()
-
-    acc["num_samples"] += len(best_pair_cpu)
-    acc["global_gap_values"].extend(float(x) for x in gap_cpu)
-    acc["global_self_minus_oracle_values"].extend(float(x) for x in self_minus_oracle_cpu)
-
-    for pair_id, gap_value, delta_value, task_id in zip(
-        best_pair_cpu, gap_cpu, self_minus_oracle_cpu, task_ids_cpu
-    ):
-        first_idx = int(pair_id) // num_tasks
-        mid_idx = int(pair_id) % num_tasks
-        pair_name = f"{task_names[first_idx]}->{task_names[mid_idx]}"
-        task_name = task_names[int(task_id)]
-        acc["global_gold_pair_counter"][pair_name] += 1
-        bucket = acc["per_task"][task_name]
-        bucket["count"] += 1
-        bucket["gold_pair_counter"][pair_name] += 1
-        bucket["gap_values"].append(float(gap_value))
-        bucket["self_minus_oracle_values"].append(float(delta_value))
-
-
-def build_oracle_debug_summary(acc: Dict, top_k: int = 5) -> Dict:
-    num_samples = int(acc.get("num_samples", 0))
-    if num_samples <= 0:
-        return {"num_samples": 0, "top_gold_pairs": [], "per_task": []}
-
-    def counter_rows(counter: Counter, denom: int, limit: int):
-        return [
-            {"name": name, "count": int(count), "rate": float(count / max(denom, 1))}
-            for name, count in counter.most_common(limit)
-        ]
-
-    def mean(values: Sequence[float]) -> float:
-        return float(sum(values) / max(len(values), 1))
-
-    def quantile(values: Sequence[float], q: float) -> float:
-        if not values:
-            return 0.0
-        sorted_values = sorted(float(v) for v in values)
-        idx = int(round((len(sorted_values) - 1) * q))
-        idx = max(0, min(idx, len(sorted_values) - 1))
-        return float(sorted_values[idx])
-
-    per_task = []
-    for task_name in acc["task_names"]:
-        bucket = acc["per_task"][task_name]
-        if bucket["count"] <= 0:
-            continue
-        per_task.append(
-            {
-                "task": task_name,
-                "count": int(bucket["count"]),
-                "avg_gap": mean(bucket["gap_values"]),
-                "p50_gap": quantile(bucket["gap_values"], 0.5),
-                "p90_gap": quantile(bucket["gap_values"], 0.9),
-                "avg_self_minus_oracle": mean(bucket["self_minus_oracle_values"]),
-                "top_gold_pairs": counter_rows(bucket["gold_pair_counter"], bucket["count"], top_k),
-            }
-        )
-
-    return {
-        "num_samples": num_samples,
-        "avg_gap": mean(acc["global_gap_values"]),
-        "p50_gap": quantile(acc["global_gap_values"], 0.5),
-        "p90_gap": quantile(acc["global_gap_values"], 0.9),
-        "avg_self_minus_oracle": mean(acc["global_self_minus_oracle_values"]),
-        "top_gold_pairs": counter_rows(acc["global_gold_pair_counter"], num_samples, top_k),
-        "per_task": per_task,
-    }
-
-
-def print_oracle_debug_summary(tag: str, summary: Dict):
-    if int(summary.get("num_samples", 0)) <= 0:
-        print(f"[ORACLE][{tag}] no samples")
-        return
-    top_gold = ", ".join(f"{row['name']}:{row['rate']:.2%}" for row in summary.get("top_gold_pairs", [])[:3])
-    print(
-        f"[ORACLE][{tag}] avg_gap={summary.get('avg_gap', 0.0):.4f} "
-        f"p50_gap={summary.get('p50_gap', 0.0):.4f} "
-        f"p90_gap={summary.get('p90_gap', 0.0):.4f} "
-        f"avg_self_minus_oracle={summary.get('avg_self_minus_oracle', 0.0):.4f} "
-        f"top_gold_pairs={top_gold}"
-    )
-    for row in summary.get("per_task", []):
-        top_gold_name = row["top_gold_pairs"][0]["name"] if row.get("top_gold_pairs") else "-"
-        print(
-            f"[ORACLE][{tag}][{row['task']}] n={row['count']} "
-            f"avg_gap={row['avg_gap']:.4f} "
-            f"p50_gap={row['p50_gap']:.4f} "
-            f"avg_self_minus_oracle={row['avg_self_minus_oracle']:.4f} "
-            f"top_gold_pair={top_gold_name}"
-        )
-
-
-def flatten_routing_summary(summary: Dict, prefix: str) -> Dict[str, float]:
-    payload: Dict[str, float] = {}
-    for key in [
-        "first_acc",
-        "mid_acc",
-        "pair_acc",
-        "self_first_acc",
-        "self_mid_acc",
-        "self_pair_acc",
-        "oracle_self_pair_acc",
-    ]:
-        if key in summary:
-            payload[f"{prefix}/{key}"] = float(summary[key])
-
-    top_pred_pairs = summary.get("top_pred_pairs", [])
-    if top_pred_pairs:
-        payload[f"{prefix}/top_pred_pair_rate"] = float(top_pred_pairs[0]["rate"])
-
-    for row in summary.get("per_task", []):
-        task = str(row["task"])
-        payload[f"{prefix}_task/{task}_self_first_rate"] = float(row["pred_self_first_rate"])
-        payload[f"{prefix}_task/{task}_self_mid_rate"] = float(row["pred_self_mid_rate"])
-        payload[f"{prefix}_task/{task}_oracle_self_pair_rate"] = float(row["gold_self_pair_rate"])
-        if row.get("top_pred_first"):
-            payload[f"{prefix}_task/{task}_top_first_rate"] = float(row["top_pred_first"][0]["rate"])
-        if row.get("top_pred_mid"):
-            payload[f"{prefix}_task/{task}_top_mid_rate"] = float(row["top_pred_mid"][0]["rate"])
-        if row.get("top_pred_pairs"):
-            payload[f"{prefix}_task/{task}_top_pair_rate"] = float(row["top_pred_pairs"][0]["rate"])
-    return payload
+####比回自己的task, 等等可能要再看一下
+def compute_self_pair_ce(pair_logits: torch.Tensor, task_ids: torch.Tensor, num_tasks: int):
+    valid = (task_ids >= 0) & (task_ids < int(num_tasks))
+    if not bool(valid.any().item()):
+        return torch.tensor(0.0, device=pair_logits.device), torch.empty(0, dtype=torch.long, device=pair_logits.device)
+    self_pair = task_ids[valid] * int(num_tasks) + task_ids[valid]
+    loss = nn.functional.cross_entropy(pair_logits[valid], self_pair)
+    return loss, self_pair
 
 
 @torch.no_grad()
@@ -537,6 +226,8 @@ def evaluate(
     joint_loss,
     pseudo_ce_weight,
     pseudo_ce_margin,
+    pair_loss_normalization,
+    supervision_mode,
 ):
     model.eval()
     total_loss = 0.0
@@ -570,19 +261,31 @@ def evaluate(
             first_vec=batch.first_vec.to(device),
             mid_vec=batch.mid_vec.to(device),
         )
-        loss, metrics, best_first, best_mid, flat_best = compute_pair_losses(
+        oracle_loss, metrics, best_first, best_mid, flat_best = compute_pair_losses(
             pair_logits=pair_logits,
             loss_matrix=batch.loss_matrix.to(device),
             joint_loss=joint_loss,
             pseudo_ce_weight=pseudo_ce_weight,
             margin=pseudo_ce_margin,
+            loss_normalization=pair_loss_normalization,
         )
+        if supervision_mode == "self_pair_ce":
+            loss, _ = compute_self_pair_ce(pair_logits, batch.task_ids.to(device), batch.loss_matrix.size(2))
+            metrics["self_pair_ce"] = float(loss.detach().item())
+            metrics["oracle_objective_loss"] = float(oracle_loss.detach().item())
+        else:
+            loss = oracle_loss
         pred_pair = pair_logits.argmax(dim=-1)
         num_tasks = batch.loss_matrix.size(2)
         pred_first = pred_pair // num_tasks
         pred_mid = pred_pair % num_tasks
         batch_stats = compute_routing_accuracy_stats(pred_first, pred_mid, best_first, best_mid, batch.task_ids)
-        score_stats = compute_route_score_stats(batch.loss_matrix.to(device), pred_pair, batch.task_ids)
+        score_stats = compute_route_score_stats(
+            batch.loss_matrix.to(device),
+            pred_pair,
+            batch.task_ids,
+            loss_normalization=pair_loss_normalization,
+        )
         update_oracle_debug_accumulator(
             oracle_debug_acc,
             batch.loss_matrix.to(device),
@@ -615,7 +318,19 @@ def evaluate(
     return result
 
 
-def save_ckpt(model, out_dir, task_names, max_bert_len, metrics, epoch, joint_loss, pseudo_ce_weight):
+def save_ckpt(
+    model,
+    out_dir,
+    expert_names,
+    sample_task_names,
+    max_bert_len,
+    metrics,
+    epoch,
+    joint_loss,
+    pseudo_ce_weight,
+    pair_loss_normalization,
+    supervision_mode,
+):
     os.makedirs(out_dir, exist_ok=True)
     model.bert.encoder.save_pretrained(os.path.join(out_dir, "encoder"))
     torch.save(
@@ -629,14 +344,17 @@ def save_ckpt(model, out_dir, task_names, max_bert_len, metrics, epoch, joint_lo
     )
     save_json(
         {
-            "task_names": list(task_names),
-            "expert_names": list(task_names),
-            "num_pairs": len(task_names) * len(task_names),
+            "task_names": list(expert_names),
+            "expert_names": list(expert_names),
+            "train_task_names": list(sample_task_names),
+            "num_pairs": len(expert_names) * len(expert_names),
             "router_max_len": max_bert_len,
             "router_feature_type": "cached_prompt_vectors_with_loss_matrix",
             "supervision_type": "cached_pair_ce_main",
+            "supervision_mode": str(supervision_mode),
             "joint_loss": str(joint_loss),
             "pseudo_ce_weight": float(pseudo_ce_weight),
+            "pair_loss_normalization": str(pair_loss_normalization),
             "best_epoch": epoch,
             "best_router_argmax_score": metrics.get("router_argmax_score"),
             "best_val_loss": metrics.get("loss"),
@@ -650,8 +368,14 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--feature_root", type=str, required=True)
     parser.add_argument("--bert_init", type=str, required=True)
+    ###輸出 router checkpoint。
     parser.add_argument("--out_dir", type=str, required=True)
-    parser.add_argument("--task_names", type=str, default=None)
+    ###舊參數，相容用。現在不建議主用，因為它會同時當 sample task 和 expert names 的 fallback。所以應該要找機會註解調對吧?
+    parser.add_argument("--task_names", type=str, default=None, help="backward-compatible alias used for both sample and expert names when the explicit args are omitted")
+    ###訓練資料來自哪些 task
+    parser.add_argument("--sample_task_names", type=str, default=None, help="comma-separated dataset tasks to train/evaluate on")
+    ###router 可以選哪些 expert
+    parser.add_argument("--expert_names", type=str, default=None, help="comma-separated expert axis names for the router output")
     parser.add_argument("--load_from", type=str, default=None)
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--epochs", type=int, default=10)
@@ -664,12 +388,36 @@ def main():
     parser.add_argument(
         "--joint_loss",
         type=str,
-        default="ce_pair_plus_expected",
+        default="expected_loss",
         choices=["ce_pair", "expected_loss", "ce_pair_plus_expected"],
     )
+    '''
+    oracle_loss：使用 cache 裡的 loss_matrix 訓練。
+    也就是讓 router 學「哪個 expert pair 實際 loss 比較低」。
+
+    self_pair_ce：直接把每筆 sample 訓練成回自己的 expert。
+    '''
+    parser.add_argument(
+        "--supervision_mode",
+        type=str,
+        default="oracle_loss",
+        choices=["oracle_loss", "self_pair_ce"],
+        help="oracle_loss uses the cached loss_matrix objective; self_pair_ce trains each sample to route task->task.",
+    )
+    ####在 ce_pair_plus_expected 裡控制 expected loss 權重。
     parser.add_argument("--pseudo_ce_weight", type=float, default=0.0)
+    ####只對 best pair 和 second best pair 差距夠大的 sample 做 hard CE。差距小代表 oracle 不明確，CE label 可能太硬。這個是用在哪個算式?
     parser.add_argument("--pseudo_ce_margin", type=float, default=0.0)
+    ####sample_minmax 會把每筆 sample 的 loss matrix normalize 到 0~1。通常建議開，因為不同 sample 的 NLL scale 可能差很多。這個可能要看一下數學式
+    parser.add_argument(
+        "--pair_loss_normalization",
+        type=str,
+        default="sample_minmax",
+        choices=["none", "sample_minmax"],
+    )
+    ####validation router score 連續幾個 epoch 沒進步就停。
     parser.add_argument("--early_stop_patience", type=int, default=2)
+    ####要超過多少才算進步。
     parser.add_argument("--early_stop_min_delta", type=float, default=1e-4)
     parser.add_argument("--log_every", type=int, default=50)
     parser.add_argument("--num_workers", type=int, default=0)
@@ -701,22 +449,49 @@ def main():
             dir=args.out_dir,
         )
         print(f"[INFO] wandb enabled project={args.wandb_project}")
-
+    
+    ###先讀 manifest 看有哪些 task/expert。
     probe_train_ds = CachedLossMatrixDataset(args.feature_root, "train")
     probe_val_ds = CachedLossMatrixDataset(args.feature_root, "validation")
-    task_names = parse_task_names(args.task_names, fallback=probe_train_ds.task_names or probe_val_ds.task_names)
-    train_ds = CachedLossMatrixDataset(args.feature_root, "train", selected_task_names=task_names)
-    val_ds = CachedLossMatrixDataset(args.feature_root, "validation", selected_task_names=task_names)
-    print(f"[INFO] task_names={task_names}")
-    print(f"[INFO] num_pairs={len(task_names) * len(task_names)}")
+    
+    ###要拿哪些 sample, 要保留哪些 expert
+    alias_task_names = parse_task_names(args.task_names, fallback=None)
+    sample_task_names = parse_task_names(
+        args.sample_task_names,
+        fallback=alias_task_names or probe_train_ds.sample_task_names or probe_val_ds.sample_task_names,
+    )
+    expert_names = parse_task_names(
+        args.expert_names,
+        fallback=alias_task_names or probe_train_ds.expert_names or probe_val_ds.expert_names,
+    )
+    
+    ####然後真正建立train_ds跟val_ds
+    train_ds = CachedLossMatrixDataset(
+        args.feature_root,
+        "train",
+        selected_sample_task_names=sample_task_names,
+        selected_expert_names=expert_names,
+    )
+    val_ds = CachedLossMatrixDataset(
+        args.feature_root,
+        "validation",
+        selected_sample_task_names=sample_task_names,
+        selected_expert_names=expert_names,
+    )
+    print(f"[INFO] sample_task_names={sample_task_names}")
+    print(f"[INFO] expert_names={expert_names}")
+    print(f"[INFO] num_pairs={len(expert_names) * len(expert_names)}")
     print(
-        f"[INFO] joint_loss={args.joint_loss} "
-        f"pseudo_ce_weight={args.pseudo_ce_weight} pseudo_ce_margin={args.pseudo_ce_margin}"
+        f"[INFO] supervision_mode={args.supervision_mode} joint_loss={args.joint_loss} "
+        f"pseudo_ce_weight={args.pseudo_ce_weight} pseudo_ce_margin={args.pseudo_ce_margin} "
+        f"pair_loss_normalization={args.pair_loss_normalization}"
     )
     train_cfg = vars(args).copy()
-    train_cfg["resolved_task_names"] = task_names
+    train_cfg["resolved_sample_task_names"] = sample_task_names
+    train_cfg["resolved_expert_names"] = expert_names
     save_json(train_cfg, os.path.join(args.out_dir, "train_config.json"))
 
+    ###Collator() 會把 list of item 組成 batch
     train_loader = DataLoader(
         train_ds,
         batch_size=args.batch_size,
@@ -736,11 +511,14 @@ def main():
 
     bert_tokenizer = AutoTokenizer.from_pretrained(args.bert_init)
     llama_hidden_size = int(train_ds[0]["first_vec"].numel())
+    '''
+    這個model只有這幾個, BERT, router_first, router_mid, pair_classifier
+    '''
     model = InternalTwoRouterCachedJointModel(
         bert_init=args.bert_init,
         llama_hidden_size=llama_hidden_size,
         router_dim=args.router_dim,
-        num_pairs=len(task_names) * len(task_names),
+        num_pairs=len(expert_names) * len(expert_names),
     ).to(device)
 
     if args.load_from is not None:
@@ -755,6 +533,7 @@ def main():
             model.bert.load_state_dict(state["bert_encoder"], strict=False)
         print(f"[LOAD] loaded from {args.load_from}")
 
+    ###設定可訓練參數
     set_trainable(model, freeze_bert=args.freeze_bert)
     trainable = [p for p in model.parameters() if p.requires_grad]
     optimizer = torch.optim.AdamW(trainable, lr=args.lr, weight_decay=args.weight_decay)
@@ -778,10 +557,11 @@ def main():
         train_best_first_all: List[int] = []
         train_best_mid_all: List[int] = []
         train_task_ids_all: List[int] = []
-        train_oracle_debug_acc = init_oracle_debug_accumulator(task_names)
+        train_oracle_debug_acc = init_oracle_debug_accumulator(expert_names)
 
         for step, batch in enumerate(train_loader, start=1):
             global_step += 1
+            ###把文字餵給 BERT。
             bert_enc = bert_tokenizer(
                 batch.texts,
                 return_tensors="pt",
@@ -795,6 +575,8 @@ def main():
             if bert_token_type_ids is not None:
                 bert_token_type_ids = bert_token_type_ids.to(device)
 
+            ####router forward。
+            ####這個logits是甚麼意思?
             pair_logits = model(
                 bert_input_ids=bert_input_ids,
                 bert_attention_mask=bert_attention_mask,
@@ -802,13 +584,33 @@ def main():
                 first_vec=batch.first_vec.to(device),
                 mid_vec=batch.mid_vec.to(device),
             )
-            loss, metrics, best_first, best_mid, flat_best = compute_pair_losses(
+            ###if --supervision_mode oracle_loss, loss=orcale_loss
+            ###compute_pair_losses 應該只是算loss的方向而已
+            oracle_loss, metrics, best_first, best_mid, flat_best = compute_pair_losses(
                 pair_logits=pair_logits,
                 loss_matrix=batch.loss_matrix.to(device),
                 joint_loss=args.joint_loss,
                 pseudo_ce_weight=args.pseudo_ce_weight,
                 margin=args.pseudo_ce_margin,
+                loss_normalization=args.pair_loss_normalization,
             )
+            ####--supervision_mode self_pair_ce, loss=自己的task
+            if args.supervision_mode == "self_pair_ce":
+                loss, _ = compute_self_pair_ce(pair_logits, batch.task_ids.to(device), batch.loss_matrix.size(2))
+                metrics["self_pair_ce"] = float(loss.detach().item())
+                metrics["oracle_objective_loss"] = float(oracle_loss.detach().item())
+            else:
+                loss = oracle_loss
+
+            if epoch == 1 and step == 1:
+                print("pair_logits[0] =", pair_logits[0].detach().cpu())
+                print("pair_prob[0] =", torch.softmax(pair_logits[0], dim=-1).detach().cpu())
+                print("loss_matrix[0] =", batch.loss_matrix[0])
+                num_tasks = batch.loss_matrix.size(2)
+                pair_prob = torch.softmax(pair_logits, dim=-1).view(-1, num_tasks, num_tasks)
+                print("router_prob_matrix[0] =", pair_prob[0].detach().cpu())
+                print("loss_matrix[0] =", batch.loss_matrix[0].detach().cpu())
+
 
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
@@ -820,7 +622,23 @@ def main():
             pred_first = pred_pair // num_tasks
             pred_mid = pred_pair % num_tasks
             batch_stats = compute_routing_accuracy_stats(pred_first, pred_mid, best_first, best_mid, batch.task_ids)
-            score_stats = compute_route_score_stats(batch.loss_matrix.to(device), pred_pair, batch.task_ids)
+            '''
+            router_argmax_score:
+            router 選的 pair score
+
+            oracle_best_pair_score:
+            loss_matrix 最佳 pair score
+
+            fixed_self_score:
+            固定 task->task 的 score
+
+            '''
+            score_stats = compute_route_score_stats(
+                batch.loss_matrix.to(device),
+                pred_pair,
+                batch.task_ids,
+                loss_normalization=args.pair_loss_normalization,
+            )
 
             bs = batch.task_ids.size(0)
             running_loss += loss.item() * bs
@@ -887,7 +705,7 @@ def main():
                     )
 
         train_summary = build_routing_summary(
-            train_pred_first_all, train_pred_mid_all, train_best_first_all, train_best_mid_all, train_task_ids_all, task_names
+            train_pred_first_all, train_pred_mid_all, train_best_first_all, train_best_mid_all, train_task_ids_all, expert_names
         )
         print_routing_summary(f"TRAIN-EPOCH{epoch}", train_summary)
         save_json(train_summary, os.path.join(args.out_dir, f"routing_summary_train_epoch{epoch}.json"))
@@ -905,16 +723,19 @@ def main():
             wandb_payload.update(flatten_routing_summary(train_summary, prefix="train_epoch_route"))
             wandb_run.log(wandb_payload, step=global_step)
 
+        ####這個val的部分不用開torch.nograd()嗎?
         val_metrics = evaluate(
             model=model,
             loader=val_loader,
             bert_tokenizer=bert_tokenizer,
             device=device,
             max_bert_len=args.max_bert_len,
-            task_names=task_names,
+            task_names=expert_names,
             joint_loss=args.joint_loss,
             pseudo_ce_weight=args.pseudo_ce_weight,
             pseudo_ce_margin=args.pseudo_ce_margin,
+            pair_loss_normalization=args.pair_loss_normalization,
+            supervision_mode=args.supervision_mode,
         )
         print(
             f"[VAL] epoch={epoch} loss={val_metrics['loss']:.4f} "
@@ -967,12 +788,15 @@ def main():
             save_ckpt(
                 model=model,
                 out_dir=args.out_dir,
-                task_names=task_names,
+                expert_names=expert_names,
+                sample_task_names=sample_task_names,
                 max_bert_len=args.max_bert_len,
                 metrics={"epoch": epoch, **val_metrics},
                 epoch=epoch,
                 joint_loss=args.joint_loss,
                 pseudo_ce_weight=args.pseudo_ce_weight,
+                pair_loss_normalization=args.pair_loss_normalization,
+                supervision_mode=args.supervision_mode,
             )
             print(f"[SAVE] best checkpoint updated at epoch={epoch} router_score={best_router_score:.2f}")
         else:

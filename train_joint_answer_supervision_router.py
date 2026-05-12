@@ -1,10 +1,8 @@
 import argparse
 import importlib
 import json
-import math
 import os
 import random
-from collections import Counter, defaultdict
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Sequence
 
@@ -41,6 +39,18 @@ from task_eval_specs import (
     normalize_boolq_label,
     normalize_qa_text,
     normalize_sst2_label,
+)
+from router_pair_common import (
+    build_oracle_debug_summary,
+    build_routing_summary,
+    compute_pair_losses,
+    compute_route_score_stats,
+    compute_routing_accuracy_stats,
+    init_oracle_debug_accumulator,
+    optional_float,
+    print_oracle_debug_summary,
+    print_routing_summary,
+    update_oracle_debug_accumulator,
 )
 
 
@@ -237,7 +247,9 @@ class JointAnswerSupervisionRouterModel(nn.Module):
     ):
         super().__init__()
         self.expert_names = list(expert_names)
+        ####建立 expert name 到 index 的 mapping：注意這裡是 router output index，不是 LoRA expert id。所以要注意對齊
         self.expert2id = {task: idx for idx, task in enumerate(self.expert_names)}
+        print(self.expert2id)
         torch_dtype = torch.float16 if dtype == "float16" else torch.bfloat16
         self.model = AutoModelForCausalLM.from_pretrained(
             base_model_path,
@@ -245,10 +257,13 @@ class JointAnswerSupervisionRouterModel(nn.Module):
             device_map=None,
         )
         self.model.eval()
+        ####凍結 base LLM。
         for p in self.model.parameters():
             p.requires_grad = False
+        ####判斷這個模型是 llama/qwen/mistral/gemma 哪種架構，方便後面取得 decoder layers。
         self.backbone_spec = infer_backbone_spec(self.model)
 
+        ####把 LLM 改造成 hard-routed LoRA 模型
         self.model = patch_llama_with_hard_routed_lora(
             self.model,
             num_experts=1 + len(self.expert_names),
@@ -261,11 +276,31 @@ class JointAnswerSupervisionRouterModel(nn.Module):
         self.first_layer_idx = int(first_layer_idx)
         self.middle_layer_idx = int(middle_layer_idx)
         self.num_layers = len(get_decoder_layers(self.model, spec=self.backbone_spec))
+        ####把 task name 對應到 LoRA expert slot。
+        ####為甚麼+1, 因為0是null expert
+        '''
+        self.expert2id = {
+        "iwslt2017": 0,
+        "medmcqa": 1,
+        "race": 2,
+        "squad2": 3,
+        "sst2": 4,
+        }
+        會變成
+        self.task_to_expert_id = {
+        "iwslt2017": 1,
+        "medmcqa": 2,
+        "race": 3,
+        "squad2": 4,
+        "sst2": 5,
+        }
+        '''
         self.task_to_expert_id = {task: self.expert2id[task] + 1 for task in self.expert_names}
 
         for task in self.expert_names:
             if task not in lora_paths:
                 raise KeyError(f"Missing LoRA path for task: {task}")
+            ####把這個 task 的 LoRA adapter 權重塞進指定 expert slot。
             load_lora_into_expert(self.model, lora_paths[task], self.task_to_expert_id[task])
 
         self.vector_extractor = PromptVectorExtractor(
@@ -298,6 +333,7 @@ class JointAnswerSupervisionRouterModel(nn.Module):
             nn.Linear(router_dim * 2, self.num_pairs),
         )
 
+    ####是為了載入已訓練好的 router checkpoint，現在還沒認真看
     def load_router_weights(self, ckpt_dir: str):
         ckpt_expert_names = None
         cfg_path = os.path.join(ckpt_dir, "router_config.json")
@@ -368,6 +404,7 @@ class JointAnswerSupervisionRouterModel(nn.Module):
         if "bert_encoder" in state:
             self.bert.load_state_dict(state["bert_encoder"], strict=False)
 
+    ####控制哪些 module 要訓練。
     def set_trainable(self, freeze_bert: bool, freeze_router_first: bool = False, freeze_router_mid: bool = False):
         for p in self.router_first.parameters():
             p.requires_grad = not freeze_router_first
@@ -378,6 +415,7 @@ class JointAnswerSupervisionRouterModel(nn.Module):
         for p in self.bert.parameters():
             p.requires_grad = not freeze_bert
 
+    ####抽 first_vec/mid_vec 時，不使用任何 task LoRA，只用 base model 狀態。這樣合理嗎?
     @torch.no_grad()
     def extract_prompt_vectors(self, input_ids: torch.Tensor, attention_mask: torch.Tensor):
         set_all_experts(self.model, NULL_EXPERT_ID)
@@ -402,6 +440,7 @@ class JointAnswerSupervisionRouterModel(nn.Module):
         loss_matrix = torch.empty(batch_size, num_tasks, num_tasks, dtype=torch.float32, device=prompt_input_ids.device)
         score_mode = str(score_mode)
 
+        ####這個像sft的算法嗎?
         if score_mode == "token_nll":
             if input_ids is None or attention_mask is None or labels is None:
                 raise ValueError("token_nll score_mode requires input_ids, attention_mask, and labels")
@@ -413,18 +452,25 @@ class JointAnswerSupervisionRouterModel(nn.Module):
                     set_all_experts(self.model, NULL_EXPERT_ID)
                     set_layer_range_expert(self.model, self.first_layer_idx, self.middle_layer_idx - 1, first_eid)
                     set_layer_range_expert(self.model, self.middle_layer_idx, self.num_layers - 1, mid_eid)
+                    ###用目前這個 expert pair 跑一次 LLM forward。
+                    ###這邊可能要印出來看長甚麼樣子
+                    ###所以前面先抽的first_vec跟mid_vec不用先寫嗎?
                     logits = self.model(
                         input_ids=input_ids,
                         attention_mask=attention_mask,
                         use_cache=False,
                         return_dict=True,
                     ).logits
+                    print(logits)
                     combo_loss = compute_sequence_nll(logits=logits, labels=labels)
+                    ####把這個 pair 的 cost 填進 loss matrix。
                     loss_matrix[:, first_tid, mid_tid] = combo_loss
 
+            ###全部算完後清回 base/null，回傳。
             set_all_experts(self.model, NULL_EXPERT_ID)
             return loss_matrix
-
+        
+        ####如果不是token_nll的話，我先不跑這裡
         for first_tid, first_task in enumerate(self.expert_names):
             first_eid = self.task_to_expert_id[first_task]
             for mid_tid, mid_task in enumerate(self.expert_names):
@@ -434,10 +480,39 @@ class JointAnswerSupervisionRouterModel(nn.Module):
                 set_layer_range_expert(self.model, self.first_layer_idx, self.middle_layer_idx - 1, first_eid)
                 set_layer_range_expert(self.model, self.middle_layer_idx, self.num_layers - 1, mid_eid)
                 combo_loss = torch.empty(batch_size, dtype=torch.float32, device=prompt_input_ids.device)
+                
+                option_nll_indices = [
+                    idx for idx, task_name in enumerate(task_names)
+                    if _task_option_labels(task_name)
+                ]
+                if option_nll_indices:
+                    option_nll_index_tensor = torch.tensor(
+                        option_nll_indices, dtype=torch.long, device=prompt_input_ids.device
+                    )
+                    option_prompt_ids = prompt_input_ids.index_select(0, option_nll_index_tensor)
+                    option_prompt_mask = prompt_attention_mask.index_select(0, option_nll_index_tensor)
+                    option_logits = self.model(
+                        input_ids=option_prompt_ids,
+                        attention_mask=option_prompt_mask,
+                        use_cache=False,
+                        return_dict=True,
+                    ).logits
+                    option_tasks = [task_names[idx] for idx in option_nll_indices]
+                    option_targets = [targets[idx] for idx in option_nll_indices]
+                    option_loss = compute_option_nll_proxy_scores(
+                        logits=option_logits,
+                        prompt_attention_mask=option_prompt_mask,
+                        targets=option_targets,
+                        task_names=option_tasks,
+                        tokenizer=llm_tokenizer,
+                        debug_prefix=f"{first_task}->{mid_task}",
+                    ).to(device=prompt_input_ids.device, dtype=torch.float32)
+                    combo_loss.index_copy_(0, option_nll_index_tensor, option_loss)
 
+                ###找出哪些 sample 不需要 generation evaluator，也沒有選項 proxy，用 token NLL 即可。
                 token_nll_indices = [
                     idx for idx, task_name in enumerate(task_names)
-                    if not _task_uses_generation_evaluator(task_name)
+                    if not _task_uses_generation_evaluator(task_name) and not _task_option_labels(task_name)
                 ]
                 if token_nll_indices:
                     if input_ids is None or attention_mask is None or labels is None:
@@ -462,6 +537,7 @@ class JointAnswerSupervisionRouterModel(nn.Module):
                     ).to(device=prompt_input_ids.device, dtype=torch.float32)
                     combo_loss.index_copy_(0, token_nll_index_tensor, token_nll_loss)
 
+                ####generation evaluator 部分, 還沒有看
                 generation_indices = [
                     idx for idx, task_name in enumerate(task_names)
                     if _task_uses_generation_evaluator(task_name)
@@ -492,6 +568,7 @@ class JointAnswerSupervisionRouterModel(nn.Module):
         set_all_experts(self.model, NULL_EXPERT_ID)
         return loss_matrix
 
+    ####在目前已設定好的 expert pair 下 generate。
     @torch.no_grad()
     def generate_under_current_pair(
         self,
@@ -550,10 +627,26 @@ class JointAnswerSupervisionRouterModel(nn.Module):
         pair_feat = torch.cat([first_feat, mid_feat], dim=-1)
         ####輸出[B, num_pairs]
         pair_logits = self.pair_classifier(pair_feat)
-        ####reshape成[B, T, T]
+        ####reshape成[B, T, T], T是expert數量
+        ####pair_prob[b, i, j] = 第 b 筆 sample 選 i->j 的機率
         pair_prob = torch.softmax(pair_logits, dim=-1).view(pair_logits.size(0), len(self.expert_names), len(self.expert_names))
+        ###P(first = i) = sum_j P(first = i, mid = j), sum(dim=2) 是把 mid expert 維度加總。
+        ###1e-12是避免log(0), 但這邊我看不懂謝謝??
         first_logits = torch.log(pair_prob.sum(dim=2).clamp_min(1e-12))
+        ####同上
         mid_logits = torch.log(pair_prob.sum(dim=1).clamp_min(1e-12))
+
+        '''
+        pair_logits:
+        真正 joint pair classifier 的輸出，用來訓練 pair route。
+
+        first_logits:
+        從 pair distribution marginal 出來的 first expert logits。
+
+        mid_logits:
+        從 pair distribution marginal 出來的 mid expert logits。
+
+        '''
         return pair_logits, first_logits, mid_logits
 
 
@@ -615,7 +708,7 @@ def build_lm_batch(
         "labels": torch.tensor(labels, dtype=torch.long),
     }
 
-
+####這個算loss的要改一下!!!重點
 def compute_sequence_nll(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
     shift_logits = logits[:, :-1, :].contiguous()
     shift_labels = labels[:, 1:].contiguous()
@@ -669,11 +762,14 @@ def compute_option_nll_proxy_scores(
     targets: Sequence[str],
     task_names: Sequence[str],
     tokenizer,
+    debug_prefix: Optional[str] = None,
 ) -> torch.Tensor:
-    prompt_lens = prompt_attention_mask.sum(dim=1).clamp_min(1)
+    positions = torch.arange(prompt_attention_mask.size(1), device=prompt_attention_mask.device)
+    last_prompt_pos = (prompt_attention_mask.to(torch.long) * positions).max(dim=1).values
     batch_idx = torch.arange(logits.size(0), device=logits.device)
-    answer_logits = logits[batch_idx, prompt_lens - 1, :]
+    answer_logits = logits[batch_idx, last_prompt_pos, :]
     costs: List[torch.Tensor] = []
+    debug_enabled = os.environ.get("ROUTER_DEBUG_OPTION_PROBS", "0") == "1"
 
     for idx, task_name in enumerate(task_names):
         option_labels = _task_option_labels(task_name)
@@ -688,9 +784,19 @@ def compute_option_nll_proxy_scores(
         option_token_ids_tensor = torch.tensor(option_token_ids, dtype=torch.long, device=logits.device)
         option_logits = answer_logits[idx].index_select(dim=-1, index=option_token_ids_tensor)
         log_probs = torch.log_softmax(option_logits, dim=-1)
+        option_probs = log_probs.exp()
         gold_label = _normalize_task_label(task_name, targets[idx])
         gold_idx = option_labels.index(gold_label) if gold_label in option_labels else 0
         costs.append(-log_probs[gold_idx])
+        if debug_enabled and idx == 0:
+            prefix = f"[OPTION_PROBS][{debug_prefix}]" if debug_prefix else "[OPTION_PROBS]"
+            print(
+                f"{prefix} task={task_name} labels={option_labels} gold={gold_label} "
+                f"option_logits={option_logits.detach().float().cpu().tolist()} "
+                f"option_probs={option_probs.detach().float().cpu().tolist()} "
+                f"gold_cost={float((-log_probs[gold_idx]).detach().float().cpu().item()):.6f}",
+                flush=True,
+            )
 
     return torch.stack(costs, dim=0).to(torch.float32)
 
@@ -786,612 +892,6 @@ def compute_generated_dataset_scores(
     return torch.tensor(scores, dtype=torch.float32)
 
 
-def normalize_pair_loss_matrix(
-    loss_matrix: torch.Tensor,
-    method: str,
-) -> torch.Tensor:
-    method = str(method)
-    loss_matrix = loss_matrix.to(torch.float32)
-    if method == "none":
-        return loss_matrix
-    if method != "sample_minmax":
-        raise ValueError(f"Unknown pair loss normalization: {method}")
-
-    flat_loss = loss_matrix.view(loss_matrix.size(0), -1)
-    min_values = flat_loss.min(dim=-1, keepdim=True).values
-    max_values = flat_loss.max(dim=-1, keepdim=True).values
-    denom = (max_values - min_values).clamp_min(1e-6)
-    normalized_flat = (flat_loss - min_values) / denom
-    return normalized_flat.view_as(loss_matrix)
-
-####用 oracle loss_matrix 找出最佳 pair，再把 router 預測跟這個 oracle 對齊，算出訓練 loss。
-def compute_pair_losses(
-    pair_logits: torch.Tensor,
-    logits_first: torch.Tensor,
-    logits_mid: torch.Tensor,
-    loss_matrix: torch.Tensor,
-    mode: str,
-    joint_loss: str,
-    pseudo_ce_weight: float,
-    margin: float,
-    loss_normalization: str = "sample_minmax",
-) -> tuple[torch.Tensor, Dict[str, float], torch.Tensor, torch.Tensor, torch.Tensor]:
-    mode = str(mode)
-    joint_loss = str(joint_loss)
-    normalized_loss_matrix = normalize_pair_loss_matrix(
-        loss_matrix=loss_matrix,
-        method=loss_normalization,
-    )
-    flat_loss = loss_matrix.view(loss_matrix.size(0), -1)
-    normalized_flat_loss = normalized_loss_matrix.view(normalized_loss_matrix.size(0), -1)
-    flat_best = flat_loss.argmin(dim=-1)
-    best_first = flat_best // loss_matrix.size(2)
-    best_mid = flat_best % loss_matrix.size(2)
-    pair_prob = torch.softmax(pair_logits, dim=-1)
-    ####在 router 目前預測的整個 pair distribution 下，期望成本是多少
-    ####但不是有問題因為如果我要用expected_loss的話，會有成本比較低但沒辦法選到最優解的問題不是嘛？
-    ###E[cost] = sum_k P(pair=k) * oracle_cost(pair=k)
-    ####是soft supervision, 不是只看argmax而已，是看整個distribution的品質，這是什麼意思？
-    ####:expected_loss 是 soft regularization，不保證 argmax 最優，所以它只能當輔助；主 supervision 還是 ce_pair(但這版已經確定會有問題了)
-    expected_loss = (pair_prob * normalized_flat_loss).sum(dim=-1).mean()
-
-    ####把每個 sample 的所有 pair cost 排序。等等要用來判斷：最佳 pair 跟次佳 pair 差距夠不夠大
-    sorted_loss, _ = normalized_flat_loss.sort(dim=-1)
-    if normalized_flat_loss.size(1) > 1:
-        margin_mask = (sorted_loss[:, 1] - sorted_loss[:, 0]) >= float(margin)
-    else:
-        margin_mask = torch.ones_like(flat_best, dtype=torch.bool)
-
-    ####對 pair classification 做逐 sample cross entropy。
-    ce_pair_all = nn.functional.cross_entropy(pair_logits, flat_best, reduction="none")
-    ce_first_all = nn.functional.cross_entropy(logits_first, best_first, reduction="none")
-    ce_mid_all = nn.functional.cross_entropy(logits_mid, best_mid, reduction="none")
-    #####只保留 supervision 夠明確的 sample，再平均。如果一個 sample 的最佳 pair 和次佳 pair 差不多，就不拿它來做 hard CE。 ce_first、ce_mid 也是同樣邏輯。
-    ####hard ce是什麼意思啊？ cross-entropy是主要是要拿來做什麼的？ 講解一下邏輯 : CE 是「把 router 的分類結果對齊 oracle 最佳 pair label」的主要工具
-    ###expected_loss 是 soft regularization，不保證 argmax 最優，所以它只能當輔助；主 supervision 還是 ce_pair。
-    ###hard CE 就是用單一 oracle best pair label 做 cross-entropy 分類訓練。
-    ce_pair = ce_pair_all[margin_mask].mean() if margin_mask.any() else torch.tensor(0.0, device=pair_logits.device)
-    ce_first = ce_first_all[margin_mask].mean() if margin_mask.any() else torch.tensor(0.0, device=logits_first.device)
-    ce_mid = ce_mid_all[margin_mask].mean() if margin_mask.any() else torch.tensor(0.0, device=logits_first.device)
-    #####記錄這個 batch 裡，有多少比例的 sample 被保留下來參與 hard CE。
-    margin_active = float(margin_mask.float().mean().item())
-
-    if mode == "stage1":
-        total_loss = ce_first
-    elif mode == "stage2":
-        total_loss = ce_mid
-    elif mode == "joint":
-        ####主 loss 是 pair-level hard CE, 如果有設定 pseudo_ce_weight, 再加上一個 soft 的 expected loss regularization
-        if joint_loss == "ce_pair":
-            total_loss = ce_pair
-        elif joint_loss == "expected_loss":
-            total_loss = expected_loss
-        elif joint_loss == "ce_pair_plus_expected":
-            total_loss = ce_pair
-            if pseudo_ce_weight > 0:
-                total_loss = total_loss + pseudo_ce_weight * expected_loss
-        else:
-            raise ValueError(f"Unknown joint_loss: {joint_loss}")
-        metrics = {
-            "expected_loss": float(expected_loss.detach().item()),
-            "joint_loss_type": joint_loss,
-            "pair_loss_normalization": str(loss_normalization),
-            "main_pair_ce": float(ce_pair.detach().item()),
-            "pseudo_ce_pair": float(ce_pair.detach().item()),
-            "pseudo_ce_first": float(ce_first.detach().item()),
-            "pseudo_ce_mid": float(ce_mid.detach().item()),
-            "best_pair_loss": float(sorted_loss[:, 0].mean().item()),
-            "raw_best_pair_loss": float(flat_loss.gather(1, flat_best.unsqueeze(1)).mean().item()),
-            "margin_active_ratio": margin_active,
-        }
-        return total_loss, metrics, best_first, best_mid, flat_best
-    else:
-        raise ValueError(f"Unknown training mode: {mode}")
-
-    metrics = {
-        "expected_loss": float(expected_loss.detach().item()),
-        "joint_loss_type": joint_loss,
-        "pair_loss_normalization": str(loss_normalization),
-        "main_pair_ce": float(ce_pair.detach().item()),
-        "pseudo_ce_pair": float(ce_pair.detach().item()),
-        "pseudo_ce_first": float(ce_first.detach().item()),
-        "pseudo_ce_mid": float(ce_mid.detach().item()),
-        "best_pair_loss": float(sorted_loss[:, 0].mean().item()),
-        "raw_best_pair_loss": float(flat_loss.gather(1, flat_best.unsqueeze(1)).mean().item()),
-        "margin_active_ratio": margin_active,
-    }
-    ####total_loss才是真的可以拿來back propogation的東西
-    return total_loss, metrics, best_first, best_mid, flat_best
-
-
-def score_from_cost(cost: torch.Tensor) -> torch.Tensor:
-    return (1.0 - cost) * 100.0
-
-
-def task_names_from_ids(task_ids: Sequence[int], expert_names: Sequence[str]) -> List[str]:
-    names = []
-    for task_id in task_ids:
-        idx = int(task_id)
-        if 0 <= idx < len(expert_names):
-            names.append(str(expert_names[idx]))
-        else:
-            names.append(f"task_id:{idx}")
-    return names
-
-
-def optional_float(value: Optional[float], digits: int = 4) -> str:
-    if value is None or not math.isfinite(float(value)):
-        return "n/a"
-    return f"{float(value):.{digits}f}"
-
-
-def optional_rate(value: Optional[float]) -> str:
-    if value is None or not math.isfinite(float(value)):
-        return "n/a"
-    return f"{float(value):.2%}"
-
-
-def resolve_self_expert_ids(
-    task_ids: torch.Tensor,
-    expert_names: Sequence[str],
-    sample_task_names: Optional[Sequence[str]],
-    device: torch.device,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    if sample_task_names is None:
-        ids = task_ids.to(device=device, dtype=torch.long)
-        valid = (ids >= 0) & (ids < len(expert_names))
-        return ids, valid
-
-    expert2id = {name: idx for idx, name in enumerate(expert_names)}
-    ids = torch.tensor(
-        [expert2id.get(str(task_name), -1) for task_name in sample_task_names],
-        dtype=torch.long,
-        device=device,
-    )
-    return ids, ids >= 0
-
-
-def masked_mean(values: torch.Tensor, mask: torch.Tensor) -> float:
-    if bool(mask.any().item()):
-        return float(values[mask].float().mean().item())
-    return 0.0
-
-
-####把 router 的預測結果，跟 oracle best route 比較，算出幾個核心 accuracy 指標。
-def compute_routing_accuracy_stats(
-    pred_first: torch.Tensor,
-    pred_mid: torch.Tensor,
-    best_first: torch.Tensor,
-    best_mid: torch.Tensor,
-    task_ids: torch.Tensor,
-    expert_names: Sequence[str],
-    sample_task_names: Optional[Sequence[str]] = None,
-) -> Dict[str, float]:
-    pred_first = pred_first.detach()
-    pred_mid = pred_mid.detach()
-    best_first = best_first.detach()
-    best_mid = best_mid.detach()
-    task_ids = task_ids.to(device=pred_first.device)
-    self_ids, self_valid = resolve_self_expert_ids(
-        task_ids=task_ids,
-        expert_names=expert_names,
-        sample_task_names=sample_task_names,
-        device=pred_first.device,
-    )
-
-    first_correct = (pred_first == best_first).float().mean().item()
-    mid_correct = (pred_mid == best_mid).float().mean().item()
-    self_first_acc = masked_mean(pred_first == self_ids, self_valid)
-    self_mid_acc = masked_mean(pred_mid == self_ids, self_valid)
-    oracle_first_self_acc = masked_mean(best_first == self_ids, self_valid)
-    oracle_mid_self_acc = masked_mean(best_mid == self_ids, self_valid)
-    pred_self_pair_acc = masked_mean((pred_first == self_ids) & (pred_mid == self_ids), self_valid)
-    oracle_self_pair_acc = masked_mean((best_first == self_ids) & (best_mid == self_ids), self_valid)
-    pair_acc = ((pred_first == best_first) & (pred_mid == best_mid)).float().mean().item()
-
-    return {
-        "first_acc": first_correct,
-        "mid_acc": mid_correct,
-        "joint_acc": 0.5 * (first_correct + mid_correct),
-        "pair_acc": pair_acc,
-        "self_first_acc": self_first_acc,
-        "self_mid_acc": self_mid_acc,
-        "self_joint_acc": 0.5 * (self_first_acc + self_mid_acc),
-        "self_pair_acc": pred_self_pair_acc,
-        "oracle_first_self_acc": oracle_first_self_acc,
-        "oracle_mid_self_acc": oracle_mid_self_acc,
-        "oracle_self_joint_acc": 0.5 * (oracle_first_self_acc + oracle_mid_self_acc),
-        "oracle_self_pair_acc": oracle_self_pair_acc,
-        "self_applicable_ratio": float(self_valid.float().mean().item()),
-    }
-
-
-def compute_route_score_stats(
-    loss_matrix: torch.Tensor,
-    pred_pair: torch.Tensor,
-    task_ids: torch.Tensor,
-    loss_normalization: str = "sample_minmax",
-    expert_names: Optional[Sequence[str]] = None,
-    sample_task_names: Optional[Sequence[str]] = None,
-) -> Dict[str, float]:
-    score_loss_matrix = normalize_pair_loss_matrix(
-        loss_matrix=loss_matrix,
-        method=loss_normalization,
-    )
-    flat_loss = score_loss_matrix.view(score_loss_matrix.size(0), -1)
-    best_pair = flat_loss.argmin(dim=-1)
-    batch_idx = torch.arange(score_loss_matrix.size(0), device=score_loss_matrix.device)
-
-    pred_cost = flat_loss[batch_idx, pred_pair]
-    oracle_cost = flat_loss[batch_idx, best_pair]
-    if expert_names is None:
-        expert_names = [str(idx) for idx in range(score_loss_matrix.size(1))]
-    self_ids, self_valid = resolve_self_expert_ids(
-        task_ids=task_ids,
-        expert_names=expert_names,
-        sample_task_names=sample_task_names,
-        device=score_loss_matrix.device,
-    )
-    self_cost = score_loss_matrix[batch_idx, self_ids.clamp_min(0), self_ids.clamp_min(0)]
-    if bool(self_valid.any().item()):
-        fixed_self_score = float(score_from_cost(self_cost[self_valid]).mean().item())
-        fixed_self_cost = float(self_cost[self_valid].mean().item())
-    else:
-        fixed_self_score = float("nan")
-        fixed_self_cost = float("nan")
-
-    return {
-        "router_argmax_score": float(score_from_cost(pred_cost).mean().item()),
-        "oracle_best_pair_score": float(score_from_cost(oracle_cost).mean().item()),
-        "fixed_self_score": fixed_self_score,
-        "router_argmax_cost": float(pred_cost.mean().item()),
-        "oracle_best_pair_cost": float(oracle_cost.mean().item()),
-        "fixed_self_cost": fixed_self_cost,
-    }
-
-#####把整批資料的 routing 行為整理成一份結構化報告
-def build_routing_summary(
-    pred_first_all: Sequence[int],
-    pred_mid_all: Sequence[int],
-    best_first_all: Sequence[int],
-    best_mid_all: Sequence[int],
-    task_ids_all: Sequence[int],
-    expert_names: Sequence[str],
-    sample_task_names_all: Optional[Sequence[str]] = None,
-    top_k: int = 5,
-) -> Dict:
-    if not pred_first_all:
-        return {"num_samples": 0, "top_pred_pairs": [], "per_task": []}
-    if sample_task_names_all is None:
-        sample_task_names_all = task_names_from_ids(task_ids_all, expert_names)
-
-    stats = compute_routing_accuracy_stats(
-        pred_first=torch.tensor(pred_first_all, dtype=torch.long),
-        pred_mid=torch.tensor(pred_mid_all, dtype=torch.long),
-        best_first=torch.tensor(best_first_all, dtype=torch.long),
-        best_mid=torch.tensor(best_mid_all, dtype=torch.long),
-        task_ids=torch.tensor(task_ids_all, dtype=torch.long),
-        expert_names=expert_names,
-        sample_task_names=sample_task_names_all,
-    )
-
-    num_samples = len(pred_first_all)
-    expert2id = {name: idx for idx, name in enumerate(expert_names)}
-    pred_pair_counter = Counter()
-    gold_pair_counter = Counter()
-    task_bucket: Dict[str, Dict[str, Counter]] = defaultdict(
-        lambda: {
-            "pred_first": Counter(),
-            "pred_mid": Counter(),
-            "pred_pair": Counter(),
-            "gold_pair": Counter(),
-        }
-    )
-
-    for pred_first, pred_mid, best_first, best_mid, task_name in zip(
-        pred_first_all, pred_mid_all, best_first_all, best_mid_all, sample_task_names_all
-    ):
-        pred_pair_name = f"{expert_names[pred_first]}->{expert_names[pred_mid]}"
-        gold_pair_name = f"{expert_names[best_first]}->{expert_names[best_mid]}"
-        pred_pair_counter[pred_pair_name] += 1
-        gold_pair_counter[gold_pair_name] += 1
-
-        bucket = task_bucket[str(task_name)]
-        bucket["pred_first"][expert_names[pred_first]] += 1
-        bucket["pred_mid"][expert_names[pred_mid]] += 1
-        bucket["pred_pair"][pred_pair_name] += 1
-        bucket["gold_pair"][gold_pair_name] += 1
-
-    def _counter_rows(counter: Counter, denom: int, limit: int) -> List[Dict]:
-        rows = []
-        for name, count in counter.most_common(limit):
-            rows.append(
-                {
-                    "name": name,
-                    "count": int(count),
-                    "rate": float(count / max(denom, 1)),
-                }
-            )
-        return rows
-
-    def _all_pair_rows(counter: Counter, denom: int) -> List[Dict]:
-        rows = []
-        for first_name in expert_names:
-            for mid_name in expert_names:
-                pair_name = f"{first_name}->{mid_name}"
-                count = int(counter.get(pair_name, 0))
-                rows.append(
-                    {
-                        "name": pair_name,
-                        "count": count,
-                        "rate": float(count / max(denom, 1)),
-                    }
-                )
-        return rows
-
-    per_task = []
-    for task_name in sorted(set(str(name) for name in sample_task_names_all)):
-        mask_count = sum(1 for name in sample_task_names_all if str(name) == task_name)
-        if mask_count == 0:
-            continue
-
-        self_expert_id = expert2id.get(task_name)
-        if self_expert_id is None:
-            pred_self_first_rate = None
-            pred_self_mid_rate = None
-            gold_self_pair_rate = None
-        else:
-            pred_self_first = sum(
-                1 for pf, name in zip(pred_first_all, sample_task_names_all)
-                if str(name) == task_name and pf == self_expert_id
-            )
-            pred_self_mid = sum(
-                1 for pm, name in zip(pred_mid_all, sample_task_names_all)
-                if str(name) == task_name and pm == self_expert_id
-            )
-            gold_self_pair = sum(
-                1
-                for bf, bm, name in zip(best_first_all, best_mid_all, sample_task_names_all)
-                if str(name) == task_name and bf == self_expert_id and bm == self_expert_id
-            )
-            pred_self_first_rate = float(pred_self_first / mask_count)
-            pred_self_mid_rate = float(pred_self_mid / mask_count)
-            gold_self_pair_rate = float(gold_self_pair / mask_count)
-
-        bucket = task_bucket[task_name]
-        per_task.append(
-            {
-                "task": task_name,
-                "count": int(mask_count),
-                "has_self_expert": self_expert_id is not None,
-                "pred_self_first_rate": pred_self_first_rate,
-                "pred_self_mid_rate": pred_self_mid_rate,
-                "gold_self_pair_rate": gold_self_pair_rate,
-                "top_pred_first": _counter_rows(bucket["pred_first"], mask_count, limit=3),
-                "top_pred_mid": _counter_rows(bucket["pred_mid"], mask_count, limit=3),
-                "top_pred_pairs": _counter_rows(bucket["pred_pair"], mask_count, limit=3),
-                "top_gold_pairs": _counter_rows(bucket["gold_pair"], mask_count, limit=3),
-                "all_pred_pairs": _all_pair_rows(bucket["pred_pair"], mask_count),
-                "all_gold_pairs": _all_pair_rows(bucket["gold_pair"], mask_count),
-            }
-        )
-
-    summary = {
-        "num_samples": int(num_samples),
-        "first_acc": float(stats["first_acc"]),
-        "mid_acc": float(stats["mid_acc"]),
-        "pair_acc": float(stats["pair_acc"]),
-        "self_first_acc": float(stats["self_first_acc"]),
-        "self_mid_acc": float(stats["self_mid_acc"]),
-        "self_pair_acc": float(stats["self_pair_acc"]),
-        "oracle_self_pair_acc": float(stats["oracle_self_pair_acc"]),
-        "self_applicable_ratio": float(stats["self_applicable_ratio"]),
-        "top_pred_pairs": _counter_rows(pred_pair_counter, num_samples, limit=top_k),
-        "top_gold_pairs": _counter_rows(gold_pair_counter, num_samples, limit=top_k),
-        "all_pred_pairs": _all_pair_rows(pred_pair_counter, num_samples),
-        "all_gold_pairs": _all_pair_rows(gold_pair_counter, num_samples),
-        "per_task": per_task,
-    }
-    return summary
-
-
-def print_routing_summary(tag: str, summary: Dict):
-    if int(summary.get("num_samples", 0)) <= 0:
-        print(f"[ROUTE][{tag}] no samples")
-        return
-
-    top_pairs = ", ".join(
-        f"{row['name']}:{row['rate']:.2%}" for row in summary.get("top_pred_pairs", [])[:3]
-    )
-    print(
-        f"[ROUTE][{tag}] pair_acc={summary.get('pair_acc', 0.0):.4f} "
-        f"self_pair={optional_float(summary.get('self_pair_acc') if summary.get('self_applicable_ratio', 1.0) > 0 else None)} "
-        f"oracle_self_pair={optional_float(summary.get('oracle_self_pair_acc') if summary.get('self_applicable_ratio', 1.0) > 0 else None)} "
-        f"top_pred_pairs={top_pairs}"
-    )
-    all_pairs = summary.get("all_pred_pairs", [])
-    if all_pairs:
-        pair_dist = ", ".join(f"{row['name']}:{row['rate']:.2%}" for row in all_pairs)
-        print(f"[ROUTE][{tag}][PAIR_DIST] {pair_dist}")
-    for row in summary.get("per_task", []):
-        top_first = row.get("top_pred_first", [])
-        top_mid = row.get("top_pred_mid", [])
-        top_pair = row.get("top_pred_pairs", [])
-        first_name = top_first[0]["name"] if top_first else "-"
-        mid_name = top_mid[0]["name"] if top_mid else "-"
-        pair_name = top_pair[0]["name"] if top_pair else "-"
-        print(
-            f"[ROUTE][{tag}][{row['task']}] n={row['count']} "
-            f"self_first={optional_rate(row.get('pred_self_first_rate'))} "
-            f"self_mid={optional_rate(row.get('pred_self_mid_rate'))} "
-            f"oracle_self_pair={optional_rate(row.get('gold_self_pair_rate'))} "
-            f"top_first={first_name} top_mid={mid_name} top_pair={pair_name}"
-        )
-        task_all_pairs = row.get("all_pred_pairs", [])
-        if task_all_pairs:
-            task_pair_dist = ", ".join(f"{pair_row['name']}:{pair_row['rate']:.2%}" for pair_row in task_all_pairs)
-            print(f"[ROUTE][{tag}][{row['task']}][PAIR_DIST] {task_pair_dist}")
-
-
-def init_oracle_debug_accumulator(expert_names: Sequence[str]) -> Dict:
-    return {
-        "num_samples": 0,
-        "expert_names": list(expert_names),
-        "global_gold_pair_counter": Counter(),
-        "global_gap_values": [],
-        "global_self_minus_oracle_values": [],
-        "per_task": defaultdict(
-            lambda: {
-                "count": 0,
-                "gold_pair_counter": Counter(),
-                "gap_values": [],
-                "self_minus_oracle_values": [],
-                "has_self_expert": False,
-            }
-        ),
-    }
-
-
-def update_oracle_debug_accumulator(
-    acc: Dict,
-    loss_matrix: torch.Tensor,
-    task_ids: torch.Tensor,
-    sample_task_names: Optional[Sequence[str]] = None,
-):
-    expert_names = acc["expert_names"]
-    num_pairs = loss_matrix.size(1) * loss_matrix.size(2)
-    flat_loss = loss_matrix.view(loss_matrix.size(0), num_pairs)
-    sorted_loss, sorted_idx = flat_loss.sort(dim=-1)
-    best_pair = sorted_idx[:, 0]
-    best_cost = sorted_loss[:, 0]
-    second_cost = sorted_loss[:, 1] if num_pairs > 1 else sorted_loss[:, 0]
-    gap = second_cost - best_cost
-    batch_idx = torch.arange(loss_matrix.size(0), device=loss_matrix.device)
-    self_ids, self_valid = resolve_self_expert_ids(
-        task_ids=task_ids,
-        expert_names=expert_names,
-        sample_task_names=sample_task_names,
-        device=loss_matrix.device,
-    )
-    self_cost = loss_matrix[batch_idx, self_ids.clamp_min(0), self_ids.clamp_min(0)]
-    self_minus_oracle = self_cost - best_cost
-
-    best_pair_cpu = best_pair.detach().cpu().tolist()
-    gap_cpu = gap.detach().cpu().tolist()
-    self_minus_oracle_cpu = self_minus_oracle.detach().cpu().tolist()
-    self_valid_cpu = self_valid.detach().cpu().tolist()
-    if sample_task_names is None:
-        sample_task_names = task_names_from_ids(task_ids.detach().cpu().tolist(), expert_names)
-
-    acc["num_samples"] += len(best_pair_cpu)
-    acc["global_gap_values"].extend(float(x) for x in gap_cpu)
-
-    for pair_id, gap_value, delta_value, has_self_expert, task_name in zip(
-        best_pair_cpu, gap_cpu, self_minus_oracle_cpu, self_valid_cpu, sample_task_names
-    ):
-        first_idx = int(pair_id) // loss_matrix.size(2)
-        mid_idx = int(pair_id) % loss_matrix.size(2)
-        pair_name = f"{expert_names[first_idx]}->{expert_names[mid_idx]}"
-        task_name = str(task_name)
-
-        acc["global_gold_pair_counter"][pair_name] += 1
-        task_bucket = acc["per_task"][task_name]
-        task_bucket["count"] += 1
-        task_bucket["gold_pair_counter"][pair_name] += 1
-        task_bucket["gap_values"].append(float(gap_value))
-        if bool(has_self_expert):
-            task_bucket["has_self_expert"] = True
-            task_bucket["self_minus_oracle_values"].append(float(delta_value))
-            acc["global_self_minus_oracle_values"].append(float(delta_value))
-
-
-def build_oracle_debug_summary(acc: Dict, top_k: int = 5) -> Dict:
-    num_samples = int(acc.get("num_samples", 0))
-    if num_samples <= 0:
-        return {"num_samples": 0, "top_gold_pairs": [], "per_task": []}
-
-    def _counter_rows(counter: Counter, denom: int, limit: int) -> List[Dict]:
-        rows = []
-        for name, count in counter.most_common(limit):
-            rows.append(
-                {
-                    "name": name,
-                    "count": int(count),
-                    "rate": float(count / max(denom, 1)),
-                }
-            )
-        return rows
-
-    def _mean(values: Sequence[float]) -> float:
-        return float(sum(values) / max(len(values), 1))
-
-    def _quantile(values: Sequence[float], q: float) -> float:
-        if not values:
-            return 0.0
-        sorted_values = sorted(float(v) for v in values)
-        idx = int(round((len(sorted_values) - 1) * q))
-        idx = max(0, min(idx, len(sorted_values) - 1))
-        return float(sorted_values[idx])
-
-    global_gaps = acc["global_gap_values"]
-    global_deltas = acc["global_self_minus_oracle_values"]
-    per_task = []
-    for task_name in sorted(acc["per_task"].keys()):
-        bucket = acc["per_task"][task_name]
-        if bucket["count"] <= 0:
-            continue
-        delta_values = bucket["self_minus_oracle_values"]
-        per_task.append(
-            {
-                "task": task_name,
-                "count": int(bucket["count"]),
-                "avg_gap": _mean(bucket["gap_values"]),
-                "p50_gap": _quantile(bucket["gap_values"], 0.5),
-                "p90_gap": _quantile(bucket["gap_values"], 0.9),
-                "has_self_expert": bool(bucket.get("has_self_expert", False)),
-                "avg_self_minus_oracle": _mean(delta_values) if delta_values else None,
-                "top_gold_pairs": _counter_rows(bucket["gold_pair_counter"], bucket["count"], top_k),
-            }
-        )
-
-    return {
-        "num_samples": num_samples,
-        "avg_gap": _mean(global_gaps),
-        "p50_gap": _quantile(global_gaps, 0.5),
-        "p90_gap": _quantile(global_gaps, 0.9),
-        "avg_self_minus_oracle": _mean(global_deltas) if global_deltas else None,
-        "top_gold_pairs": _counter_rows(acc["global_gold_pair_counter"], num_samples, top_k),
-        "per_task": per_task,
-    }
-
-
-def print_oracle_debug_summary(tag: str, summary: Dict):
-    if int(summary.get("num_samples", 0)) <= 0:
-        print(f"[ORACLE][{tag}] no samples")
-        return
-
-    top_gold = ", ".join(
-        f"{row['name']}:{row['rate']:.2%}" for row in summary.get("top_gold_pairs", [])[:3]
-    )
-    print(
-        f"[ORACLE][{tag}] avg_gap={summary.get('avg_gap', 0.0):.4f} "
-        f"p50_gap={summary.get('p50_gap', 0.0):.4f} "
-        f"p90_gap={summary.get('p90_gap', 0.0):.4f} "
-        f"avg_self_minus_oracle={optional_float(summary.get('avg_self_minus_oracle'))} "
-        f"top_gold_pairs={top_gold}"
-    )
-    for row in summary.get("per_task", []):
-        top_gold_rows = row.get("top_gold_pairs", [])
-        top_gold_name = top_gold_rows[0]["name"] if top_gold_rows else "-"
-        print(
-            f"[ORACLE][{tag}][{row['task']}] n={row['count']} "
-            f"avg_gap={row['avg_gap']:.4f} "
-            f"p50_gap={row['p50_gap']:.4f} "
-            f"avg_self_minus_oracle={optional_float(row.get('avg_self_minus_oracle'))} "
-            f"top_gold_pair={top_gold_name}"
-        )
-
-
 def save_runtime_compatible_router_bundle(
     model: JointAnswerSupervisionRouterModel,
     bert_tokenizer,
@@ -1445,11 +945,12 @@ def evaluate(
             max_length=max_llm_len,
             add_eos_to_target=add_eos_to_target,
         )
-        prompt_input_ids = lm_batch["prompt_input_ids"].to(device)
-        prompt_attention_mask = lm_batch["prompt_attention_mask"].to(device)
-        input_ids = lm_batch["input_ids"].to(device)
-        attention_mask = lm_batch["attention_mask"].to(device)
-        labels = lm_batch["labels"].to(device)
+        prompt_input_ids = lm_batch["prompt_input_ids"].to(device, non_blocking=True)
+        prompt_attention_mask = lm_batch["prompt_attention_mask"].to(device, non_blocking=True)
+        input_ids = lm_batch["input_ids"].to(device, non_blocking=True)
+        attention_mask = lm_batch["attention_mask"].to(device, non_blocking=True)
+        labels = lm_batch["labels"].to(device, non_blocking=True)
+        task_ids = batch.task_ids.to(device, non_blocking=True)
 
         bert_enc = bert_tokenizer(
             batch.source_texts,
@@ -1458,11 +959,11 @@ def evaluate(
             truncation=True,
             max_length=max_bert_len,
         )
-        bert_input_ids = bert_enc["input_ids"].to(device)
-        bert_attention_mask = bert_enc["attention_mask"].to(device)
+        bert_input_ids = bert_enc["input_ids"].to(device, non_blocking=True)
+        bert_attention_mask = bert_enc["attention_mask"].to(device, non_blocking=True)
         bert_token_type_ids = bert_enc.get("token_type_ids")
         if bert_token_type_ids is not None:
-            bert_token_type_ids = bert_token_type_ids.to(device)
+            bert_token_type_ids = bert_token_type_ids.to(device, non_blocking=True)
 
         ####先抽 prompt vector
         first_vec, mid_vec = model.extract_prompt_vectors(
@@ -1508,14 +1009,14 @@ def evaluate(
             pred_mid=pred_mid,
             best_first=best_first,
             best_mid=best_mid,
-            task_ids=batch.task_ids,
+            task_ids=task_ids,
             expert_names=model.expert_names,
             sample_task_names=batch.task_names,
         )
         score_stats = compute_route_score_stats(
             loss_matrix=loss_matrix,
             pred_pair=pred_pair,
-            task_ids=batch.task_ids,
+            task_ids=task_ids,
             loss_normalization=pair_loss_normalization,
             expert_names=model.expert_names,
             sample_task_names=batch.task_names,
@@ -1523,14 +1024,14 @@ def evaluate(
         update_oracle_debug_accumulator(
             acc=oracle_debug_acc,
             loss_matrix=loss_matrix,
-            task_ids=batch.task_ids,
+            task_ids=task_ids,
             sample_task_names=batch.task_names,
         )
         pred_first_all.extend(pred_first.cpu().tolist())
         pred_mid_all.extend(pred_mid.cpu().tolist())
         best_first_all.extend(best_first.cpu().tolist())
         best_mid_all.extend(best_mid.cpu().tolist())
-        task_ids_all.extend(batch.task_ids.cpu().tolist())
+        task_ids_all.extend(task_ids.detach().cpu().tolist())
         task_names_all.extend(str(name) for name in batch.task_names)
 
         total_loss += loss.item() * batch_size
@@ -1583,19 +1084,22 @@ def make_progress(iterable, total: int, desc: str):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--data_root", type=str, default="router_train_datasets")
+    parser.add_argument("--data_root", type=str, default="router_train_datasets_0511")
+    ####資料來源要用哪些task來訓練router, 不填就用data_root底下所有的資料夾
     parser.add_argument(
         "--task_names",
         type=str,
         default=None,
         help="comma-separated task names. default: discover all subdirs under data_root",
     )
+    ####資料來源要用哪個data_root根目錄來eval, 不填就用data_root底下所有的資料夾
     parser.add_argument(
         "--eval_data_root",
         type=str,
         default=None,
         help="optional evaluation dataset root. default: use data_root",
     )
+    ####指定 eval 用哪些 task。不填就掃 eval_data_root底下所有的資料夾
     parser.add_argument(
         "--eval_task_names",
         type=str,
@@ -1613,17 +1117,20 @@ def main():
         action="store_true",
         help="skip training and only evaluate router checkpoint on eval datasets",
     )
+    #### 訓練每幾個 epoch 額外跑一次 eval dataset。適合看新資料訓練時，有沒有把舊資料能力搞壞。
     parser.add_argument(
         "--eval_data_during_train",
         action="store_true",
         help="also evaluate eval_data_root after training epochs, useful for monitoring old tasks while training on new tasks",
     )
+    ####搭配上面那個參數，每幾個 epoch eval 一次。
     parser.add_argument(
         "--eval_data_every_epochs",
         type=int,
         default=1,
         help="run eval_data_root evaluation every N epochs when --eval_data_during_train is set",
     )
+    ####router 可以選的 expert 名單。這個會決定 pair 空間大小：
     parser.add_argument(
         "--expert_names",
         type=str,
@@ -1633,34 +1140,60 @@ def main():
     parser.add_argument("--base_model_path", type=str, required=True)
     parser.add_argument("--router_bert_init", type=str, required=True)
     parser.add_argument("--output_dir", type=str, required=True)
+    ###從既有 router checkpoint 繼續訓練或 eval。
     parser.add_argument("--load_router_ckpt_dir", type=str, default=None)
     parser.add_argument("--lora_iwslt", type=str, default='./saves/llama2-7b-chat-hf/lora/sft_iwslt')
     parser.add_argument("--lora_medmcqa", type=str, default='./saves/llama2-7b-chat-hf/lora/sft_medmcqa')
     parser.add_argument("--lora_race", type=str, default='./saves/llama2-7b-chat-hf/lora/sft_race')
     parser.add_argument("--lora_squad2", type=str, default="./saves/llama2-7b-chat-hf/lora/sft_squad20")
     parser.add_argument("--lora_sst2", type=str, default="./saves/llama2-7b-chat-hf/lora/sft_sst2")
-    parser.add_argument("--lora_piqa", type=str, default=None)
-    parser.add_argument("--lora_copa", type=str, default=None)
-    parser.add_argument("--lora_hellaswag", type=str, default=None)
-    parser.add_argument("--lora_boolq", type=str, default=None)
-    parser.add_argument("--lora_siqa", type=str, default=None)
+    #parser.add_argument("--lora_piqa", type=str, default=None)
+    #parser.add_argument("--lora_copa", type=str, default=None)
+    #parser.add_argument("--lora_hellaswag", type=str, default=None)
+    #parser.add_argument("--lora_boolq", type=str, default=None)
+    #parser.add_argument("--lora_siqa", type=str, default=None)
     parser.add_argument("--batch_size", type=int, default=128)
     parser.add_argument("--eval_batch_size", type=int, default=128)
     parser.add_argument("--epochs", type=int, default=2)
     parser.add_argument("--lr", type=float, default=2e-5)
     parser.add_argument("--weight_decay", type=float, default=0.01)
     parser.add_argument("--warmup_ratio", type=float, default=0.05)
-    parser.add_argument("--max_train_samples", type=int, default=None)
-    parser.add_argument("--max_val_samples", type=int, default=None)
+    parser.add_argument("--max_train_samples", type=int, default=500)
+    parser.add_argument("--max_val_samples", type=int, default=250)
+    ####LLM prompt+target 最大 token 長度。越大越吃 GPU。
     parser.add_argument("--max_llm_len", type=int, default=768)
     parser.add_argument("--max_bert_len", type=int, default=512)
     parser.add_argument("--first_layer_idx", type=int, default=0)
     parser.add_argument("--middle_layer_idx", type=int, default=15)
+    ####router hidden dim，其實我也不知道這個是甚麼意思?
+    '''
+    Ans.
+    LLM hidden vector 原本可能是 4096 維
+    BERT hidden vector 原本可能是 768 維
+
+    router_dim=512 表示：
+    先把它們都投影到 512 維
+    再做 attention / feature extraction
+    '''
+    '''
+    router_dim 越大：
+    router 表達能力越強
+    參數越多
+    訓練較慢
+    更可能 overfit
+
+    router_dim 越小：
+    參數少
+    訓練快
+    但可能學不動
+    '''
+    ###這樣不會造成誤差嗎?
+    ###router_dim * 2 = 1024 維為甚麼? 為甚麼router_first最後會輸出1024?
     parser.add_argument("--router_dim", type=int, default=512)
     parser.add_argument(
         "--router_pooling",
         type=str,
-        default="last_token",
+        default="mean",
         choices=["last_token", "mean", "lastk_mean"],
     )
     parser.add_argument("--router_pooling_last_k", type=int, default=4)
@@ -1668,9 +1201,21 @@ def main():
     parser.add_argument("--r", type=int, default=8)
     parser.add_argument("--alpha", type=int, default=32)
     parser.add_argument("--freeze_bert", action="store_true")
+    ####這兩個default是到底會不會開著啊?Ans. store_true:你沒有寫這個參數 -> False, 你有寫這個參數   -> True
     parser.add_argument("--freeze_router_first", action="store_true")
     parser.add_argument("--freeze_router_mid", action="store_true")
     parser.add_argument("--train_mode", type=str, default="joint", choices=["stage1", "stage2", "joint"])
+    '''
+    ce_pair:
+    把 loss_matrix 最低的 pair 當 hard label。
+
+    expected_loss:
+    router softmax 機率乘上整張 loss_matrix。
+    不是只追第一名，而是整體偏向低 cost pair。
+
+    ce_pair_plus_expected:
+    ce_pair + pseudo_ce_weight * expected_loss
+    '''
     parser.add_argument(
         "--joint_loss",
         type=str,
@@ -1678,8 +1223,11 @@ def main():
         choices=["ce_pair", "expected_loss", "ce_pair_plus_expected"],
         help="Joint-mode objective. Ignored for stage1/stage2.",
     )
+    ####在 ce_pair_plus_expected 裡控制 expected loss 權重。
     parser.add_argument("--pseudo_ce_weight", type=float, default=0.0)
+    ####只對 best pair 和 second best pair 差距夠大的 sample 做 hard CE。差距小代表 oracle 不明確，CE label 可能太硬。這個是用在哪個算式?Ans. 只有用在--joint_loss ce_pair裡才會影響loss，如果expected_loss只有影響main_pair_ce 指標
     parser.add_argument("--pseudo_ce_margin", type=float, default=0.0)
+    ####sample_minmax 會把每筆 sample 的 loss matrix normalize 到 0~1。通常建議開，因為不同 sample 的 NLL scale 可能差很多。這個可能要看一下數學式
     parser.add_argument(
         "--pair_loss_normalization",
         type=str,
@@ -1687,6 +1235,15 @@ def main():
         choices=["none", "sample_minmax"],
         help="Normalize each sample's oracle pair-cost matrix before expected-loss and margin filtering.",
     )
+    ####計算 token NLL 時，target 後面加 EOS。啊這個是要幹嘛用的?action="store_true"是甚麼意思?
+    '''
+    不加 EOS:
+    只評估模型有沒有產生 target 文字
+
+    加 EOS:
+    評估模型有沒有產生 target 文字，並且知道答案該結束
+    '''
+    ###但要注意：如果你的 target 本身格式很短，例如 "A"、"1"，加 EOS 會讓 loss 多算一個 EOS token。這可能改變不同 expert pair 的 ranking。不是一定壞，但要固定一致：建 cache 和比較實驗時要同一種設定。 比較實驗我要看哪裡?
     parser.add_argument("--add_eos_to_target", action="store_true")
     parser.add_argument("--num_workers", type=int, default=0)
     parser.add_argument("--seed", type=int, default=42)
@@ -1972,11 +1529,12 @@ def main():
                 max_length=args.max_llm_len,
                 add_eos_to_target=args.add_eos_to_target,
             )
-            prompt_input_ids = lm_batch["prompt_input_ids"].to(device)
-            prompt_attention_mask = lm_batch["prompt_attention_mask"].to(device)
-            input_ids = lm_batch["input_ids"].to(device)
-            attention_mask = lm_batch["attention_mask"].to(device)
-            labels = lm_batch["labels"].to(device)
+            prompt_input_ids = lm_batch["prompt_input_ids"].to(device, non_blocking=True)
+            prompt_attention_mask = lm_batch["prompt_attention_mask"].to(device, non_blocking=True)
+            input_ids = lm_batch["input_ids"].to(device, non_blocking=True)
+            attention_mask = lm_batch["attention_mask"].to(device, non_blocking=True)
+            labels = lm_batch["labels"].to(device, non_blocking=True)
+            task_ids = batch.task_ids.to(device, non_blocking=True)
 
             bert_enc = bert_tokenizer(
                 batch.source_texts,
@@ -1985,11 +1543,11 @@ def main():
                 truncation=True,
                 max_length=args.max_bert_len,
             )
-            bert_input_ids = bert_enc["input_ids"].to(device)
-            bert_attention_mask = bert_enc["attention_mask"].to(device)
+            bert_input_ids = bert_enc["input_ids"].to(device, non_blocking=True)
+            bert_attention_mask = bert_enc["attention_mask"].to(device, non_blocking=True)
             bert_token_type_ids = bert_enc.get("token_type_ids")
             if bert_token_type_ids is not None:
-                bert_token_type_ids = bert_token_type_ids.to(device)
+                bert_token_type_ids = bert_token_type_ids.to(device, non_blocking=True)
 
             ####開torch.no_grad(), 因為我不想對 base LLM/backbone 回傳梯度
             with torch.no_grad():
@@ -2045,12 +1603,12 @@ def main():
             train_pred_mid_all.extend(pred_mid.detach().cpu().tolist())
             train_best_first_all.extend(best_first.detach().cpu().tolist())
             train_best_mid_all.extend(best_mid.detach().cpu().tolist())
-            train_task_ids_all.extend(batch.task_ids.cpu().tolist())
+            train_task_ids_all.extend(task_ids.detach().cpu().tolist())
             train_task_names_all.extend(str(name) for name in batch.task_names)
             update_oracle_debug_accumulator(
                 acc=train_oracle_debug_acc,
                 loss_matrix=loss_matrix,
-                task_ids=batch.task_ids,
+                task_ids=task_ids,
                 sample_task_names=batch.task_names,
             )
 
@@ -2060,7 +1618,7 @@ def main():
                     pred_mid=pred_mid,
                     best_first=best_first,
                     best_mid=best_mid,
-                    task_ids=batch.task_ids,
+                    task_ids=task_ids,
                     expert_names=expert_names,
                     sample_task_names=batch.task_names,
                 )
@@ -2079,7 +1637,7 @@ def main():
                     pred_mid=pred_mid,
                     best_first=best_first,
                     best_mid=best_mid,
-                    task_ids=batch.task_ids,
+                    task_ids=task_ids,
                     expert_names=expert_names,
                     sample_task_names=batch.task_names,
                 )
