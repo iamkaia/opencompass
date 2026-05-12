@@ -27,11 +27,13 @@ def compute_pair_losses(
     logits_first: Optional[torch.Tensor] = None,
     logits_mid: Optional[torch.Tensor] = None,
     loss_matrix: Optional[torch.Tensor] = None,
+    correct_matrix: Optional[torch.Tensor] = None,
     mode: str = "joint",
     joint_loss: str = "expected_loss",
     pseudo_ce_weight: float = 0.0,
     margin: float = 0.0,
     loss_normalization: str = "sample_minmax",
+    correct_soft_ce_temperature: float = 1.0,
 ) -> tuple[torch.Tensor, Dict[str, float], torch.Tensor, torch.Tensor, torch.Tensor]:
     if loss_matrix is None:
         raise ValueError("loss_matrix is required")
@@ -50,6 +52,45 @@ def compute_pair_losses(
     best_mid = flat_best % num_tasks
     pair_prob = torch.softmax(pair_logits, dim=-1)
     expected_loss = (pair_prob * normalized_flat_loss).sum(dim=-1).mean()
+    log_pair_prob = torch.log_softmax(pair_logits, dim=-1)
+
+    correct_soft_ce = torch.tensor(0.0, device=pair_logits.device)
+    correct_conf_ce = torch.tensor(0.0, device=pair_logits.device)
+    correct_target_available = torch.zeros(loss_matrix.size(0), dtype=torch.bool, device=pair_logits.device)
+    avg_correct_pairs = torch.tensor(0.0, device=pair_logits.device)
+    if correct_matrix is not None:
+        flat_correct = correct_matrix.to(device=pair_logits.device, dtype=torch.float32).view(loss_matrix.size(0), -1)
+        correct_counts = flat_correct.sum(dim=-1, keepdim=True)
+        correct_target_available = correct_counts.squeeze(-1) > 0
+        avg_correct_pairs = correct_counts[correct_target_available].mean() if correct_target_available.any() else torch.tensor(
+            0.0, device=pair_logits.device
+        )
+        target_prob = torch.where(
+            correct_counts > 0,
+            flat_correct / correct_counts.clamp_min(1.0),
+            torch.zeros_like(flat_correct),
+        )
+        correct_soft_ce_all = -(target_prob * log_pair_prob).sum(dim=-1)
+        correct_soft_ce = (
+            correct_soft_ce_all[correct_target_available].mean()
+            if correct_target_available.any()
+            else torch.tensor(0.0, device=pair_logits.device)
+        )
+        temperature = max(float(correct_soft_ce_temperature), 1e-6)
+        correct_conf_logits = -normalized_flat_loss / temperature
+        correct_conf_logits = correct_conf_logits.masked_fill(flat_correct <= 0, -1e9)
+        correct_conf_target = torch.softmax(correct_conf_logits, dim=-1)
+        correct_conf_target = torch.where(
+            correct_counts > 0,
+            correct_conf_target,
+            torch.zeros_like(correct_conf_target),
+        )
+        correct_conf_ce_all = -(correct_conf_target * log_pair_prob).sum(dim=-1)
+        correct_conf_ce = (
+            correct_conf_ce_all[correct_target_available].mean()
+            if correct_target_available.any()
+            else torch.tensor(0.0, device=pair_logits.device)
+        )
 
     sorted_loss, _ = normalized_flat_loss.sort(dim=-1)
     if normalized_flat_loss.size(1) > 1:
@@ -82,6 +123,14 @@ def compute_pair_losses(
             total_loss = ce_pair
         elif joint_loss == "expected_loss":
             total_loss = expected_loss
+        elif joint_loss == "correct_soft_ce":
+            if correct_matrix is None:
+                raise ValueError("correct_soft_ce requires correct_matrix")
+            total_loss = correct_soft_ce
+        elif joint_loss == "correct_conf_ce":
+            if correct_matrix is None:
+                raise ValueError("correct_conf_ce requires correct_matrix")
+            total_loss = correct_conf_ce
         elif joint_loss == "ce_pair_plus_expected":
             total_loss = ce_pair
             if pseudo_ce_weight > 0:
@@ -93,6 +142,11 @@ def compute_pair_losses(
 
     metrics = {
         "expected_loss": float(expected_loss.detach().item()),
+        "correct_soft_ce": float(correct_soft_ce.detach().item()),
+        "correct_conf_ce": float(correct_conf_ce.detach().item()),
+        "correct_soft_ce_temperature": float(correct_soft_ce_temperature),
+        "correct_target_available_ratio": float(correct_target_available.float().mean().item()),
+        "avg_correct_pairs": float(avg_correct_pairs.detach().item()),
         "main_pair_ce": float(ce_pair.detach().item()),
         "pseudo_ce_pair": float(ce_pair.detach().item()),
         "best_pair_loss": float(sorted_loss[:, 0].mean().item()),

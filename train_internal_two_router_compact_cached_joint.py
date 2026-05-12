@@ -264,6 +264,7 @@ def evaluate(
     pseudo_ce_margin,
     pair_loss_normalization,
     supervision_mode,
+    correct_soft_ce_temperature,
 ):
     model.eval()
     total_loss = 0.0
@@ -301,10 +302,12 @@ def evaluate(
         oracle_loss, metrics, best_first, best_mid, flat_best = compute_pair_losses(
             pair_logits=pair_logits,
             loss_matrix=batch.loss_matrix.to(device),
+            correct_matrix=batch.correct_matrix.to(device),
             joint_loss=joint_loss,
             pseudo_ce_weight=pseudo_ce_weight,
             margin=pseudo_ce_margin,
             loss_normalization=pair_loss_normalization,
+            correct_soft_ce_temperature=correct_soft_ce_temperature,
         )
         if supervision_mode == "self_pair_ce":
             loss, _ = compute_self_pair_ce(pair_logits, batch.task_ids.to(device), batch.loss_matrix.size(2))
@@ -495,7 +498,13 @@ def main():
         "--joint_loss",
         type=str,
         default="expected_loss",
-        choices=["ce_pair", "expected_loss", "ce_pair_plus_expected"],
+        choices=["ce_pair", "expected_loss", "ce_pair_plus_expected", "correct_soft_ce", "correct_conf_ce"],
+    )
+    parser.add_argument(
+        "--correct_soft_ce_temperature",
+        type=float,
+        default=1.0,
+        help="Temperature for correct_conf_ce. Lower values put more target mass on lower-loss correct pairs.",
     )
     '''
     oracle_loss：使用 cache 裡的 loss_matrix 訓練。
@@ -600,6 +609,7 @@ def main():
     print(
         f"[INFO] supervision_mode={args.supervision_mode} joint_loss={args.joint_loss} "
         f"pseudo_ce_weight={args.pseudo_ce_weight} pseudo_ce_margin={args.pseudo_ce_margin} "
+        f"correct_soft_ce_temperature={args.correct_soft_ce_temperature} "
         f"pair_loss_normalization={args.pair_loss_normalization}"
     )
     train_cfg = vars(args).copy()
@@ -713,10 +723,12 @@ def main():
             oracle_loss, metrics, best_first, best_mid, flat_best = compute_pair_losses(
                 pair_logits=pair_logits,
                 loss_matrix=batch.loss_matrix.to(device),
+                correct_matrix=batch.correct_matrix.to(device),
                 joint_loss=args.joint_loss,
                 pseudo_ce_weight=args.pseudo_ce_weight,
                 margin=args.pseudo_ce_margin,
                 loss_normalization=args.pair_loss_normalization,
+                correct_soft_ce_temperature=args.correct_soft_ce_temperature,
             )
             ####--supervision_mode self_pair_ce, loss=自己的task
             if args.supervision_mode == "self_pair_ce":
@@ -808,6 +820,10 @@ def main():
                             "train/loss": avg_loss,
                             "train/main_pair_ce": avg_metrics["main_pair_ce"],
                             "train/expected_loss": avg_metrics["expected_loss"],
+                            "train/correct_soft_ce": avg_metrics.get("correct_soft_ce", 0.0),
+                            "train/correct_conf_ce": avg_metrics.get("correct_conf_ce", 0.0),
+                            "train/correct_target_available_ratio": avg_metrics.get("correct_target_available_ratio", 0.0),
+                            "train/avg_correct_pairs": avg_metrics.get("avg_correct_pairs", 0.0),
                             "train/best_pair_loss": avg_metrics["best_pair_loss"],
                             "train/pseudo_ce_pair": avg_metrics["pseudo_ce_pair"],
                             "train/margin_active_ratio": avg_metrics["margin_active_ratio"],
@@ -860,6 +876,7 @@ def main():
             pseudo_ce_margin=args.pseudo_ce_margin,
             pair_loss_normalization=args.pair_loss_normalization,
             supervision_mode=args.supervision_mode,
+            correct_soft_ce_temperature=args.correct_soft_ce_temperature,
         )
         print(
             f"[VAL] epoch={epoch} loss={val_metrics['loss']:.4f} "
@@ -899,6 +916,7 @@ def main():
                 pseudo_ce_margin=args.pseudo_ce_margin,
                 pair_loss_normalization=args.pair_loss_normalization,
                 supervision_mode=args.supervision_mode,
+                correct_soft_ce_temperature=args.correct_soft_ce_temperature,
             )
             print(
                 f"[TRAIN-EVAL] epoch={epoch} loss={train_eval_metrics['loss']:.4f} "
@@ -931,6 +949,10 @@ def main():
                 "val/loss": val_metrics["loss"],
                 "val/main_pair_ce": val_metrics.get("main_pair_ce", 0.0),
                 "val/expected_loss": val_metrics.get("expected_loss", 0.0),
+                "val/correct_soft_ce": val_metrics.get("correct_soft_ce", 0.0),
+                "val/correct_conf_ce": val_metrics.get("correct_conf_ce", 0.0),
+                "val/correct_target_available_ratio": val_metrics.get("correct_target_available_ratio", 0.0),
+                "val/avg_correct_pairs": val_metrics.get("avg_correct_pairs", 0.0),
                 "val/best_pair_loss": val_metrics.get("best_pair_loss", 0.0),
                 "val/pseudo_ce_pair": val_metrics.get("pseudo_ce_pair", 0.0),
                 "val/router_argmax_score": val_metrics["router_argmax_score"],
