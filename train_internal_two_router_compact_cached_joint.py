@@ -437,8 +437,11 @@ def save_ckpt(
     epoch,
     joint_loss,
     pseudo_ce_weight,
+    correct_soft_ce_temperature,
     pair_loss_normalization,
     supervision_mode,
+    best_metric,
+    best_metric_value,
 ):
     os.makedirs(out_dir, exist_ok=True)
     model.bert.encoder.save_pretrained(os.path.join(out_dir, "encoder"))
@@ -463,9 +466,13 @@ def save_ckpt(
             "supervision_mode": str(supervision_mode),
             "joint_loss": str(joint_loss),
             "pseudo_ce_weight": float(pseudo_ce_weight),
+            "correct_soft_ce_temperature": float(correct_soft_ce_temperature),
             "pair_loss_normalization": str(pair_loss_normalization),
             "best_epoch": epoch,
+            "best_metric": str(best_metric),
+            "best_metric_value": float(best_metric_value),
             "best_router_argmax_score": metrics.get("router_argmax_score"),
+            "best_route_correct_acc": metrics.get("route_correct_acc"),
             "best_val_loss": metrics.get("loss"),
         },
         os.path.join(out_dir, "router_config.json"),
@@ -529,6 +536,21 @@ def main():
         type=str,
         default="sample_minmax",
         choices=["none", "sample_minmax"],
+    )
+    parser.add_argument(
+        "--best_metric",
+        type=str,
+        default="route_correct_acc",
+        choices=[
+            "route_correct_acc",
+            "router_argmax_score",
+            "pair_acc",
+            "joint_acc",
+            "first_acc",
+            "mid_acc",
+            "loss",
+        ],
+        help="Validation metric for checkpointing/early stopping. All choices are maximized except loss.",
     )
     ####validation router score 連續幾個 epoch 沒進步就停。
     parser.add_argument("--early_stop_patience", type=int, default=2)
@@ -610,7 +632,8 @@ def main():
         f"[INFO] supervision_mode={args.supervision_mode} joint_loss={args.joint_loss} "
         f"pseudo_ce_weight={args.pseudo_ce_weight} pseudo_ce_margin={args.pseudo_ce_margin} "
         f"correct_soft_ce_temperature={args.correct_soft_ce_temperature} "
-        f"pair_loss_normalization={args.pair_loss_normalization}"
+        f"pair_loss_normalization={args.pair_loss_normalization} "
+        f"best_metric={args.best_metric}"
     )
     train_cfg = vars(args).copy()
     train_cfg["resolved_sample_task_names"] = sample_task_names
@@ -676,6 +699,7 @@ def main():
     warmup_steps = int(total_steps * args.warmup_ratio)
     scheduler = get_linear_schedule_with_warmup(optimizer, warmup_steps, total_steps)
 
+    best_metric_value = float("inf") if args.best_metric == "loss" else float("-inf")
     best_router_score = float("-inf")
     best_epoch = -1
     no_improve_epochs = 0
@@ -943,6 +967,12 @@ def main():
                     {"epoch": epoch, "records": train_eval_metrics["route_records"]},
                     os.path.join(args.out_dir, f"route_records_train_eval_epoch{epoch}.json"),
                 )
+        current_best_metric = float(val_metrics.get(args.best_metric, float("nan")))
+        if not math.isfinite(current_best_metric):
+            raise ValueError(
+                f"best_metric={args.best_metric} is not available or is not finite in validation metrics. "
+                f"Available metrics include: {sorted(val_metrics.keys())}"
+            )
         if wandb_run is not None:
             wandb_payload = {
                 "val/epoch": epoch,
@@ -974,8 +1004,12 @@ def main():
                 "val/self_joint_acc": val_metrics["self_joint_acc"],
                 "val/self_pair_acc": val_metrics["self_pair_acc"],
                 "val/oracle_self_pair_acc": val_metrics["oracle_self_pair_acc"],
+                "val/best_metric_value": current_best_metric
+                if best_epoch < 0
+                else (min(best_metric_value, current_best_metric) if args.best_metric == "loss" else max(best_metric_value, current_best_metric)),
                 "val/best_router_argmax_score": max(best_router_score, val_metrics["router_argmax_score"]),
             }
+            wandb_payload[f"val/{args.best_metric}_for_checkpoint"] = current_best_metric
             wandb_payload.update(flatten_routing_summary(val_metrics["routing_summary"], prefix="val_route"))
             if train_eval_metrics is not None:
                 wandb_payload.update(
@@ -996,8 +1030,12 @@ def main():
                     flatten_routing_summary(train_eval_metrics["routing_summary"], prefix="train_eval_route")
                 )
             wandb_run.log(wandb_payload, step=global_step)
-        improved = val_metrics["router_argmax_score"] > (best_router_score + args.early_stop_min_delta)
+        if args.best_metric == "loss":
+            improved = current_best_metric < (best_metric_value - args.early_stop_min_delta)
+        else:
+            improved = current_best_metric > (best_metric_value + args.early_stop_min_delta)
         if improved:
+            best_metric_value = current_best_metric
             best_router_score = val_metrics["router_argmax_score"]
             best_epoch = epoch
             no_improve_epochs = 0
@@ -1011,25 +1049,36 @@ def main():
                 epoch=epoch,
                 joint_loss=args.joint_loss,
                 pseudo_ce_weight=args.pseudo_ce_weight,
+                correct_soft_ce_temperature=args.correct_soft_ce_temperature,
                 pair_loss_normalization=args.pair_loss_normalization,
                 supervision_mode=args.supervision_mode,
+                best_metric=args.best_metric,
+                best_metric_value=best_metric_value,
             )
-            print(f"[SAVE] best checkpoint updated at epoch={epoch} router_score={best_router_score:.2f}")
+            print(
+                f"[SAVE] best checkpoint updated at epoch={epoch} "
+                f"{args.best_metric}={best_metric_value:.4f} router_score={best_router_score:.2f}"
+            )
         else:
             no_improve_epochs += 1
             print(
                 f"[EARLY_STOP] no improvement for {no_improve_epochs} epoch(s). "
-                f"best_router_score={best_router_score:.2f} at epoch={best_epoch}"
+                f"best_{args.best_metric}={best_metric_value:.4f} at epoch={best_epoch}"
             )
             if no_improve_epochs >= args.early_stop_patience:
                 print(f"[EARLY_STOP] stop training because patience={args.early_stop_patience} is reached.")
                 break
 
     if wandb_run is not None:
+        wandb_run.summary["best_metric"] = args.best_metric
+        wandb_run.summary["best_metric_value"] = best_metric_value
         wandb_run.summary["best_router_argmax_score"] = best_router_score
         wandb_run.summary["best_epoch"] = best_epoch
         wandb_run.finish()
-    print(f"[DONE] best_router_argmax_score={best_router_score:.2f} best_epoch={best_epoch}")
+    print(
+        f"[DONE] best_metric={args.best_metric} best_metric_value={best_metric_value:.4f} "
+        f"best_router_argmax_score={best_router_score:.2f} best_epoch={best_epoch}"
+    )
 
 
 if __name__ == "__main__":
