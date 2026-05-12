@@ -52,6 +52,7 @@ def save_chunk(items: List[Dict], split_dir: str, chunk_idx: int, manifest_files
     manifest_files.append(filename)
 
 
+###建datasets的cache
 def process_split(
     model: JointAnswerSupervisionRouterModel,
     split: str,
@@ -109,6 +110,25 @@ def process_split(
     )
 
     for batch_idx, batch in enumerate(progress, start=1):
+        '''
+        prompt_input_ids
+        prompt_attention_mask
+
+        input_ids
+        attention_mask
+        labels
+
+        prompt_input_ids:
+        只有 prompt，用來抽 first_vec/mid_vec
+
+        input_ids:
+        prompt + target，用來算 target token NLL
+
+        labels:
+        prompt 部分是 -100，不算 loss
+        target 部分才算 loss
+        '''
+
         lm_batch = build_lm_batch(
             tokenizer=llm_tokenizer,
             prompts=batch.texts,
@@ -228,8 +248,11 @@ def process_split(
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--data_root", type=str, required=True)
+    ####最後輸出cache的地方
     parser.add_argument("--feature_root", type=str, required=True)
+    ####資料來源要用哪些task來訓練router, 不填就用data_root底下所有的資料夾
     parser.add_argument("--task_names", type=str, default=None)
+    ####建 cache 時枚舉哪些 expert
     parser.add_argument("--expert_names", type=str, default=None)
     parser.add_argument("--base_model_path", type=str, required=True)
     parser.add_argument("--router_bert_init", type=str, default ="./task_classifier_ckpt")
@@ -261,11 +284,11 @@ def main():
     parser.add_argument("--lora_race", type=str, default='./saves/llama2-7b-chat-hf/lora/sft_race')
     parser.add_argument("--lora_squad2", type=str, default='./saves/llama2-7b-chat-hf/lora/sft_squad20')
     parser.add_argument("--lora_sst2", type=str, default='./saves/llama2-7b-chat-hf/lora/sft_sst2')
-    parser.add_argument("--lora_piqa", type=str, default=None)
-    parser.add_argument("--lora_copa", type=str, default=None)
-    parser.add_argument("--lora_hellaswag", type=str, default=None)
-    parser.add_argument("--lora_boolq", type=str, default=None)
-    parser.add_argument("--lora_siqa", type=str, default=None)
+    #parser.add_argument("--lora_piqa", type=str, default=None)
+    #parser.add_argument("--lora_copa", type=str, default=None)
+    #parser.add_argument("--lora_hellaswag", type=str, default=None)
+    #parser.add_argument("--lora_boolq", type=str, default=None)
+    #parser.add_argument("--lora_siqa", type=str, default=None)
     args = parser.parse_args()
 
     os.makedirs(args.feature_root, exist_ok=True)
@@ -280,11 +303,6 @@ def main():
         "race": args.lora_race,
         "squad2": args.lora_squad2,
         "sst2": args.lora_sst2,
-        "piqa": args.lora_piqa,
-        "copa": args.lora_copa,
-        "hellaswag": args.lora_hellaswag,
-        "boolq": args.lora_boolq,
-        "siqa": args.lora_siqa,
     }
     expert_names, expert_name_source = discover_expert_names(requested_experts, all_lora_paths)
     lora_paths = build_lora_paths(args, expert_names)
@@ -295,6 +313,14 @@ def main():
     if llm_tokenizer.pad_token_id is None:
         llm_tokenizer.pad_token = llm_tokenizer.eos_token
     llm_tokenizer.padding_side = "left"
+    '''
+    1. 載 base LLM
+    2. 把 LLM linear layer 換成 hard-routed LoRA linear
+    3. 把五個 LoRA adapter 載進五個 expert slot
+    4. 建 PromptVectorExtractor
+    5. 建 BERT
+    6. 建 router_first/router_mid/pair_classifier
+    '''
 
     model = JointAnswerSupervisionRouterModel(
         base_model_path=args.base_model_path,
