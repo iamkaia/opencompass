@@ -724,9 +724,14 @@ def compute_sequence_nll(logits: torch.Tensor, labels: torch.Tensor) -> torch.Te
     return (per_token_loss * valid_mask).sum(dim=1) / denom
 
 
-def _first_token_id(tokenizer, text: str) -> Optional[int]:
-    ids = tokenizer.encode(str(text), add_special_tokens=False)
-    return ids[0] if ids else None
+def _option_token_id(tokenizer, text: str) -> Optional[int]:
+    text = str(text)
+    for candidate in (text, " " + text, "\n" + text):
+        ids = tokenizer.encode(candidate, add_special_tokens=False)
+        if len(ids) == 1:
+            return ids[0]
+    ids = tokenizer.encode(text, add_special_tokens=False)
+    return ids[-1] if ids else None
 
 
 def _task_uses_generation_evaluator(task_name: str) -> bool:
@@ -777,7 +782,7 @@ def compute_option_nll_proxy_scores(
             raise ValueError(f"No option-label proxy defined for task={task_name}")
         option_token_ids = []
         for label in option_labels:
-            token_id = _first_token_id(tokenizer, label)
+            token_id = _option_token_id(tokenizer, label)
             if token_id is None:
                 raise ValueError(f"Tokenizer cannot encode option label {label!r} for task={task_name}")
             option_token_ids.append(token_id)
@@ -792,6 +797,7 @@ def compute_option_nll_proxy_scores(
             prefix = f"[OPTION_PROBS][{debug_prefix}]" if debug_prefix else "[OPTION_PROBS]"
             print(
                 f"{prefix} task={task_name} labels={option_labels} gold={gold_label} "
+                f"token_ids={option_token_ids} "
                 f"option_logits={option_logits.detach().float().cpu().tolist()} "
                 f"option_probs={option_probs.detach().float().cpu().tolist()} "
                 f"gold_cost={float((-log_probs[gold_idx]).detach().float().cpu().item()):.6f}",
