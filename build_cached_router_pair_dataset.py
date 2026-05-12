@@ -34,11 +34,11 @@ def build_lora_paths(args, expert_names: Sequence[str]) -> Dict[str, str]:
         "race": args.lora_race,
         "squad2": args.lora_squad2,
         "sst2": args.lora_sst2,
-        "piqa": args.lora_piqa,
-        "copa": args.lora_copa,
-        "hellaswag": args.lora_hellaswag,
-        "boolq": args.lora_boolq,
-        "siqa": args.lora_siqa,
+        #"piqa": args.lora_piqa,
+        #"copa": args.lora_copa,
+        #"hellaswag": args.lora_hellaswag,
+        #"boolq": args.lora_boolq,
+        #"siqa": args.lora_siqa,
     }
     missing = [name for name in expert_names if not all_lora_paths.get(name)]
     if missing:
