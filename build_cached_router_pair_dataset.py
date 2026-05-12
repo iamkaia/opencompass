@@ -159,6 +159,7 @@ def process_split(
                 llm_tokenizer=llm_tokenizer,
                 score_mode=score_mode,
             )
+            correct_matrix = getattr(model, "last_route_correct_matrix", None)
 
         flat_loss = loss_matrix.view(loss_matrix.size(0), -1)
         best_pair = flat_loss.argmin(dim=-1)
@@ -168,6 +169,11 @@ def process_split(
         first_vec_cpu = first_vec.to(dtype=torch.float16).cpu()
         mid_vec_cpu = mid_vec.to(dtype=torch.float16).cpu()
         loss_matrix_cpu = loss_matrix.to(dtype=torch.float32).cpu()
+        correct_matrix_cpu = (
+            correct_matrix.to(dtype=torch.bool).cpu()
+            if correct_matrix is not None
+            else torch.zeros_like(loss_matrix, dtype=torch.bool).cpu()
+        )
         best_pair_cpu = best_pair.cpu()
         best_first_cpu = best_first.cpu()
         best_mid_cpu = best_mid.cpu()
@@ -184,6 +190,7 @@ def process_split(
                     "first_vec": first_vec_cpu[idx].clone(),
                     "mid_vec": mid_vec_cpu[idx].clone(),
                     "loss_matrix": loss_matrix_cpu[idx].clone(),
+                    "correct_matrix": correct_matrix_cpu[idx].clone(),
                     "pair_label": int(best_pair_cpu[idx].item()),
                     "first_label": int(best_first_cpu[idx].item()),
                     "mid_label": int(best_mid_cpu[idx].item()),
@@ -238,6 +245,7 @@ def process_split(
             "expert_names": list(model.expert_names),
             "num_tasks": len(model.expert_names),
             "supervision_type": "cached_loss_matrix",
+            "has_correct_matrix": True,
             "score_mode": str(score_mode),
         },
         os.path.join(split_dir, "manifest.json"),

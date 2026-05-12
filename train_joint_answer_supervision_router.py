@@ -438,6 +438,7 @@ class JointAnswerSupervisionRouterModel(nn.Module):
         batch_size = prompt_input_ids.size(0)
         num_tasks = len(self.expert_names)
         loss_matrix = torch.empty(batch_size, num_tasks, num_tasks, dtype=torch.float32, device=prompt_input_ids.device)
+        correct_matrix = torch.zeros(batch_size, num_tasks, num_tasks, dtype=torch.bool, device=prompt_input_ids.device)
         score_mode = str(score_mode)
 
         ####這個像sft的算法嗎?
@@ -468,6 +469,7 @@ class JointAnswerSupervisionRouterModel(nn.Module):
 
             ###全部算完後清回 base/null，回傳。
             set_all_experts(self.model, NULL_EXPERT_ID)
+            self.last_route_correct_matrix = correct_matrix
             return loss_matrix
         
         ####如果不是token_nll的話，我先不跑這裡
@@ -499,15 +501,18 @@ class JointAnswerSupervisionRouterModel(nn.Module):
                     ).logits
                     option_tasks = [task_names[idx] for idx in option_nll_indices]
                     option_targets = [targets[idx] for idx in option_nll_indices]
-                    option_loss = compute_option_nll_proxy_scores(
+                    option_loss, option_correct = compute_option_nll_proxy_scores(
                         logits=option_logits,
                         prompt_attention_mask=option_prompt_mask,
                         targets=option_targets,
                         task_names=option_tasks,
                         tokenizer=llm_tokenizer,
                         debug_prefix=f"{first_task}->{mid_task}",
-                    ).to(device=prompt_input_ids.device, dtype=torch.float32)
+                    )
+                    option_loss = option_loss.to(device=prompt_input_ids.device, dtype=torch.float32)
+                    option_correct = option_correct.to(device=prompt_input_ids.device, dtype=torch.bool)
                     combo_loss.index_copy_(0, option_nll_index_tensor, option_loss)
+                    correct_matrix[:, first_tid, mid_tid].index_copy_(0, option_nll_index_tensor, option_correct)
 
                 ###找出哪些 sample 不需要 generation evaluator，也沒有選項 proxy，用 token NLL 即可。
                 token_nll_indices = [
@@ -563,9 +568,15 @@ class JointAnswerSupervisionRouterModel(nn.Module):
                         source_texts=generation_source_texts,
                     ).to(device=prompt_input_ids.device, dtype=torch.float32)
                     combo_loss.index_copy_(0, generation_index_tensor, generation_loss)
+                    correct_matrix[:, first_tid, mid_tid].index_copy_(
+                        0,
+                        generation_index_tensor,
+                        generation_loss <= 1e-6,
+                    )
                 loss_matrix[:, first_tid, mid_tid] = combo_loss
 
         set_all_experts(self.model, NULL_EXPERT_ID)
+        self.last_route_correct_matrix = correct_matrix
         return loss_matrix
 
     ####在目前已設定好的 expert pair 下 generate。
@@ -768,12 +779,13 @@ def compute_option_nll_proxy_scores(
     task_names: Sequence[str],
     tokenizer,
     debug_prefix: Optional[str] = None,
-) -> torch.Tensor:
+) -> tuple[torch.Tensor, torch.Tensor]:
     positions = torch.arange(prompt_attention_mask.size(1), device=prompt_attention_mask.device)
     last_prompt_pos = (prompt_attention_mask.to(torch.long) * positions).max(dim=1).values
     batch_idx = torch.arange(logits.size(0), device=logits.device)
     answer_logits = logits[batch_idx, last_prompt_pos, :]
     costs: List[torch.Tensor] = []
+    correct_flags: List[torch.Tensor] = []
     debug_enabled = os.environ.get("ROUTER_DEBUG_OPTION_PROBS", "0") == "1"
 
     for idx, task_name in enumerate(task_names):
@@ -793,6 +805,7 @@ def compute_option_nll_proxy_scores(
         gold_label = _normalize_task_label(task_name, targets[idx])
         gold_idx = option_labels.index(gold_label) if gold_label in option_labels else 0
         costs.append(-log_probs[gold_idx])
+        correct_flags.append(option_probs.argmax(dim=-1) == gold_idx)
         if debug_enabled and idx == 0:
             prefix = f"[OPTION_PROBS][{debug_prefix}]" if debug_prefix else "[OPTION_PROBS]"
             print(
@@ -804,7 +817,7 @@ def compute_option_nll_proxy_scores(
                 flush=True,
             )
 
-    return torch.stack(costs, dim=0).to(torch.float32)
+    return torch.stack(costs, dim=0).to(torch.float32), torch.stack(correct_flags, dim=0).to(torch.bool)
 
 
 def compute_official_evaluator_sample_score(

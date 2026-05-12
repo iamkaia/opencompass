@@ -109,6 +109,14 @@ class CachedLossMatrixDataset(Dataset):
                 sliced_loss_matrix = loss_matrix.index_select(0, torch.tensor(selected_expert_indices)).index_select(
                     1, torch.tensor(selected_expert_indices)
                 )
+                correct_matrix = item.get("correct_matrix")
+                has_correct_matrix = correct_matrix is not None
+                if has_correct_matrix:
+                    sliced_correct_matrix = correct_matrix.index_select(
+                        0, torch.tensor(selected_expert_indices)
+                    ).index_select(1, torch.tensor(selected_expert_indices))
+                else:
+                    sliced_correct_matrix = torch.zeros_like(sliced_loss_matrix, dtype=torch.bool)
                 flat_loss = sliced_loss_matrix.view(-1)
                 best_pair = int(flat_loss.argmin().item())
                 num_tasks = len(resolved_expert_names)
@@ -118,6 +126,8 @@ class CachedLossMatrixDataset(Dataset):
                 ####把 sample 的 task name 對應到 expert id。
                 remapped["task_id"] = int(expert2id.get(task_name, -1))
                 remapped["loss_matrix"] = sliced_loss_matrix
+                remapped["correct_matrix"] = sliced_correct_matrix.to(torch.bool)
+                remapped["has_correct_matrix"] = bool(has_correct_matrix)
                 remapped["pair_label"] = best_pair
                 remapped["first_label"] = best_first
                 remapped["mid_label"] = best_mid
@@ -146,6 +156,8 @@ class CachedLossMatrixDataset(Dataset):
             "first_vec": item["first_vec"],
             "mid_vec": item["mid_vec"],
             "loss_matrix": item["loss_matrix"],
+            "correct_matrix": item["correct_matrix"],
+            "has_correct_matrix": bool(item.get("has_correct_matrix", False)),
             "pair_label": int(item["pair_label"]),
             "first_label": int(item["first_label"]),
             "mid_label": int(item["mid_label"]),
@@ -163,6 +175,8 @@ class Batch:
     first_vec: torch.Tensor
     mid_vec: torch.Tensor
     loss_matrix: torch.Tensor
+    correct_matrix: torch.Tensor
+    correct_available: torch.Tensor
     pair_labels: torch.Tensor
     first_labels: torch.Tensor
     mid_labels: torch.Tensor
@@ -180,6 +194,8 @@ class Collator:
             first_vec=torch.stack([x["first_vec"] for x in batch], dim=0).to(torch.float32),
             mid_vec=torch.stack([x["mid_vec"] for x in batch], dim=0).to(torch.float32),
             loss_matrix=torch.stack([x["loss_matrix"] for x in batch], dim=0).to(torch.float32),
+            correct_matrix=torch.stack([x["correct_matrix"] for x in batch], dim=0).to(torch.bool),
+            correct_available=torch.tensor([bool(x["has_correct_matrix"]) for x in batch], dtype=torch.bool),
             pair_labels=torch.tensor([x["pair_label"] for x in batch], dtype=torch.long),
             first_labels=torch.tensor([x["first_label"] for x in batch], dtype=torch.long),
             mid_labels=torch.tensor([x["mid_label"] for x in batch], dtype=torch.long),
@@ -308,6 +324,41 @@ def evaluate(
             batch.task_ids,
             loss_normalization=pair_loss_normalization,
         )
+        correct_matrix_device = batch.correct_matrix.to(device)
+        correct_available = batch.correct_available.to(device)
+        batch_idx = torch.arange(batch.task_ids.size(0), device=device)
+        pred_correct = correct_matrix_device[batch_idx, pred_first, pred_mid]
+        oracle_correct = correct_matrix_device[batch_idx, best_first, best_mid]
+        any_correct = correct_matrix_device.view(correct_matrix_device.size(0), -1).any(dim=-1)
+        valid_self = (batch.task_ids.to(device) >= 0) & (batch.task_ids.to(device) < num_tasks)
+        self_ids = batch.task_ids.to(device).clamp_min(0)
+        self_correct = correct_matrix_device[batch_idx, self_ids, self_ids]
+        correctness_mask = correct_available
+        correctness_stats: Dict[str, float] = {
+            "correct_matrix_available_ratio": float(correctness_mask.float().mean().item()),
+        }
+        if bool(correctness_mask.any().item()):
+            correctness_stats.update(
+                {
+                    "route_correct_acc": float(pred_correct[correctness_mask].float().mean().item()),
+                    "oracle_correct_acc": float(oracle_correct[correctness_mask].float().mean().item()),
+                    "any_pair_correct_rate": float(any_correct[correctness_mask].float().mean().item()),
+                }
+            )
+            self_mask = correctness_mask & valid_self
+            if bool(self_mask.any().item()):
+                correctness_stats["fixed_self_correct_acc"] = float(self_correct[self_mask].float().mean().item())
+            else:
+                correctness_stats["fixed_self_correct_acc"] = 0.0
+        else:
+            correctness_stats.update(
+                {
+                    "route_correct_acc": 0.0,
+                    "oracle_correct_acc": 0.0,
+                    "any_pair_correct_rate": 0.0,
+                    "fixed_self_correct_acc": 0.0,
+                }
+            )
         update_oracle_debug_accumulator(
             oracle_debug_acc,
             batch.loss_matrix.to(device),
@@ -322,6 +373,8 @@ def evaluate(
         for key, value in batch_stats.items():
             metric_totals[key] = metric_totals.get(key, 0.0) + value * bs
         for key, value in score_stats.items():
+            metric_totals[key] = metric_totals.get(key, 0.0) + value * bs
+        for key, value in correctness_stats.items():
             metric_totals[key] = metric_totals.get(key, 0.0) + value * bs
         pred_first_all.extend(pred_first.cpu().tolist())
         pred_mid_all.extend(pred_mid.cpu().tolist())
@@ -347,6 +400,10 @@ def evaluate(
                     "pred_pair": pred_pair_name,
                     "gold_pair": gold_pair_name,
                     "match": bool(pred_pair_cpu[idx] == flat_best_cpu[idx]),
+                    "pred_correct": bool(pred_correct.detach().cpu().tolist()[idx]),
+                    "gold_correct": bool(oracle_correct.detach().cpu().tolist()[idx]),
+                    "any_pair_correct": bool(any_correct.detach().cpu().tolist()[idx]),
+                    "correct_matrix_available": bool(batch.correct_available.detach().cpu().tolist()[idx]),
                     "pred_raw_loss": float(raw_flat_loss[idx, pred_pair_cpu[idx]].item()),
                     "gold_raw_loss": float(raw_flat_loss[idx, flat_best_cpu[idx]].item()),
                     "text": batch.texts[idx],
@@ -812,6 +869,9 @@ def main():
             f"first_acc={val_metrics['first_acc']:.4f} "
             f"mid_acc={val_metrics['mid_acc']:.4f} "
             f"pair_acc={val_metrics['pair_acc']:.4f} "
+            f"route_correct={val_metrics.get('route_correct_acc', 0.0):.4f} "
+            f"self_correct={val_metrics.get('fixed_self_correct_acc', 0.0):.4f} "
+            f"any_correct={val_metrics.get('any_pair_correct_rate', 0.0):.4f} "
             f"self_first={val_metrics['self_first_acc']:.4f} "
             f"self_mid={val_metrics['self_mid_acc']:.4f} "
             f"oracle_self_pair={val_metrics['oracle_self_pair_acc']:.4f}"
@@ -848,6 +908,9 @@ def main():
                 f"first_acc={train_eval_metrics['first_acc']:.4f} "
                 f"mid_acc={train_eval_metrics['mid_acc']:.4f} "
                 f"pair_acc={train_eval_metrics['pair_acc']:.4f} "
+                f"route_correct={train_eval_metrics.get('route_correct_acc', 0.0):.4f} "
+                f"self_correct={train_eval_metrics.get('fixed_self_correct_acc', 0.0):.4f} "
+                f"any_correct={train_eval_metrics.get('any_pair_correct_rate', 0.0):.4f} "
                 f"self_first={train_eval_metrics['self_first_acc']:.4f} "
                 f"self_mid={train_eval_metrics['self_mid_acc']:.4f} "
                 f"oracle_self_pair={train_eval_metrics['oracle_self_pair_acc']:.4f}"
@@ -880,6 +943,10 @@ def main():
                 "val/mid_acc": val_metrics["mid_acc"],
                 "val/joint_acc": val_metrics["joint_acc"],
                 "val/pair_acc": val_metrics["pair_acc"],
+                "val/route_correct_acc": val_metrics.get("route_correct_acc", 0.0),
+                "val/fixed_self_correct_acc": val_metrics.get("fixed_self_correct_acc", 0.0),
+                "val/any_pair_correct_rate": val_metrics.get("any_pair_correct_rate", 0.0),
+                "val/correct_matrix_available_ratio": val_metrics.get("correct_matrix_available_ratio", 0.0),
                 "val/self_first_acc": val_metrics["self_first_acc"],
                 "val/self_mid_acc": val_metrics["self_mid_acc"],
                 "val/self_joint_acc": val_metrics["self_joint_acc"],
@@ -895,6 +962,10 @@ def main():
                         "train_eval/router_argmax_score": train_eval_metrics["router_argmax_score"],
                         "train_eval/fixed_self_score": train_eval_metrics["fixed_self_score"],
                         "train_eval/pair_acc": train_eval_metrics["pair_acc"],
+                        "train_eval/route_correct_acc": train_eval_metrics.get("route_correct_acc", 0.0),
+                        "train_eval/fixed_self_correct_acc": train_eval_metrics.get("fixed_self_correct_acc", 0.0),
+                        "train_eval/any_pair_correct_rate": train_eval_metrics.get("any_pair_correct_rate", 0.0),
+                        "train_eval/correct_matrix_available_ratio": train_eval_metrics.get("correct_matrix_available_ratio", 0.0),
                         "train_eval/first_acc": train_eval_metrics["first_acc"],
                         "train_eval/mid_acc": train_eval_metrics["mid_acc"],
                     }
