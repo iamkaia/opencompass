@@ -9,7 +9,8 @@ from opencompass.openicl.icl_inferencer import (AgentInferencer,
                                                 GenInferencer, LLInferencer,
                                                 PPLInferencer,
                                                 PPLOnlyInferencer)
-from opencompass.registry import ICL_PROMPT_TEMPLATES, ICL_RETRIEVERS
+from opencompass.registry import (ICL_INFERENCERS, ICL_PROMPT_TEMPLATES,
+                                  ICL_RETRIEVERS, MODELS)
 from opencompass.utils import (Menu, build_dataset_from_cfg,
                                build_model_from_cfg, dataset_abbr_from_cfg,
                                model_abbr_from_cfg)
@@ -55,7 +56,9 @@ def print_prompts(model_cfg, dataset_cfg, count=1):
     # and reused here.
     if model_cfg:
         max_seq_len = model_cfg.get('max_seq_len', 32768)
-        if not model_cfg['type'].is_api:
+        model_type = model_cfg['type']
+        model_cls = MODELS.get(model_type) if isinstance(model_type, str) else model_type
+        if not getattr(model_cls, 'is_api', False):
             model_cfg['tokenizer_only'] = True
         model = build_model_from_cfg(model_cfg)
     else:
@@ -84,12 +87,15 @@ def print_prompts(model_cfg, dataset_cfg, count=1):
         AgentInferencer, PPLInferencer, GenInferencer, CLPInferencer,
         PPLOnlyInferencer, ChatInferencer, LLInferencer
     ]
-    if infer_cfg.inferencer.type not in supported_inferencer:
+    inferencer_type = infer_cfg.inferencer.type
+    inferencer_cls = (ICL_INFERENCERS.get(inferencer_type)
+                      if isinstance(inferencer_type, str) else inferencer_type)
+    if inferencer_cls not in supported_inferencer:
         print(f'Only {supported_inferencer} are supported')
         return
 
     for idx in range(min(count, len(ice_idx_list))):
-        if issubclass(infer_cfg.inferencer.type,
+        if issubclass(inferencer_cls,
                       (PPLInferencer, LLInferencer)):
             labels = retriever.get_labels(ice_template=ice_template,
                                           prompt_template=prompt_template)
