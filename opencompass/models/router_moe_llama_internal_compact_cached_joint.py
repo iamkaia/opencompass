@@ -1,7 +1,7 @@
 import atexit
 import os
 from collections import Counter
-from typing import Optional
+from typing import List, Optional
 
 import torch
 
@@ -67,14 +67,19 @@ class RouterMoELlamaInternalCompactCachedJoint(HuggingFacewithChatTemplate):
             os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
             os.environ.setdefault("HF_EVALUATE_OFFLINE", "1")
             os.environ.setdefault("HF_HUB_OFFLINE", "1")
+
+        tokenizer_only = kwargs.pop("tokenizer_only", True)
         super().__init__(
             path=path,
-            max_out_len=max_out_len,
-            batch_size=batch_size,
+            tokenizer_only=tokenizer_only,
+            max_seq_len=max_seq_len,
             run_cfg=run_cfg,
             **kwargs,
         )
         self.abbr = abbr
+        self.max_out_len = max_out_len
+        self.batch_size = batch_size
+        self.run_cfg = run_cfg
         self.core = UnifiedMoECoreInternalRouterCompactCachedJoint(
             base_model_path=path,
             router_ckpt_dir=router_ckpt_dir,
@@ -194,6 +199,23 @@ class RouterMoELlamaInternalCompactCachedJoint(HuggingFacewithChatTemplate):
             return
         for dataset_name in sorted(self._dataset_pair_counter):
             self._flush_dataset_routing_summary(dataset_name)
+
+    def get_ppl(self, inputs: List[str], mask_length: Optional[List[int]] = None) -> List[float]:
+        raise NotImplementedError(
+            f"{self.__class__.__name__} only supports gen-based evaluation. "
+            "Please use generation datasets or implement route-aware PPL scoring."
+        )
+
+    def get_ppl_tokenwise(
+        self,
+        inputs: List[str],
+        label: Optional[List[List[int]]] = None,
+        mask_length: Optional[List[int]] = None,
+    ) -> List[float]:
+        raise NotImplementedError(
+            f"{self.__class__.__name__} only supports gen-based evaluation. "
+            "Please use generation datasets or implement route-aware tokenwise PPL scoring."
+        )
 
     @torch.no_grad()
     def generate(self, inputs, max_out_len, min_out_len=None, stopping_criteria=[], **kwargs):

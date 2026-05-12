@@ -393,7 +393,7 @@ class HuggingFacewithChatTemplate(BaseModel):
                 if j in tag_list[i]:
 
                     inference_loss += loss[i][j]
-                    print(loss[i][j])
+                    #print(loss[i][j])
                     token_len += 1
             inference_loss_list.append(inference_loss)
             token_len_list.append(token_len)
@@ -503,6 +503,7 @@ class HuggingFacewithChatTemplate(BaseModel):
         # 🔥 最後一刻再清一次（防止回流）
         generation_kwargs.pop("gt_task", None)
         generation_kwargs.pop("output_json_filepath", None)
+        generation_kwargs.pop("output_json_filename", None)
 
         self.logger.info("Generation Args of Huggingface:")
         self.logger.info(generation_kwargs)
@@ -510,7 +511,7 @@ class HuggingFacewithChatTemplate(BaseModel):
         # ---------------------------
         # model forward
         # ---------------------------
-        print("[SFT] chat-templated sample:", repr(messages[0][:300]))
+        #print("[SFT] chat-templated sample:", repr(messages[0][:300]))
         outputs = self.model.generate(**tokens, **generation_kwargs)
 
         # remove prompt tokens
@@ -702,4 +703,3 @@ class HuggingFaceBaseModel(HuggingFacewithChatTemplate):
         m = _convert_base_messages([prompt])[0]
         t = self.tokenizer(m, add_special_tokens=add_special_tokens)
         return len(t['input_ids'])
-

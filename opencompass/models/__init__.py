@@ -38,6 +38,8 @@ from .openai_streaming import OpenAISDKStreaming  # noqa: F401
 from .pangu_api import PanGu  # noqa: F401
 from .qwen_api import Qwen  # noqa: F401
 from .rendu_api import Rendu  # noqa: F401
+from .router_moe_llama_internal_compact_cached_joint import \
+    RouterMoELlamaInternalCompactCachedJoint  # noqa: F401
 from .sensetime_api import SenseTime  # noqa: F401
 from .stepfun_api import StepFun  # noqa: F401
 from .turbomind import TurboMindModel  # noqa: F401
