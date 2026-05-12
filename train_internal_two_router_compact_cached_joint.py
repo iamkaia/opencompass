@@ -121,6 +121,7 @@ class CachedLossMatrixDataset(Dataset):
                 remapped["pair_label"] = best_pair
                 remapped["first_label"] = best_first
                 remapped["mid_label"] = best_mid
+                remapped["item_id"] = f"{split}:{len(self.items):08d}"
                 self.items.append(remapped)
         if not self.items:
             raise ValueError(f"No items loaded from {split_dir}")
@@ -137,6 +138,9 @@ class CachedLossMatrixDataset(Dataset):
         item = self.items[idx]
         return {
             "text": item["text"],
+            "prompt_text": item.get("prompt_text", item["text"]),
+            "target": item.get("target", ""),
+            "item_id": item.get("item_id", str(idx)),
             "task": item["task"],
             "task_id": int(item["task_id"]),
             "first_vec": item["first_vec"],
@@ -151,6 +155,10 @@ class CachedLossMatrixDataset(Dataset):
 @dataclass
 class Batch:
     texts: List[str]
+    prompt_texts: List[str]
+    targets: List[str]
+    item_ids: List[str]
+    tasks: List[str]
     task_ids: torch.Tensor
     first_vec: torch.Tensor
     mid_vec: torch.Tensor
@@ -164,6 +172,10 @@ class Collator:
     def __call__(self, batch: List[Dict]) -> Batch:
         return Batch(
             texts=[x["text"] for x in batch],
+            prompt_texts=[str(x["prompt_text"]) for x in batch],
+            targets=[str(x["target"]) for x in batch],
+            item_ids=[str(x["item_id"]) for x in batch],
+            tasks=[str(x["task"]) for x in batch],
             task_ids=torch.tensor([x["task_id"] for x in batch], dtype=torch.long),
             first_vec=torch.stack([x["first_vec"] for x in batch], dim=0).to(torch.float32),
             mid_vec=torch.stack([x["mid_vec"] for x in batch], dim=0).to(torch.float32),
@@ -246,6 +258,7 @@ def evaluate(
     best_first_all: List[int] = []
     best_mid_all: List[int] = []
     task_ids_all: List[int] = []
+    route_records: List[Dict] = []
     oracle_debug_acc = init_oracle_debug_accumulator(task_names)
 
     for batch in loader:
@@ -288,8 +301,9 @@ def evaluate(
         pred_first = pred_pair // num_tasks
         pred_mid = pred_pair % num_tasks
         batch_stats = compute_routing_accuracy_stats(pred_first, pred_mid, best_first, best_mid, batch.task_ids)
+        loss_matrix_device = batch.loss_matrix.to(device)
         score_stats = compute_route_score_stats(
-            batch.loss_matrix.to(device),
+            loss_matrix_device,
             pred_pair,
             batch.task_ids,
             loss_normalization=pair_loss_normalization,
@@ -314,6 +328,32 @@ def evaluate(
         best_first_all.extend(best_first.cpu().tolist())
         best_mid_all.extend(best_mid.cpu().tolist())
         task_ids_all.extend(batch.task_ids.cpu().tolist())
+        pred_pair_cpu = pred_pair.detach().cpu().tolist()
+        flat_best_cpu = flat_best.detach().cpu().tolist()
+        pred_first_cpu = pred_first.detach().cpu().tolist()
+        pred_mid_cpu = pred_mid.detach().cpu().tolist()
+        best_first_cpu = best_first.detach().cpu().tolist()
+        best_mid_cpu = best_mid.detach().cpu().tolist()
+        raw_flat_loss = batch.loss_matrix.view(batch.loss_matrix.size(0), -1)
+        for idx, item_id in enumerate(batch.item_ids):
+            pred_pair_name = f"{task_names[pred_first_cpu[idx]]}->{task_names[pred_mid_cpu[idx]]}"
+            gold_pair_name = f"{task_names[best_first_cpu[idx]]}->{task_names[best_mid_cpu[idx]]}"
+            route_records.append(
+                {
+                    "item_id": item_id,
+                    "task": batch.tasks[idx],
+                    "pred_pair_id": int(pred_pair_cpu[idx]),
+                    "gold_pair_id": int(flat_best_cpu[idx]),
+                    "pred_pair": pred_pair_name,
+                    "gold_pair": gold_pair_name,
+                    "match": bool(pred_pair_cpu[idx] == flat_best_cpu[idx]),
+                    "pred_raw_loss": float(raw_flat_loss[idx, pred_pair_cpu[idx]].item()),
+                    "gold_raw_loss": float(raw_flat_loss[idx, flat_best_cpu[idx]].item()),
+                    "text": batch.texts[idx],
+                    "prompt_text": batch.prompt_texts[idx],
+                    "target": batch.targets[idx],
+                }
+            )
 
     denom = max(total_samples, 1)
     result = {"loss": total_loss / denom}
@@ -323,6 +363,7 @@ def evaluate(
         pred_first_all, pred_mid_all, best_first_all, best_mid_all, task_ids_all, task_names
     )
     result["oracle_debug_summary"] = build_oracle_debug_summary(oracle_debug_acc)
+    result["route_records"] = route_records
     return result
 
 
@@ -429,6 +470,16 @@ def main():
     parser.add_argument("--early_stop_min_delta", type=float, default=1e-4)
     parser.add_argument("--log_every", type=int, default=50)
     parser.add_argument("--num_workers", type=int, default=0)
+    parser.add_argument(
+        "--eval_train_each_epoch",
+        action="store_true",
+        help="After each epoch, run model.eval() on the train split to measure same-sample routing agreement.",
+    )
+    parser.add_argument(
+        "--save_route_records",
+        action="store_true",
+        help="Save per-sample predicted/gold route records for train-eval and validation.",
+    )
     parser.add_argument("--wandb", action="store_true")
     parser.add_argument("--wandb_project", type=str, default="router_answer_supervision")
     parser.add_argument("--wandb_name", type=str, default=None)
@@ -504,6 +555,14 @@ def main():
         train_ds,
         batch_size=args.batch_size,
         shuffle=True,
+        collate_fn=Collator(),
+        num_workers=args.num_workers,
+        pin_memory=(device.type == "cuda"),
+    )
+    train_eval_loader = DataLoader(
+        train_ds,
+        batch_size=args.batch_size,
+        shuffle=False,
         collate_fn=Collator(),
         num_workers=args.num_workers,
         pin_memory=(device.type == "cuda"),
@@ -759,8 +818,50 @@ def main():
         )
         print_routing_summary(f"VAL-EPOCH{epoch}", val_metrics["routing_summary"])
         save_json(val_metrics["routing_summary"], os.path.join(args.out_dir, f"routing_summary_val_epoch{epoch}.json"))
+        if args.save_route_records:
+            save_json(
+                {"epoch": epoch, "records": val_metrics["route_records"]},
+                os.path.join(args.out_dir, f"route_records_val_epoch{epoch}.json"),
+            )
         print_oracle_debug_summary(f"VAL-EPOCH{epoch}", val_metrics["oracle_debug_summary"])
         save_json(val_metrics["oracle_debug_summary"], os.path.join(args.out_dir, f"oracle_debug_val_epoch{epoch}.json"))
+        train_eval_metrics = None
+        if args.eval_train_each_epoch:
+            train_eval_metrics = evaluate(
+                model=model,
+                loader=train_eval_loader,
+                bert_tokenizer=bert_tokenizer,
+                device=device,
+                max_bert_len=args.max_bert_len,
+                task_names=expert_names,
+                joint_loss=args.joint_loss,
+                pseudo_ce_weight=args.pseudo_ce_weight,
+                pseudo_ce_margin=args.pseudo_ce_margin,
+                pair_loss_normalization=args.pair_loss_normalization,
+                supervision_mode=args.supervision_mode,
+            )
+            print(
+                f"[TRAIN-EVAL] epoch={epoch} loss={train_eval_metrics['loss']:.4f} "
+                f"router_score={train_eval_metrics['router_argmax_score']:.2f} "
+                f"self_score={train_eval_metrics['fixed_self_score']:.2f} "
+                f"oracle_score={train_eval_metrics['oracle_best_pair_score']:.2f} "
+                f"first_acc={train_eval_metrics['first_acc']:.4f} "
+                f"mid_acc={train_eval_metrics['mid_acc']:.4f} "
+                f"pair_acc={train_eval_metrics['pair_acc']:.4f} "
+                f"self_first={train_eval_metrics['self_first_acc']:.4f} "
+                f"self_mid={train_eval_metrics['self_mid_acc']:.4f} "
+                f"oracle_self_pair={train_eval_metrics['oracle_self_pair_acc']:.4f}"
+            )
+            print_routing_summary(f"TRAIN-EVAL-EPOCH{epoch}", train_eval_metrics["routing_summary"])
+            save_json(
+                train_eval_metrics["routing_summary"],
+                os.path.join(args.out_dir, f"routing_summary_train_eval_epoch{epoch}.json"),
+            )
+            if args.save_route_records:
+                save_json(
+                    {"epoch": epoch, "records": train_eval_metrics["route_records"]},
+                    os.path.join(args.out_dir, f"route_records_train_eval_epoch{epoch}.json"),
+                )
         if wandb_run is not None:
             wandb_payload = {
                 "val/epoch": epoch,
@@ -787,6 +888,20 @@ def main():
                 "val/best_router_argmax_score": max(best_router_score, val_metrics["router_argmax_score"]),
             }
             wandb_payload.update(flatten_routing_summary(val_metrics["routing_summary"], prefix="val_route"))
+            if train_eval_metrics is not None:
+                wandb_payload.update(
+                    {
+                        "train_eval/loss": train_eval_metrics["loss"],
+                        "train_eval/router_argmax_score": train_eval_metrics["router_argmax_score"],
+                        "train_eval/fixed_self_score": train_eval_metrics["fixed_self_score"],
+                        "train_eval/pair_acc": train_eval_metrics["pair_acc"],
+                        "train_eval/first_acc": train_eval_metrics["first_acc"],
+                        "train_eval/mid_acc": train_eval_metrics["mid_acc"],
+                    }
+                )
+                wandb_payload.update(
+                    flatten_routing_summary(train_eval_metrics["routing_summary"], prefix="train_eval_route")
+                )
             wandb_run.log(wandb_payload, step=global_step)
         improved = val_metrics["router_argmax_score"] > (best_router_score + args.early_stop_min_delta)
         if improved:
