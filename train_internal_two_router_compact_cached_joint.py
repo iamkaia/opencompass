@@ -39,6 +39,14 @@ def parse_task_names(raw: Optional[str], fallback: Optional[Sequence[str]] = Non
         return list(fallback)
     raise ValueError("Failed to resolve task names")
 
+
+def parse_optional_task_names(raw: Optional[str]) -> Optional[List[str]]:
+    if raw:
+        tasks = [part.strip() for part in raw.split(",") if part.strip()]
+        if tasks:
+            return tasks
+    return None
+
 #####它會讀 feature_root/<split>/manifest.json，再把 chunk 檔載進來。重要的是它在 66-81 行 (line 66) 做了兩件事：
 #####如果你只想訓練部分 task，它會先把 loss_matrix slice 成較小的子矩陣
 ####再從 slice 後的 loss_matrix 重新算一次 pair_label / first_label / mid_label
@@ -455,7 +463,7 @@ def main():
     probe_val_ds = CachedLossMatrixDataset(args.feature_root, "validation")
     
     ###要拿哪些 sample, 要保留哪些 expert
-    alias_task_names = parse_task_names(args.task_names, fallback=None)
+    alias_task_names = parse_optional_task_names(args.task_names)
     sample_task_names = parse_task_names(
         args.sample_task_names,
         fallback=alias_task_names or probe_train_ds.sample_task_names or probe_val_ds.sample_task_names,
