@@ -400,6 +400,7 @@ def evaluate(
     pair_loss_normalization,
     supervision_mode,
     correct_soft_ce_temperature,
+    self_preserve_weight,
     topk_weighted_temperatures,
     sample_feature_mode,
 ):
@@ -447,6 +448,7 @@ def evaluate(
             margin=pseudo_ce_margin,
             loss_normalization=pair_loss_normalization,
             correct_soft_ce_temperature=correct_soft_ce_temperature,
+            self_preserve_weight=self_preserve_weight,
         )
         if supervision_mode == "self_pair_ce":
             loss, _ = compute_self_pair_ce(pair_logits, batch.task_ids.to(device), batch.loss_matrix.size(2))
@@ -633,6 +635,7 @@ def save_ckpt(
     joint_loss,
     pseudo_ce_weight,
     correct_soft_ce_temperature,
+    self_preserve_weight,
     pair_loss_normalization,
     supervision_mode,
     best_metric,
@@ -666,6 +669,7 @@ def save_ckpt(
             "joint_loss": str(joint_loss),
             "pseudo_ce_weight": float(pseudo_ce_weight),
             "correct_soft_ce_temperature": float(correct_soft_ce_temperature),
+            "self_preserve_weight": float(self_preserve_weight),
             "pair_loss_normalization": str(pair_loss_normalization),
             "best_epoch": epoch,
             "best_metric": str(best_metric),
@@ -727,6 +731,12 @@ def main():
         type=float,
         default=1.0,
         help="Temperature for correct_conf_ce. Lower values put more target mass on lower-loss correct pairs.",
+    )
+    parser.add_argument(
+        "--self_preserve_weight",
+        type=float,
+        default=1.0,
+        help="For self_preserving_correct_conf_ce: target mass reserved for a correct self pair. 1.0 keeps the old hard self-preserve behavior.",
     )
     parser.add_argument(
         "--topk_weighted_temperatures",
@@ -869,6 +879,7 @@ def main():
         f"[INFO] supervision_mode={args.supervision_mode} joint_loss={args.joint_loss} "
         f"pseudo_ce_weight={args.pseudo_ce_weight} pseudo_ce_margin={args.pseudo_ce_margin} "
         f"correct_soft_ce_temperature={args.correct_soft_ce_temperature} "
+        f"self_preserve_weight={args.self_preserve_weight} "
         f"pair_loss_normalization={args.pair_loss_normalization} "
         f"best_metric={args.best_metric} "
         f"sample_feature_mode={args.sample_feature_mode}"
@@ -997,6 +1008,7 @@ def main():
                 margin=args.pseudo_ce_margin,
                 loss_normalization=args.pair_loss_normalization,
                 correct_soft_ce_temperature=args.correct_soft_ce_temperature,
+                self_preserve_weight=args.self_preserve_weight,
             )
             ####--supervision_mode self_pair_ce, loss=自己的task
             if args.supervision_mode == "self_pair_ce":
@@ -1147,6 +1159,7 @@ def main():
             pair_loss_normalization=args.pair_loss_normalization,
             supervision_mode=args.supervision_mode,
             correct_soft_ce_temperature=args.correct_soft_ce_temperature,
+            self_preserve_weight=args.self_preserve_weight,
             topk_weighted_temperatures=topk_weighted_temperatures,
             sample_feature_mode=args.sample_feature_mode,
         )
@@ -1197,6 +1210,7 @@ def main():
                 pair_loss_normalization=args.pair_loss_normalization,
                 supervision_mode=args.supervision_mode,
                 correct_soft_ce_temperature=args.correct_soft_ce_temperature,
+                self_preserve_weight=args.self_preserve_weight,
                 topk_weighted_temperatures=topk_weighted_temperatures,
                 sample_feature_mode=args.sample_feature_mode,
             )
@@ -1348,6 +1362,7 @@ def main():
                 joint_loss=args.joint_loss,
                 pseudo_ce_weight=args.pseudo_ce_weight,
                 correct_soft_ce_temperature=args.correct_soft_ce_temperature,
+                self_preserve_weight=args.self_preserve_weight,
                 pair_loss_normalization=args.pair_loss_normalization,
                 supervision_mode=args.supervision_mode,
                 best_metric=args.best_metric,

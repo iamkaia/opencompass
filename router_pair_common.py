@@ -35,6 +35,7 @@ def compute_pair_losses(
     margin: float = 0.0,
     loss_normalization: str = "sample_minmax",
     correct_soft_ce_temperature: float = 1.0,
+    self_preserve_weight: float = 1.0,
 ) -> tuple[torch.Tensor, Dict[str, float], torch.Tensor, torch.Tensor, torch.Tensor]:
     if loss_matrix is None:
         raise ValueError("loss_matrix is required")
@@ -99,6 +100,7 @@ def compute_pair_losses(
             else zero_loss
         )
         if task_ids is not None:
+            preserve_weight = min(max(float(self_preserve_weight), 0.0), 1.0)
             task_ids_device = task_ids.to(device=pair_logits.device, dtype=torch.long)
             valid_self_task = (task_ids_device >= 0) & (task_ids_device < num_tasks)
             self_pair_ids = task_ids_device.clamp(min=0, max=max(num_tasks - 1, 0)) * num_tasks + task_ids_device.clamp(
@@ -110,9 +112,10 @@ def compute_pair_losses(
             ).squeeze(1)[valid_self_task]
             self_target = torch.zeros_like(correct_conf_target)
             self_target.scatter_(1, self_pair_ids.unsqueeze(1), 1.0)
+            soft_self_target = preserve_weight * self_target + (1.0 - preserve_weight) * correct_conf_target
             self_preserving_target = torch.where(
                 (valid_self_task & self_correct).unsqueeze(1),
-                self_target,
+                soft_self_target,
                 correct_conf_target,
             )
             self_preserving_available = correct_target_available | (valid_self_task & self_correct)
@@ -206,6 +209,7 @@ def compute_pair_losses(
         "correct_max_margin": float(correct_max_margin.detach().item()),
         "correct_margin_available_ratio": float(correct_margin_available.float().mean().item()),
         "correct_soft_ce_temperature": float(correct_soft_ce_temperature),
+        "self_preserve_weight": float(self_preserve_weight),
         "correct_target_available_ratio": float(correct_target_available.float().mean().item()),
         "avg_correct_pairs": float(avg_correct_pairs.detach().item()),
         "main_pair_ce": float(ce_pair.detach().item()),
