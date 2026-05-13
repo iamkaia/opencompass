@@ -28,6 +28,7 @@ def compute_pair_losses(
     logits_mid: Optional[torch.Tensor] = None,
     loss_matrix: Optional[torch.Tensor] = None,
     correct_matrix: Optional[torch.Tensor] = None,
+    task_ids: Optional[torch.Tensor] = None,
     mode: str = "joint",
     joint_loss: str = "expected_loss",
     pseudo_ce_weight: float = 0.0,
@@ -57,6 +58,7 @@ def compute_pair_losses(
     zero_loss = pair_logits.sum() * 0.0
     correct_soft_ce = zero_loss
     correct_conf_ce = zero_loss
+    self_preserving_correct_conf_ce = zero_loss
     correct_max_margin = zero_loss
     correct_target_available = torch.zeros(loss_matrix.size(0), dtype=torch.bool, device=pair_logits.device)
     correct_margin_available = torch.zeros(loss_matrix.size(0), dtype=torch.bool, device=pair_logits.device)
@@ -96,6 +98,30 @@ def compute_pair_losses(
             if correct_target_available.any()
             else zero_loss
         )
+        if task_ids is not None:
+            task_ids_device = task_ids.to(device=pair_logits.device, dtype=torch.long)
+            valid_self_task = (task_ids_device >= 0) & (task_ids_device < num_tasks)
+            self_pair_ids = task_ids_device.clamp(min=0, max=max(num_tasks - 1, 0)) * num_tasks + task_ids_device.clamp(
+                min=0, max=max(num_tasks - 1, 0)
+            )
+            self_correct = torch.zeros(loss_matrix.size(0), dtype=torch.bool, device=pair_logits.device)
+            self_correct[valid_self_task] = flat_correct.bool().gather(
+                1, self_pair_ids.unsqueeze(1)
+            ).squeeze(1)[valid_self_task]
+            self_target = torch.zeros_like(correct_conf_target)
+            self_target.scatter_(1, self_pair_ids.unsqueeze(1), 1.0)
+            self_preserving_target = torch.where(
+                (valid_self_task & self_correct).unsqueeze(1),
+                self_target,
+                correct_conf_target,
+            )
+            self_preserving_available = correct_target_available | (valid_self_task & self_correct)
+            self_preserving_correct_conf_ce_all = -(self_preserving_target * log_pair_prob).sum(dim=-1)
+            self_preserving_correct_conf_ce = (
+                self_preserving_correct_conf_ce_all[self_preserving_available].mean()
+                if self_preserving_available.any()
+                else zero_loss
+            )
         flat_correct_bool = flat_correct > 0
         flat_wrong_bool = ~flat_correct_bool
         correct_margin_available = flat_correct_bool.any(dim=-1) & flat_wrong_bool.any(dim=-1)
@@ -149,6 +175,12 @@ def compute_pair_losses(
             if correct_matrix is None:
                 raise ValueError("correct_conf_ce requires correct_matrix")
             total_loss = correct_conf_ce
+        elif joint_loss == "self_preserving_correct_conf_ce":
+            if correct_matrix is None:
+                raise ValueError("self_preserving_correct_conf_ce requires correct_matrix")
+            if task_ids is None:
+                raise ValueError("self_preserving_correct_conf_ce requires task_ids")
+            total_loss = self_preserving_correct_conf_ce
         elif joint_loss == "correct_max_margin":
             if correct_matrix is None:
                 raise ValueError("correct_max_margin requires correct_matrix")
@@ -170,6 +202,7 @@ def compute_pair_losses(
         "expected_loss": float(expected_loss.detach().item()),
         "correct_soft_ce": float(correct_soft_ce.detach().item()),
         "correct_conf_ce": float(correct_conf_ce.detach().item()),
+        "self_preserving_correct_conf_ce": float(self_preserving_correct_conf_ce.detach().item()),
         "correct_max_margin": float(correct_max_margin.detach().item()),
         "correct_margin_available_ratio": float(correct_margin_available.float().mean().item()),
         "correct_soft_ce_temperature": float(correct_soft_ce_temperature),
