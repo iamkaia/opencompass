@@ -332,7 +332,10 @@ def evaluate(
         batch_idx = torch.arange(batch.task_ids.size(0), device=device)
         pred_correct = correct_matrix_device[batch_idx, pred_first, pred_mid]
         oracle_correct = correct_matrix_device[batch_idx, best_first, best_mid]
-        any_correct = correct_matrix_device.view(correct_matrix_device.size(0), -1).any(dim=-1)
+        flat_correct_matrix = correct_matrix_device.view(correct_matrix_device.size(0), -1)
+        any_correct = flat_correct_matrix.any(dim=-1)
+        max_topk = min(10, pair_logits.size(-1))
+        topk_pair_ids = pair_logits.topk(k=max_topk, dim=-1).indices
         valid_self = (batch.task_ids.to(device) >= 0) & (batch.task_ids.to(device) < num_tasks)
         self_ids = batch.task_ids.to(device).clamp_min(0)
         self_correct = correct_matrix_device[batch_idx, self_ids, self_ids]
@@ -348,6 +351,12 @@ def evaluate(
                     "any_pair_correct_rate": float(any_correct[correctness_mask].float().mean().item()),
                 }
             )
+            for k in (1, 3, 5, 10):
+                if k <= max_topk:
+                    topk_correct = flat_correct_matrix.gather(1, topk_pair_ids[:, :k]).any(dim=-1)
+                    correctness_stats[f"route_top{k}_correct_acc"] = float(
+                        topk_correct[correctness_mask].float().mean().item()
+                    )
             self_mask = correctness_mask & valid_self
             if bool(self_mask.any().item()):
                 correctness_stats["fixed_self_correct_acc"] = float(self_correct[self_mask].float().mean().item())
@@ -357,6 +366,10 @@ def evaluate(
             correctness_stats.update(
                 {
                     "route_correct_acc": 0.0,
+                    "route_top1_correct_acc": 0.0,
+                    "route_top3_correct_acc": 0.0,
+                    "route_top5_correct_acc": 0.0,
+                    "route_top10_correct_acc": 0.0,
                     "oracle_correct_acc": 0.0,
                     "any_pair_correct_rate": 0.0,
                     "fixed_self_correct_acc": 0.0,
@@ -921,6 +934,8 @@ def main():
             f"mid_acc={val_metrics['mid_acc']:.4f} "
             f"pair_acc={val_metrics['pair_acc']:.4f} "
             f"route_correct={val_metrics.get('route_correct_acc', 0.0):.4f} "
+            f"top3_correct={val_metrics.get('route_top3_correct_acc', 0.0):.4f} "
+            f"top5_correct={val_metrics.get('route_top5_correct_acc', 0.0):.4f} "
             f"self_correct={val_metrics.get('fixed_self_correct_acc', 0.0):.4f} "
             f"any_correct={val_metrics.get('any_pair_correct_rate', 0.0):.4f} "
             f"self_first={val_metrics['self_first_acc']:.4f} "
@@ -961,6 +976,8 @@ def main():
                 f"mid_acc={train_eval_metrics['mid_acc']:.4f} "
                 f"pair_acc={train_eval_metrics['pair_acc']:.4f} "
                 f"route_correct={train_eval_metrics.get('route_correct_acc', 0.0):.4f} "
+                f"top3_correct={train_eval_metrics.get('route_top3_correct_acc', 0.0):.4f} "
+                f"top5_correct={train_eval_metrics.get('route_top5_correct_acc', 0.0):.4f} "
                 f"self_correct={train_eval_metrics.get('fixed_self_correct_acc', 0.0):.4f} "
                 f"any_correct={train_eval_metrics.get('any_pair_correct_rate', 0.0):.4f} "
                 f"self_first={train_eval_metrics['self_first_acc']:.4f} "
@@ -1008,6 +1025,10 @@ def main():
                 "val/joint_acc": val_metrics["joint_acc"],
                 "val/pair_acc": val_metrics["pair_acc"],
                 "val/route_correct_acc": val_metrics.get("route_correct_acc", 0.0),
+                "val/route_top1_correct_acc": val_metrics.get("route_top1_correct_acc", 0.0),
+                "val/route_top3_correct_acc": val_metrics.get("route_top3_correct_acc", 0.0),
+                "val/route_top5_correct_acc": val_metrics.get("route_top5_correct_acc", 0.0),
+                "val/route_top10_correct_acc": val_metrics.get("route_top10_correct_acc", 0.0),
                 "val/fixed_self_correct_acc": val_metrics.get("fixed_self_correct_acc", 0.0),
                 "val/any_pair_correct_rate": val_metrics.get("any_pair_correct_rate", 0.0),
                 "val/correct_matrix_available_ratio": val_metrics.get("correct_matrix_available_ratio", 0.0),
@@ -1031,6 +1052,10 @@ def main():
                         "train_eval/fixed_self_score": train_eval_metrics["fixed_self_score"],
                         "train_eval/pair_acc": train_eval_metrics["pair_acc"],
                         "train_eval/route_correct_acc": train_eval_metrics.get("route_correct_acc", 0.0),
+                        "train_eval/route_top1_correct_acc": train_eval_metrics.get("route_top1_correct_acc", 0.0),
+                        "train_eval/route_top3_correct_acc": train_eval_metrics.get("route_top3_correct_acc", 0.0),
+                        "train_eval/route_top5_correct_acc": train_eval_metrics.get("route_top5_correct_acc", 0.0),
+                        "train_eval/route_top10_correct_acc": train_eval_metrics.get("route_top10_correct_acc", 0.0),
                         "train_eval/fixed_self_correct_acc": train_eval_metrics.get("fixed_self_correct_acc", 0.0),
                         "train_eval/any_pair_correct_rate": train_eval_metrics.get("any_pair_correct_rate", 0.0),
                         "train_eval/correct_matrix_available_ratio": train_eval_metrics.get("correct_matrix_available_ratio", 0.0),
