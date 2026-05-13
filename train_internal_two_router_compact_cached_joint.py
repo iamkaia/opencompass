@@ -1,4 +1,5 @@
 import argparse
+import hashlib
 import json
 import math
 import os
@@ -28,6 +29,10 @@ from router_pair_common import (
 def save_json(obj: Dict, path: str):
     with open(path, "w", encoding="utf-8") as f:
         json.dump(obj, f, ensure_ascii=False, indent=2)
+
+
+def prompt_hash(text: str) -> str:
+    return hashlib.sha1(str(text).encode("utf-8")).hexdigest()
 
 
 def parse_task_names(raw: Optional[str], fallback: Optional[Sequence[str]] = None) -> List[str]:
@@ -606,6 +611,7 @@ def evaluate(
                     "correct_matrix_available": bool(batch.correct_available.detach().cpu().tolist()[idx]),
                     "pred_raw_loss": float(raw_flat_loss[idx, pred_pair_cpu[idx]].item()),
                     "gold_raw_loss": float(raw_flat_loss[idx, flat_best_cpu[idx]].item()),
+                    "prompt_sha1": prompt_hash(batch.prompt_texts[idx]),
                     "text": batch.texts[idx],
                     "prompt_text": batch.prompt_texts[idx],
                     "target": batch.targets[idx],
@@ -815,6 +821,11 @@ def main():
         action="store_true",
         help="Save per-sample predicted/gold route records for train-eval and validation.",
     )
+    parser.add_argument(
+        "--eval_only",
+        action="store_true",
+        help="Load --load_from and only evaluate cached train/validation splits without updating weights.",
+    )
     parser.add_argument("--wandb", action="store_true")
     parser.add_argument("--wandb_project", type=str, default="router_answer_supervision")
     parser.add_argument("--wandb_name", type=str, default=None)
@@ -942,6 +953,80 @@ def main():
         if "bert_encoder" in state:
             model.bert.load_state_dict(state["bert_encoder"], strict=False)
         print(f"[LOAD] loaded from {args.load_from}")
+
+    if args.eval_only:
+        if args.load_from is None:
+            raise ValueError("--eval_only requires --load_from")
+        val_metrics = evaluate(
+            model=model,
+            loader=val_loader,
+            bert_tokenizer=bert_tokenizer,
+            device=device,
+            max_bert_len=args.max_bert_len,
+            task_names=expert_names,
+            joint_loss=args.joint_loss,
+            pseudo_ce_weight=args.pseudo_ce_weight,
+            pseudo_ce_margin=args.pseudo_ce_margin,
+            pair_loss_normalization=args.pair_loss_normalization,
+            supervision_mode=args.supervision_mode,
+            correct_soft_ce_temperature=args.correct_soft_ce_temperature,
+            self_preserve_weight=args.self_preserve_weight,
+            topk_weighted_temperatures=topk_weighted_temperatures,
+            sample_feature_mode=args.sample_feature_mode,
+        )
+        print(
+            f"[EVAL_ONLY][VAL] loss={val_metrics['loss']:.4f} "
+            f"route_correct={val_metrics.get('route_correct_acc', 0.0):.4f} "
+            f"top3_correct={val_metrics.get('route_top3_correct_acc', 0.0):.4f} "
+            f"top5_correct={val_metrics.get('route_top5_correct_acc', 0.0):.4f} "
+            f"self_correct={val_metrics.get('fixed_self_correct_acc', 0.0):.4f} "
+            f"any_correct={val_metrics.get('any_pair_correct_rate', 0.0):.4f} "
+            f"self_pair={val_metrics['self_pair_acc']:.4f}"
+        )
+        print_routing_summary("EVAL-ONLY-VAL", val_metrics["routing_summary"])
+        save_json(val_metrics["routing_summary"], os.path.join(args.out_dir, "routing_summary_val_eval_only.json"))
+        save_json(val_metrics["oracle_debug_summary"], os.path.join(args.out_dir, "oracle_debug_val_eval_only.json"))
+        if args.save_route_records:
+            save_json(
+                {"epoch": 0, "records": val_metrics["route_records"]},
+                os.path.join(args.out_dir, "route_records_val_eval_only.json"),
+            )
+        train_eval_metrics = evaluate(
+            model=model,
+            loader=train_eval_loader,
+            bert_tokenizer=bert_tokenizer,
+            device=device,
+            max_bert_len=args.max_bert_len,
+            task_names=expert_names,
+            joint_loss=args.joint_loss,
+            pseudo_ce_weight=args.pseudo_ce_weight,
+            pseudo_ce_margin=args.pseudo_ce_margin,
+            pair_loss_normalization=args.pair_loss_normalization,
+            supervision_mode=args.supervision_mode,
+            correct_soft_ce_temperature=args.correct_soft_ce_temperature,
+            self_preserve_weight=args.self_preserve_weight,
+            topk_weighted_temperatures=topk_weighted_temperatures,
+            sample_feature_mode=args.sample_feature_mode,
+        )
+        print(
+            f"[EVAL_ONLY][TRAIN] loss={train_eval_metrics['loss']:.4f} "
+            f"route_correct={train_eval_metrics.get('route_correct_acc', 0.0):.4f} "
+            f"self_correct={train_eval_metrics.get('fixed_self_correct_acc', 0.0):.4f} "
+            f"any_correct={train_eval_metrics.get('any_pair_correct_rate', 0.0):.4f} "
+            f"self_pair={train_eval_metrics['self_pair_acc']:.4f}"
+        )
+        print_routing_summary("EVAL-ONLY-TRAIN", train_eval_metrics["routing_summary"])
+        save_json(train_eval_metrics["routing_summary"], os.path.join(args.out_dir, "routing_summary_train_eval_only.json"))
+        save_json(train_eval_metrics["oracle_debug_summary"], os.path.join(args.out_dir, "oracle_debug_train_eval_only.json"))
+        if args.save_route_records:
+            save_json(
+                {"epoch": 0, "records": train_eval_metrics["route_records"]},
+                os.path.join(args.out_dir, "route_records_train_eval_only.json"),
+            )
+        if wandb_run is not None:
+            wandb_run.finish()
+        print("[DONE] eval_only finished")
+        return
 
     ###設定可訓練參數
     set_trainable(model, freeze_bert=args.freeze_bert)
