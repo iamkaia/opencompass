@@ -473,6 +473,13 @@ class JointAnswerSupervisionRouterModel(nn.Module):
             self.last_route_correct_matrix = correct_matrix
             return loss_matrix
         
+        if score_mode == "official_generation_only":
+            generation_indices = list(range(batch_size))
+            generation_index_tensor = torch.arange(batch_size, dtype=torch.long, device=prompt_input_ids.device)
+        else:
+            generation_indices = []
+            generation_index_tensor = None
+
         ####如果不是token_nll的話，我先不跑這裡
         for first_tid, first_task in enumerate(self.expert_names):
             first_eid = self.task_to_expert_id[first_task]
@@ -484,7 +491,7 @@ class JointAnswerSupervisionRouterModel(nn.Module):
                 set_layer_range_expert(self.model, self.middle_layer_idx, self.num_layers - 1, mid_eid)
                 combo_loss = torch.empty(batch_size, dtype=torch.float32, device=prompt_input_ids.device)
                 
-                option_nll_indices = [
+                option_nll_indices = [] if score_mode == "official_generation_only" else [
                     idx for idx, task_name in enumerate(task_names)
                     if _task_option_labels(task_name)
                 ]
@@ -558,13 +565,17 @@ class JointAnswerSupervisionRouterModel(nn.Module):
                     combo_loss.index_copy_(0, token_nll_index_tensor, token_nll_loss)
 
                 ####generation evaluator 部分, 還沒有看
-                generation_indices = [
-                    idx for idx, task_name in enumerate(task_names)
-                    if _task_uses_generation_evaluator(task_name)
-                ]
+                if score_mode != "official_generation_only":
+                    generation_indices = [
+                        idx for idx, task_name in enumerate(task_names)
+                        if _task_uses_generation_evaluator(task_name)
+                    ]
+                    generation_index_tensor = (
+                        torch.tensor(generation_indices, dtype=torch.long, device=prompt_input_ids.device)
+                        if generation_indices
+                        else None
+                    )
                 if generation_indices:
-                    generation_index_tensor = torch.tensor(
-                        generation_indices, dtype=torch.long, device=prompt_input_ids.device)
                     generation_prompt_ids = prompt_input_ids.index_select(0, generation_index_tensor)
                     generation_prompt_mask = prompt_attention_mask.index_select(0, generation_index_tensor)
                     generation_tasks = [task_names[idx] for idx in generation_indices]

@@ -363,7 +363,7 @@ def main():
         "--score_mode",
         type=str,
         default="official_eval_aligned_generation",
-        choices=["official_eval_aligned_generation", "token_nll"],
+        choices=["official_eval_aligned_generation", "official_generation_only", "token_nll"],
     )
     parser.add_argument("--add_eos_to_target", action="store_true")
     parser.add_argument("--num_workers", type=int, default=0)
