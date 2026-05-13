@@ -54,9 +54,10 @@ def compute_pair_losses(
     expected_loss = (pair_prob * normalized_flat_loss).sum(dim=-1).mean()
     log_pair_prob = torch.log_softmax(pair_logits, dim=-1)
 
-    correct_soft_ce = torch.tensor(0.0, device=pair_logits.device)
-    correct_conf_ce = torch.tensor(0.0, device=pair_logits.device)
-    correct_max_margin = torch.tensor(0.0, device=pair_logits.device)
+    zero_loss = pair_logits.sum() * 0.0
+    correct_soft_ce = zero_loss
+    correct_conf_ce = zero_loss
+    correct_max_margin = zero_loss
     correct_target_available = torch.zeros(loss_matrix.size(0), dtype=torch.bool, device=pair_logits.device)
     correct_margin_available = torch.zeros(loss_matrix.size(0), dtype=torch.bool, device=pair_logits.device)
     avg_correct_pairs = torch.tensor(0.0, device=pair_logits.device)
@@ -64,8 +65,10 @@ def compute_pair_losses(
         flat_correct = correct_matrix.to(device=pair_logits.device, dtype=torch.float32).view(loss_matrix.size(0), -1)
         correct_counts = flat_correct.sum(dim=-1, keepdim=True)
         correct_target_available = correct_counts.squeeze(-1) > 0
-        avg_correct_pairs = correct_counts[correct_target_available].mean() if correct_target_available.any() else torch.tensor(
-            0.0, device=pair_logits.device
+        avg_correct_pairs = (
+            correct_counts[correct_target_available].mean()
+            if correct_target_available.any()
+            else torch.tensor(0.0, device=pair_logits.device)
         )
         target_prob = torch.where(
             correct_counts > 0,
@@ -76,7 +79,7 @@ def compute_pair_losses(
         correct_soft_ce = (
             correct_soft_ce_all[correct_target_available].mean()
             if correct_target_available.any()
-            else torch.tensor(0.0, device=pair_logits.device)
+            else zero_loss
         )
         temperature = max(float(correct_soft_ce_temperature), 1e-6)
         correct_conf_logits = -normalized_flat_loss / temperature
@@ -91,7 +94,7 @@ def compute_pair_losses(
         correct_conf_ce = (
             correct_conf_ce_all[correct_target_available].mean()
             if correct_target_available.any()
-            else torch.tensor(0.0, device=pair_logits.device)
+            else zero_loss
         )
         flat_correct_bool = flat_correct > 0
         flat_wrong_bool = ~flat_correct_bool
@@ -104,7 +107,7 @@ def compute_pair_losses(
         correct_max_margin = (
             correct_max_margin_all[correct_margin_available].mean()
             if correct_margin_available.any()
-            else torch.tensor(0.0, device=pair_logits.device)
+            else zero_loss
         )
 
     sorted_loss, _ = normalized_flat_loss.sort(dim=-1)
@@ -114,16 +117,16 @@ def compute_pair_losses(
         margin_mask = torch.ones_like(flat_best, dtype=torch.bool)
 
     ce_pair_all = nn.functional.cross_entropy(pair_logits, flat_best, reduction="none")
-    ce_pair = ce_pair_all[margin_mask].mean() if margin_mask.any() else torch.tensor(0.0, device=pair_logits.device)
+    ce_pair = ce_pair_all[margin_mask].mean() if margin_mask.any() else zero_loss
 
-    ce_first = torch.tensor(0.0, device=pair_logits.device)
-    ce_mid = torch.tensor(0.0, device=pair_logits.device)
+    ce_first = zero_loss
+    ce_mid = zero_loss
     if logits_first is not None:
         ce_first_all = nn.functional.cross_entropy(logits_first, best_first, reduction="none")
-        ce_first = ce_first_all[margin_mask].mean() if margin_mask.any() else torch.tensor(0.0, device=logits_first.device)
+        ce_first = ce_first_all[margin_mask].mean() if margin_mask.any() else zero_loss
     if logits_mid is not None:
         ce_mid_all = nn.functional.cross_entropy(logits_mid, best_mid, reduction="none")
-        ce_mid = ce_mid_all[margin_mask].mean() if margin_mask.any() else torch.tensor(0.0, device=logits_mid.device)
+        ce_mid = ce_mid_all[margin_mask].mean() if margin_mask.any() else zero_loss
 
     if mode == "stage1":
         if logits_first is None:
