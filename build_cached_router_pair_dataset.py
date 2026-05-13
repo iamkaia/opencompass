@@ -160,6 +160,7 @@ def process_split(
                 score_mode=score_mode,
             )
             correct_matrix = getattr(model, "last_route_correct_matrix", None)
+            option_prob_matrices = getattr(model, "last_route_option_prob_matrices", None)
 
         flat_loss = loss_matrix.view(loss_matrix.size(0), -1)
         best_pair = flat_loss.argmin(dim=-1)
@@ -191,6 +192,11 @@ def process_split(
                     "mid_vec": mid_vec_cpu[idx].clone(),
                     "loss_matrix": loss_matrix_cpu[idx].clone(),
                     "correct_matrix": correct_matrix_cpu[idx].clone(),
+                    "option_prob_matrix": (
+                        option_prob_matrices[idx].to(dtype=torch.float32).cpu().clone()
+                        if option_prob_matrices is not None and option_prob_matrices[idx] is not None
+                        else None
+                    ),
                     "pair_label": int(best_pair_cpu[idx].item()),
                     "first_label": int(best_first_cpu[idx].item()),
                     "mid_label": int(best_mid_cpu[idx].item()),
@@ -246,6 +252,7 @@ def process_split(
             "num_tasks": len(model.expert_names),
             "supervision_type": "cached_loss_matrix",
             "has_correct_matrix": True,
+            "has_option_prob_matrix": True,
             "score_mode": str(score_mode),
         },
         os.path.join(split_dir, "manifest.json"),

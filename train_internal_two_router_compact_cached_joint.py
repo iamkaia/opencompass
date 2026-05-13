@@ -127,6 +127,13 @@ class CachedLossMatrixDataset(Dataset):
                 remapped["task_id"] = int(expert2id.get(task_name, -1))
                 remapped["loss_matrix"] = sliced_loss_matrix
                 remapped["correct_matrix"] = sliced_correct_matrix.to(torch.bool)
+                option_prob_matrix = item.get("option_prob_matrix")
+                if option_prob_matrix is not None:
+                    remapped["option_prob_matrix"] = option_prob_matrix.index_select(
+                        0, torch.tensor(selected_expert_indices)
+                    ).index_select(1, torch.tensor(selected_expert_indices))
+                else:
+                    remapped["option_prob_matrix"] = None
                 remapped["has_correct_matrix"] = bool(has_correct_matrix)
                 remapped["pair_label"] = best_pair
                 remapped["first_label"] = best_first
@@ -157,6 +164,7 @@ class CachedLossMatrixDataset(Dataset):
             "mid_vec": item["mid_vec"],
             "loss_matrix": item["loss_matrix"],
             "correct_matrix": item["correct_matrix"],
+            "option_prob_matrix": item.get("option_prob_matrix"),
             "has_correct_matrix": bool(item.get("has_correct_matrix", False)),
             "pair_label": int(item["pair_label"]),
             "first_label": int(item["first_label"]),
@@ -176,6 +184,8 @@ class Batch:
     mid_vec: torch.Tensor
     loss_matrix: torch.Tensor
     correct_matrix: torch.Tensor
+    option_prob_matrix: torch.Tensor
+    option_prob_available: torch.Tensor
     correct_available: torch.Tensor
     pair_labels: torch.Tensor
     first_labels: torch.Tensor
@@ -184,6 +194,29 @@ class Batch:
 
 class Collator:
     def __call__(self, batch: List[Dict]) -> Batch:
+        max_num_options = 1
+        for item in batch:
+            option_prob_matrix = item.get("option_prob_matrix")
+            if option_prob_matrix is not None:
+                max_num_options = max(max_num_options, int(option_prob_matrix.size(-1)))
+        option_prob_tensors = []
+        option_prob_available = []
+        for item in batch:
+            option_prob_matrix = item.get("option_prob_matrix")
+            if option_prob_matrix is None:
+                num_tasks = item["loss_matrix"].size(0)
+                option_prob_tensors.append(torch.zeros(num_tasks, num_tasks, max_num_options, dtype=torch.float32))
+                option_prob_available.append(False)
+            else:
+                padded = torch.zeros(
+                    option_prob_matrix.size(0),
+                    option_prob_matrix.size(1),
+                    max_num_options,
+                    dtype=torch.float32,
+                )
+                padded[..., : option_prob_matrix.size(-1)] = option_prob_matrix.to(torch.float32)
+                option_prob_tensors.append(padded)
+                option_prob_available.append(True)
         return Batch(
             texts=[x["text"] for x in batch],
             prompt_texts=[str(x["prompt_text"]) for x in batch],
@@ -195,6 +228,8 @@ class Collator:
             mid_vec=torch.stack([x["mid_vec"] for x in batch], dim=0).to(torch.float32),
             loss_matrix=torch.stack([x["loss_matrix"] for x in batch], dim=0).to(torch.float32),
             correct_matrix=torch.stack([x["correct_matrix"] for x in batch], dim=0).to(torch.bool),
+            option_prob_matrix=torch.stack(option_prob_tensors, dim=0).to(torch.float32),
+            option_prob_available=torch.tensor(option_prob_available, dtype=torch.bool),
             correct_available=torch.tensor([bool(x["has_correct_matrix"]) for x in batch], dtype=torch.bool),
             pair_labels=torch.tensor([x["pair_label"] for x in batch], dtype=torch.long),
             first_labels=torch.tensor([x["first_label"] for x in batch], dtype=torch.long),
@@ -357,6 +392,27 @@ def evaluate(
                     correctness_stats[f"route_top{k}_correct_acc"] = float(
                         topk_correct[correctness_mask].float().mean().item()
                     )
+            option_prob_available = batch.option_prob_available.to(device)
+            option_conf_mask = correctness_mask & option_prob_available
+            if bool(option_conf_mask.any().item()):
+                flat_option_prob = batch.option_prob_matrix.to(device).view(
+                    batch.option_prob_matrix.size(0),
+                    -1,
+                    batch.option_prob_matrix.size(-1),
+                )
+                pair_confidence = flat_option_prob.max(dim=-1).values
+                for k in (1, 3, 5, 10):
+                    if k <= max_topk:
+                        topk_ids = topk_pair_ids[:, :k]
+                        topk_conf = pair_confidence.gather(1, topk_ids)
+                        rerank_choice = topk_ids.gather(1, topk_conf.argmax(dim=-1, keepdim=True)).squeeze(-1)
+                        rerank_correct = flat_correct_matrix.gather(1, rerank_choice.unsqueeze(1)).squeeze(1)
+                        correctness_stats[f"route_top{k}_confidence_rerank_correct_acc"] = float(
+                            rerank_correct[option_conf_mask].float().mean().item()
+                        )
+                correctness_stats["option_prob_available_ratio"] = float(option_prob_available.float().mean().item())
+            else:
+                correctness_stats["option_prob_available_ratio"] = 0.0
             self_mask = correctness_mask & valid_self
             if bool(self_mask.any().item()):
                 correctness_stats["fixed_self_correct_acc"] = float(self_correct[self_mask].float().mean().item())
@@ -370,6 +426,11 @@ def evaluate(
                     "route_top3_correct_acc": 0.0,
                     "route_top5_correct_acc": 0.0,
                     "route_top10_correct_acc": 0.0,
+                    "route_top1_confidence_rerank_correct_acc": 0.0,
+                    "route_top3_confidence_rerank_correct_acc": 0.0,
+                    "route_top5_confidence_rerank_correct_acc": 0.0,
+                    "route_top10_confidence_rerank_correct_acc": 0.0,
+                    "option_prob_available_ratio": 0.0,
                     "oracle_correct_acc": 0.0,
                     "any_pair_correct_rate": 0.0,
                     "fixed_self_correct_acc": 0.0,
@@ -936,6 +997,8 @@ def main():
             f"route_correct={val_metrics.get('route_correct_acc', 0.0):.4f} "
             f"top3_correct={val_metrics.get('route_top3_correct_acc', 0.0):.4f} "
             f"top5_correct={val_metrics.get('route_top5_correct_acc', 0.0):.4f} "
+            f"top3_conf={val_metrics.get('route_top3_confidence_rerank_correct_acc', 0.0):.4f} "
+            f"top5_conf={val_metrics.get('route_top5_confidence_rerank_correct_acc', 0.0):.4f} "
             f"self_correct={val_metrics.get('fixed_self_correct_acc', 0.0):.4f} "
             f"any_correct={val_metrics.get('any_pair_correct_rate', 0.0):.4f} "
             f"self_first={val_metrics['self_first_acc']:.4f} "
@@ -978,6 +1041,8 @@ def main():
                 f"route_correct={train_eval_metrics.get('route_correct_acc', 0.0):.4f} "
                 f"top3_correct={train_eval_metrics.get('route_top3_correct_acc', 0.0):.4f} "
                 f"top5_correct={train_eval_metrics.get('route_top5_correct_acc', 0.0):.4f} "
+                f"top3_conf={train_eval_metrics.get('route_top3_confidence_rerank_correct_acc', 0.0):.4f} "
+                f"top5_conf={train_eval_metrics.get('route_top5_confidence_rerank_correct_acc', 0.0):.4f} "
                 f"self_correct={train_eval_metrics.get('fixed_self_correct_acc', 0.0):.4f} "
                 f"any_correct={train_eval_metrics.get('any_pair_correct_rate', 0.0):.4f} "
                 f"self_first={train_eval_metrics['self_first_acc']:.4f} "
@@ -1029,6 +1094,11 @@ def main():
                 "val/route_top3_correct_acc": val_metrics.get("route_top3_correct_acc", 0.0),
                 "val/route_top5_correct_acc": val_metrics.get("route_top5_correct_acc", 0.0),
                 "val/route_top10_correct_acc": val_metrics.get("route_top10_correct_acc", 0.0),
+                "val/route_top1_confidence_rerank_correct_acc": val_metrics.get("route_top1_confidence_rerank_correct_acc", 0.0),
+                "val/route_top3_confidence_rerank_correct_acc": val_metrics.get("route_top3_confidence_rerank_correct_acc", 0.0),
+                "val/route_top5_confidence_rerank_correct_acc": val_metrics.get("route_top5_confidence_rerank_correct_acc", 0.0),
+                "val/route_top10_confidence_rerank_correct_acc": val_metrics.get("route_top10_confidence_rerank_correct_acc", 0.0),
+                "val/option_prob_available_ratio": val_metrics.get("option_prob_available_ratio", 0.0),
                 "val/fixed_self_correct_acc": val_metrics.get("fixed_self_correct_acc", 0.0),
                 "val/any_pair_correct_rate": val_metrics.get("any_pair_correct_rate", 0.0),
                 "val/correct_matrix_available_ratio": val_metrics.get("correct_matrix_available_ratio", 0.0),
@@ -1056,6 +1126,11 @@ def main():
                         "train_eval/route_top3_correct_acc": train_eval_metrics.get("route_top3_correct_acc", 0.0),
                         "train_eval/route_top5_correct_acc": train_eval_metrics.get("route_top5_correct_acc", 0.0),
                         "train_eval/route_top10_correct_acc": train_eval_metrics.get("route_top10_correct_acc", 0.0),
+                        "train_eval/route_top1_confidence_rerank_correct_acc": train_eval_metrics.get("route_top1_confidence_rerank_correct_acc", 0.0),
+                        "train_eval/route_top3_confidence_rerank_correct_acc": train_eval_metrics.get("route_top3_confidence_rerank_correct_acc", 0.0),
+                        "train_eval/route_top5_confidence_rerank_correct_acc": train_eval_metrics.get("route_top5_confidence_rerank_correct_acc", 0.0),
+                        "train_eval/route_top10_confidence_rerank_correct_acc": train_eval_metrics.get("route_top10_confidence_rerank_correct_acc", 0.0),
+                        "train_eval/option_prob_available_ratio": train_eval_metrics.get("option_prob_available_ratio", 0.0),
                         "train_eval/fixed_self_correct_acc": train_eval_metrics.get("fixed_self_correct_acc", 0.0),
                         "train_eval/any_pair_correct_rate": train_eval_metrics.get("any_pair_correct_rate", 0.0),
                         "train_eval/correct_matrix_available_ratio": train_eval_metrics.get("correct_matrix_available_ratio", 0.0),

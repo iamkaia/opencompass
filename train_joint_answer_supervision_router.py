@@ -439,6 +439,7 @@ class JointAnswerSupervisionRouterModel(nn.Module):
         num_tasks = len(self.expert_names)
         loss_matrix = torch.empty(batch_size, num_tasks, num_tasks, dtype=torch.float32, device=prompt_input_ids.device)
         correct_matrix = torch.zeros(batch_size, num_tasks, num_tasks, dtype=torch.bool, device=prompt_input_ids.device)
+        option_prob_matrices: List[Optional[torch.Tensor]] = [None for _ in range(batch_size)]
         score_mode = str(score_mode)
 
         ####這個像sft的算法嗎?
@@ -501,7 +502,7 @@ class JointAnswerSupervisionRouterModel(nn.Module):
                     ).logits
                     option_tasks = [task_names[idx] for idx in option_nll_indices]
                     option_targets = [targets[idx] for idx in option_nll_indices]
-                    option_loss, option_correct = compute_option_nll_proxy_scores(
+                    option_loss, option_correct, option_probs_list = compute_option_nll_proxy_scores(
                         logits=option_logits,
                         prompt_attention_mask=option_prompt_mask,
                         targets=option_targets,
@@ -513,6 +514,20 @@ class JointAnswerSupervisionRouterModel(nn.Module):
                     option_correct = option_correct.to(device=prompt_input_ids.device, dtype=torch.bool)
                     combo_loss.index_copy_(0, option_nll_index_tensor, option_loss)
                     correct_matrix[:, first_tid, mid_tid].index_copy_(0, option_nll_index_tensor, option_correct)
+                    for local_idx, sample_idx in enumerate(option_nll_indices):
+                        option_probs = option_probs_list[local_idx].to(
+                            device=prompt_input_ids.device,
+                            dtype=torch.float32,
+                        )
+                        if option_prob_matrices[sample_idx] is None:
+                            option_prob_matrices[sample_idx] = torch.empty(
+                                num_tasks,
+                                num_tasks,
+                                option_probs.numel(),
+                                dtype=torch.float32,
+                                device=prompt_input_ids.device,
+                            )
+                        option_prob_matrices[sample_idx][first_tid, mid_tid] = option_probs
 
                 ###找出哪些 sample 不需要 generation evaluator，也沒有選項 proxy，用 token NLL 即可。
                 token_nll_indices = [
@@ -577,6 +592,7 @@ class JointAnswerSupervisionRouterModel(nn.Module):
 
         set_all_experts(self.model, NULL_EXPERT_ID)
         self.last_route_correct_matrix = correct_matrix
+        self.last_route_option_prob_matrices = option_prob_matrices
         return loss_matrix
 
     ####在目前已設定好的 expert pair 下 generate。
@@ -779,13 +795,14 @@ def compute_option_nll_proxy_scores(
     task_names: Sequence[str],
     tokenizer,
     debug_prefix: Optional[str] = None,
-) -> tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, List[torch.Tensor]]:
     positions = torch.arange(prompt_attention_mask.size(1), device=prompt_attention_mask.device)
     last_prompt_pos = (prompt_attention_mask.to(torch.long) * positions).max(dim=1).values
     batch_idx = torch.arange(logits.size(0), device=logits.device)
     answer_logits = logits[batch_idx, last_prompt_pos, :]
     costs: List[torch.Tensor] = []
     correct_flags: List[torch.Tensor] = []
+    option_probs_list: List[torch.Tensor] = []
     debug_enabled = os.environ.get("ROUTER_DEBUG_OPTION_PROBS", "0") == "1"
 
     for idx, task_name in enumerate(task_names):
@@ -806,6 +823,7 @@ def compute_option_nll_proxy_scores(
         gold_idx = option_labels.index(gold_label) if gold_label in option_labels else 0
         costs.append(-log_probs[gold_idx])
         correct_flags.append(option_probs.argmax(dim=-1) == gold_idx)
+        option_probs_list.append(option_probs.to(torch.float32))
         if debug_enabled and idx == 0:
             prefix = f"[OPTION_PROBS][{debug_prefix}]" if debug_prefix else "[OPTION_PROBS]"
             print(
@@ -817,7 +835,11 @@ def compute_option_nll_proxy_scores(
                 flush=True,
             )
 
-    return torch.stack(costs, dim=0).to(torch.float32), torch.stack(correct_flags, dim=0).to(torch.bool)
+    return (
+        torch.stack(costs, dim=0).to(torch.float32),
+        torch.stack(correct_flags, dim=0).to(torch.bool),
+        option_probs_list,
+    )
 
 
 def compute_official_evaluator_sample_score(
