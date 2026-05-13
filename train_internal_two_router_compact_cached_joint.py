@@ -47,6 +47,66 @@ def parse_optional_task_names(raw: Optional[str]) -> Optional[List[str]]:
             return tasks
     return None
 
+
+def parse_float_list(raw: Optional[str], default: Sequence[float]) -> List[float]:
+    if raw:
+        values = [float(part.strip()) for part in raw.split(",") if part.strip()]
+        if values:
+            return values
+    return [float(value) for value in default]
+
+
+def metric_float_tag(value: float) -> str:
+    return str(float(value)).replace("-", "m").replace(".", "p")
+
+
+def task_option_labels(task_name: str) -> Optional[List[str]]:
+    task_name = str(task_name)
+    if task_name in {"race", "medmcqa", "hellaswag"}:
+        return ["A", "B", "C", "D"]
+    if task_name in {"piqa", "copa", "boolq"}:
+        return ["A", "B"]
+    if task_name == "siqa":
+        return ["A", "B", "C"]
+    if task_name == "sst2":
+        return ["0", "1"]
+    return None
+
+
+def normalize_task_label(task_name: str, target: str) -> str:
+    task_name = str(task_name)
+    target_text = str(target).strip()
+    lower = target_text.lower()
+    if task_name == "sst2":
+        if lower in {"1", "positive", "pos", "true"}:
+            return "1"
+        if lower in {"0", "negative", "neg", "false"}:
+            return "0"
+    if task_name == "boolq":
+        if lower in {"yes", "true", "1", "a"}:
+            return "A"
+        if lower in {"no", "false", "0", "b"}:
+            return "B"
+    return target_text.upper()[:1]
+
+
+def batch_gold_option_indices(tasks: Sequence[str], targets: Sequence[str], device) -> tuple[torch.Tensor, torch.Tensor]:
+    gold_indices = []
+    valid = []
+    for task, target in zip(tasks, targets):
+        labels = task_option_labels(task)
+        gold = normalize_task_label(task, target)
+        if labels and gold in labels:
+            gold_indices.append(labels.index(gold))
+            valid.append(True)
+        else:
+            gold_indices.append(0)
+            valid.append(False)
+    return (
+        torch.tensor(gold_indices, dtype=torch.long, device=device),
+        torch.tensor(valid, dtype=torch.bool, device=device),
+    )
+
 #####它會讀 feature_root/<split>/manifest.json，再把 chunk 檔載進來。重要的是它在 66-81 行 (line 66) 做了兩件事：
 #####如果你只想訓練部分 task，它會先把 loss_matrix slice 成較小的子矩陣
 ####再從 slice 後的 loss_matrix 重新算一次 pair_label / first_label / mid_label
@@ -300,6 +360,7 @@ def evaluate(
     pair_loss_normalization,
     supervision_mode,
     correct_soft_ce_temperature,
+    topk_weighted_temperatures,
 ):
     model.eval()
     total_loss = 0.0
@@ -401,6 +462,8 @@ def evaluate(
                     batch.option_prob_matrix.size(-1),
                 )
                 pair_confidence = flat_option_prob.max(dim=-1).values
+                gold_option_idx, gold_option_valid = batch_gold_option_indices(batch.tasks, batch.targets, device)
+                weighted_mask = option_conf_mask & gold_option_valid
                 for k in (1, 3, 5, 10):
                     if k <= max_topk:
                         topk_ids = topk_pair_ids[:, :k]
@@ -410,9 +473,24 @@ def evaluate(
                         correctness_stats[f"route_top{k}_confidence_rerank_correct_acc"] = float(
                             rerank_correct[option_conf_mask].float().mean().item()
                         )
+                        if bool(weighted_mask.any().item()):
+                            gather_idx = topk_ids.unsqueeze(-1).expand(-1, -1, flat_option_prob.size(-1))
+                            topk_option_prob = flat_option_prob.gather(1, gather_idx)
+                            topk_logits = pair_logits.gather(1, topk_ids)
+                            for temperature in topk_weighted_temperatures:
+                                tag = metric_float_tag(float(temperature))
+                                weights = torch.softmax(topk_logits / float(temperature), dim=-1)
+                                weighted_option_prob = (topk_option_prob * weights.unsqueeze(-1)).sum(dim=1)
+                                weighted_pred = weighted_option_prob.argmax(dim=-1)
+                                weighted_correct = weighted_pred == gold_option_idx
+                                correctness_stats[f"route_top{k}_weighted_t{tag}_answer_acc"] = float(
+                                    weighted_correct[weighted_mask].float().mean().item()
+                                )
                 correctness_stats["option_prob_available_ratio"] = float(option_prob_available.float().mean().item())
+                correctness_stats["option_gold_available_ratio"] = float(gold_option_valid.float().mean().item())
             else:
                 correctness_stats["option_prob_available_ratio"] = 0.0
+                correctness_stats["option_gold_available_ratio"] = 0.0
             self_mask = correctness_mask & valid_self
             if bool(self_mask.any().item()):
                 correctness_stats["fixed_self_correct_acc"] = float(self_correct[self_mask].float().mean().item())
@@ -595,6 +673,12 @@ def main():
         default=1.0,
         help="Temperature for correct_conf_ce. Lower values put more target mass on lower-loss correct pairs.",
     )
+    parser.add_argument(
+        "--topk_weighted_temperatures",
+        type=str,
+        default="0.5,1.0",
+        help="Comma-separated router-logit temperatures for top-k weighted option-prob voting metrics.",
+    )
     '''
     oracle_loss：使用 cache 裡的 loss_matrix 訓練。
     也就是讓 router 學「哪個 expert pair 實際 loss 比較低」。
@@ -720,6 +804,9 @@ def main():
     train_cfg = vars(args).copy()
     train_cfg["resolved_sample_task_names"] = sample_task_names
     train_cfg["resolved_expert_names"] = expert_names
+    topk_weighted_temperatures = parse_float_list(args.topk_weighted_temperatures, default=[0.5, 1.0])
+    train_cfg["resolved_topk_weighted_temperatures"] = topk_weighted_temperatures
+    print(f"[INFO] topk_weighted_temperatures={topk_weighted_temperatures}")
     save_json(train_cfg, os.path.join(args.out_dir, "train_config.json"))
 
     ###Collator() 會把 list of item 組成 batch
@@ -985,6 +1072,7 @@ def main():
             pair_loss_normalization=args.pair_loss_normalization,
             supervision_mode=args.supervision_mode,
             correct_soft_ce_temperature=args.correct_soft_ce_temperature,
+            topk_weighted_temperatures=topk_weighted_temperatures,
         )
         print(
             f"[VAL] epoch={epoch} loss={val_metrics['loss']:.4f} "
@@ -999,6 +1087,10 @@ def main():
             f"top5_correct={val_metrics.get('route_top5_correct_acc', 0.0):.4f} "
             f"top3_conf={val_metrics.get('route_top3_confidence_rerank_correct_acc', 0.0):.4f} "
             f"top5_conf={val_metrics.get('route_top5_confidence_rerank_correct_acc', 0.0):.4f} "
+            f"top3_wt05={val_metrics.get('route_top3_weighted_t0p5_answer_acc', 0.0):.4f} "
+            f"top5_wt05={val_metrics.get('route_top5_weighted_t0p5_answer_acc', 0.0):.4f} "
+            f"top3_wt1={val_metrics.get('route_top3_weighted_t1p0_answer_acc', 0.0):.4f} "
+            f"top5_wt1={val_metrics.get('route_top5_weighted_t1p0_answer_acc', 0.0):.4f} "
             f"self_correct={val_metrics.get('fixed_self_correct_acc', 0.0):.4f} "
             f"any_correct={val_metrics.get('any_pair_correct_rate', 0.0):.4f} "
             f"self_first={val_metrics['self_first_acc']:.4f} "
@@ -1029,6 +1121,7 @@ def main():
                 pair_loss_normalization=args.pair_loss_normalization,
                 supervision_mode=args.supervision_mode,
                 correct_soft_ce_temperature=args.correct_soft_ce_temperature,
+                topk_weighted_temperatures=topk_weighted_temperatures,
             )
             print(
                 f"[TRAIN-EVAL] epoch={epoch} loss={train_eval_metrics['loss']:.4f} "
@@ -1043,6 +1136,10 @@ def main():
                 f"top5_correct={train_eval_metrics.get('route_top5_correct_acc', 0.0):.4f} "
                 f"top3_conf={train_eval_metrics.get('route_top3_confidence_rerank_correct_acc', 0.0):.4f} "
                 f"top5_conf={train_eval_metrics.get('route_top5_confidence_rerank_correct_acc', 0.0):.4f} "
+                f"top3_wt05={train_eval_metrics.get('route_top3_weighted_t0p5_answer_acc', 0.0):.4f} "
+                f"top5_wt05={train_eval_metrics.get('route_top5_weighted_t0p5_answer_acc', 0.0):.4f} "
+                f"top3_wt1={train_eval_metrics.get('route_top3_weighted_t1p0_answer_acc', 0.0):.4f} "
+                f"top5_wt1={train_eval_metrics.get('route_top5_weighted_t1p0_answer_acc', 0.0):.4f} "
                 f"self_correct={train_eval_metrics.get('fixed_self_correct_acc', 0.0):.4f} "
                 f"any_correct={train_eval_metrics.get('any_pair_correct_rate', 0.0):.4f} "
                 f"self_first={train_eval_metrics['self_first_acc']:.4f} "
@@ -1099,6 +1196,7 @@ def main():
                 "val/route_top5_confidence_rerank_correct_acc": val_metrics.get("route_top5_confidence_rerank_correct_acc", 0.0),
                 "val/route_top10_confidence_rerank_correct_acc": val_metrics.get("route_top10_confidence_rerank_correct_acc", 0.0),
                 "val/option_prob_available_ratio": val_metrics.get("option_prob_available_ratio", 0.0),
+                "val/option_gold_available_ratio": val_metrics.get("option_gold_available_ratio", 0.0),
                 "val/fixed_self_correct_acc": val_metrics.get("fixed_self_correct_acc", 0.0),
                 "val/any_pair_correct_rate": val_metrics.get("any_pair_correct_rate", 0.0),
                 "val/correct_matrix_available_ratio": val_metrics.get("correct_matrix_available_ratio", 0.0),
@@ -1112,6 +1210,11 @@ def main():
                 else (min(best_metric_value, current_best_metric) if args.best_metric == "loss" else max(best_metric_value, current_best_metric)),
                 "val/best_router_argmax_score": max(best_router_score, val_metrics["router_argmax_score"]),
             }
+            for temperature in topk_weighted_temperatures:
+                tag = metric_float_tag(float(temperature))
+                for k in (1, 3, 5, 10):
+                    metric_name = f"route_top{k}_weighted_t{tag}_answer_acc"
+                    wandb_payload[f"val/{metric_name}"] = val_metrics.get(metric_name, 0.0)
             wandb_payload[f"val/{args.best_metric}_for_checkpoint"] = current_best_metric
             wandb_payload.update(flatten_routing_summary(val_metrics["routing_summary"], prefix="val_route"))
             if train_eval_metrics is not None:
@@ -1131,6 +1234,7 @@ def main():
                         "train_eval/route_top5_confidence_rerank_correct_acc": train_eval_metrics.get("route_top5_confidence_rerank_correct_acc", 0.0),
                         "train_eval/route_top10_confidence_rerank_correct_acc": train_eval_metrics.get("route_top10_confidence_rerank_correct_acc", 0.0),
                         "train_eval/option_prob_available_ratio": train_eval_metrics.get("option_prob_available_ratio", 0.0),
+                        "train_eval/option_gold_available_ratio": train_eval_metrics.get("option_gold_available_ratio", 0.0),
                         "train_eval/fixed_self_correct_acc": train_eval_metrics.get("fixed_self_correct_acc", 0.0),
                         "train_eval/any_pair_correct_rate": train_eval_metrics.get("any_pair_correct_rate", 0.0),
                         "train_eval/correct_matrix_available_ratio": train_eval_metrics.get("correct_matrix_available_ratio", 0.0),
@@ -1138,6 +1242,11 @@ def main():
                         "train_eval/mid_acc": train_eval_metrics["mid_acc"],
                     }
                 )
+                for temperature in topk_weighted_temperatures:
+                    tag = metric_float_tag(float(temperature))
+                    for k in (1, 3, 5, 10):
+                        metric_name = f"route_top{k}_weighted_t{tag}_answer_acc"
+                        wandb_payload[f"train_eval/{metric_name}"] = train_eval_metrics.get(metric_name, 0.0)
                 wandb_payload.update(
                     flatten_routing_summary(train_eval_metrics["routing_summary"], prefix="train_eval_route")
                 )
