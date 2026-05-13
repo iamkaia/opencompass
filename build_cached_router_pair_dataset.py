@@ -15,9 +15,11 @@ from train_joint_answer_supervision_router import (
     JointAnswerSupervisionRouterModel,
     build_lm_batch,
     build_dataset,
+    compute_option_nll_proxy_scores,
     discover_expert_names,
     save_json,
 )
+from opencompass.models.router_moe_shared import NULL_EXPERT_ID, set_all_experts
 
 
 def parse_csv_arg(raw: Optional[str]) -> Optional[List[str]]:
@@ -50,6 +52,32 @@ def save_chunk(items: List[Dict], split_dir: str, chunk_idx: int, manifest_files
     filename = f"chunk_{chunk_idx:05d}.pt"
     torch.save({"items": items}, os.path.join(split_dir, filename))
     manifest_files.append(filename)
+
+
+def build_option_stats(option_probs: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+    if option_probs is None:
+        return None
+    probs = option_probs.to(torch.float32)
+    if probs.dim() != 2 or probs.size(-1) <= 0:
+        return None
+    sorted_probs = probs.sort(dim=-1, descending=True).values
+    max_prob = sorted_probs[:, 0]
+    second_prob = sorted_probs[:, 1] if sorted_probs.size(-1) > 1 else torch.zeros_like(max_prob)
+    margin = max_prob - second_prob
+    entropy = -(probs.clamp_min(1e-8) * probs.clamp_min(1e-8).log()).sum(dim=-1)
+    num_options = torch.full_like(max_prob, float(probs.size(-1)))
+    return torch.stack([max_prob, entropy, margin, num_options], dim=-1)
+
+
+def build_single_option_stats(option_probs: torch.Tensor) -> torch.Tensor:
+    probs = option_probs.to(torch.float32).view(-1)
+    sorted_probs = probs.sort(descending=True).values
+    max_prob = sorted_probs[0]
+    second_prob = sorted_probs[1] if sorted_probs.numel() > 1 else torch.zeros_like(max_prob)
+    margin = max_prob - second_prob
+    entropy = -(probs.clamp_min(1e-8) * probs.clamp_min(1e-8).log()).sum()
+    num_options = torch.tensor(float(probs.numel()), dtype=torch.float32, device=probs.device)
+    return torch.stack([max_prob, entropy, margin, num_options], dim=0)
 
 
 ###建datasets的cache
@@ -147,6 +175,41 @@ def process_split(
                 input_ids=prompt_input_ids,
                 attention_mask=prompt_attention_mask,
             )
+            base_option_probs = None
+            base_option_stats = None
+            try:
+                set_all_experts(model.model, NULL_EXPERT_ID)
+                base_logits = model.model(
+                    input_ids=prompt_input_ids,
+                    attention_mask=prompt_attention_mask,
+                    use_cache=False,
+                ).logits
+                _, _, base_option_probs = compute_option_nll_proxy_scores(
+                    logits=base_logits,
+                    prompt_attention_mask=prompt_attention_mask,
+                    targets=batch.targets,
+                    task_names=batch.task_names,
+                    tokenizer=llm_tokenizer,
+                    debug_prefix="base",
+                )
+                base_option_stats = torch.stack(
+                    [build_single_option_stats(probs.to(device=device)) for probs in base_option_probs],
+                    dim=0,
+                )
+                max_num_options = max(int(probs.numel()) for probs in base_option_probs)
+                padded_base_option_probs = torch.zeros(
+                    len(base_option_probs),
+                    max_num_options,
+                    dtype=torch.float32,
+                    device=device,
+                )
+                for option_idx, probs in enumerate(base_option_probs):
+                    padded_base_option_probs[option_idx, : probs.numel()] = probs.to(device=device, dtype=torch.float32)
+                base_option_probs = padded_base_option_probs
+            except Exception as exc:
+                print(f"[WARN] failed to compute base option features for split={split} batch={batch_idx}: {exc}", flush=True)
+                base_option_probs = None
+                base_option_stats = None
             loss_matrix = model.score_all_route_pairs(
                 prompt_input_ids=prompt_input_ids,
                 prompt_attention_mask=prompt_attention_mask,
@@ -179,6 +242,8 @@ def process_split(
         best_first_cpu = best_first.cpu()
         best_mid_cpu = best_mid.cpu()
         task_ids_cpu = batch.task_ids.cpu()
+        base_option_probs_cpu = base_option_probs.to(dtype=torch.float32).cpu() if base_option_probs is not None else None
+        base_option_stats_cpu = base_option_stats.to(dtype=torch.float32).cpu() if base_option_stats is not None else None
 
         for idx in range(len(batch.texts)):
             chunk_items.append(
@@ -195,6 +260,16 @@ def process_split(
                     "option_prob_matrix": (
                         option_prob_matrices[idx].to(dtype=torch.float32).cpu().clone()
                         if option_prob_matrices is not None and option_prob_matrices[idx] is not None
+                        else None
+                    ),
+                    "base_option_probs": (
+                        base_option_probs_cpu[idx].clone()
+                        if base_option_probs_cpu is not None
+                        else None
+                    ),
+                    "base_option_stats": (
+                        base_option_stats_cpu[idx].clone()
+                        if base_option_stats_cpu is not None
                         else None
                     ),
                     "pair_label": int(best_pair_cpu[idx].item()),
@@ -253,6 +328,7 @@ def process_split(
             "supervision_type": "cached_loss_matrix",
             "has_correct_matrix": True,
             "has_option_prob_matrix": True,
+            "has_base_option_features": True,
             "score_mode": str(score_mode),
         },
         os.path.join(split_dir, "manifest.json"),

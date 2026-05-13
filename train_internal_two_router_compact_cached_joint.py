@@ -187,6 +187,7 @@ class CachedLossMatrixDataset(Dataset):
                 remapped["task_id"] = int(expert2id.get(task_name, -1))
                 remapped["loss_matrix"] = sliced_loss_matrix
                 remapped["correct_matrix"] = sliced_correct_matrix.to(torch.bool)
+                remapped["base_option_stats"] = item.get("base_option_stats")
                 option_prob_matrix = item.get("option_prob_matrix")
                 if option_prob_matrix is not None:
                     remapped["option_prob_matrix"] = option_prob_matrix.index_select(
@@ -225,6 +226,7 @@ class CachedLossMatrixDataset(Dataset):
             "loss_matrix": item["loss_matrix"],
             "correct_matrix": item["correct_matrix"],
             "option_prob_matrix": item.get("option_prob_matrix"),
+            "base_option_stats": item.get("base_option_stats"),
             "has_correct_matrix": bool(item.get("has_correct_matrix", False)),
             "pair_label": int(item["pair_label"]),
             "first_label": int(item["first_label"]),
@@ -245,6 +247,8 @@ class Batch:
     loss_matrix: torch.Tensor
     correct_matrix: torch.Tensor
     option_prob_matrix: torch.Tensor
+    sample_features: torch.Tensor
+    sample_feature_available: torch.Tensor
     option_prob_available: torch.Tensor
     correct_available: torch.Tensor
     pair_labels: torch.Tensor
@@ -261,6 +265,8 @@ class Collator:
                 max_num_options = max(max_num_options, int(option_prob_matrix.size(-1)))
         option_prob_tensors = []
         option_prob_available = []
+        sample_feature_tensors = []
+        sample_feature_available = []
         for item in batch:
             option_prob_matrix = item.get("option_prob_matrix")
             if option_prob_matrix is None:
@@ -277,6 +283,18 @@ class Collator:
                 padded[..., : option_prob_matrix.size(-1)] = option_prob_matrix.to(torch.float32)
                 option_prob_tensors.append(padded)
                 option_prob_available.append(True)
+            base_option_stats = item.get("base_option_stats")
+            if base_option_stats is None:
+                sample_feature_tensors.append(torch.zeros(4, dtype=torch.float32))
+                sample_feature_available.append(False)
+            else:
+                feature = base_option_stats.to(torch.float32).view(-1)
+                if feature.numel() < 4:
+                    padded_feature = torch.zeros(4, dtype=torch.float32)
+                    padded_feature[: feature.numel()] = feature
+                    feature = padded_feature
+                sample_feature_tensors.append(feature[:4])
+                sample_feature_available.append(True)
         return Batch(
             texts=[x["text"] for x in batch],
             prompt_texts=[str(x["prompt_text"]) for x in batch],
@@ -289,6 +307,8 @@ class Collator:
             loss_matrix=torch.stack([x["loss_matrix"] for x in batch], dim=0).to(torch.float32),
             correct_matrix=torch.stack([x["correct_matrix"] for x in batch], dim=0).to(torch.bool),
             option_prob_matrix=torch.stack(option_prob_tensors, dim=0).to(torch.float32),
+            sample_features=torch.stack(sample_feature_tensors, dim=0).to(torch.float32),
+            sample_feature_available=torch.tensor(sample_feature_available, dtype=torch.bool),
             option_prob_available=torch.tensor(option_prob_available, dtype=torch.bool),
             correct_available=torch.tensor([bool(x["has_correct_matrix"]) for x in batch], dtype=torch.bool),
             pair_labels=torch.tensor([x["pair_label"] for x in batch], dtype=torch.long),
@@ -298,20 +318,21 @@ class Collator:
 
 #### 沒有base llm
 class InternalTwoRouterCachedJointModel(nn.Module):
-    def __init__(self, bert_init: str, llama_hidden_size: int, router_dim: int, num_pairs: int):
+    def __init__(self, bert_init: str, llama_hidden_size: int, router_dim: int, num_pairs: int, sample_feature_dim: int = 0):
         super().__init__()
+        self.sample_feature_dim = int(sample_feature_dim)
         self.bert = BertExternalEncoder(bert_init)
         bert_hidden_size = self.bert.encoder.config.hidden_size
         self.router_first = CompactRouterFeatureEncoder(llama_hidden_size, bert_hidden_size, router_dim)
         self.router_mid = CompactRouterFeatureEncoder(llama_hidden_size, bert_hidden_size, router_dim)
         self.pair_classifier = nn.Sequential(
-            nn.LayerNorm(router_dim * 4),
-            nn.Linear(router_dim * 4, router_dim * 2),
+            nn.LayerNorm(router_dim * 4 + self.sample_feature_dim),
+            nn.Linear(router_dim * 4 + self.sample_feature_dim, router_dim * 2),
             nn.GELU(),
             nn.Linear(router_dim * 2, num_pairs),
         )
 
-    def forward(self, bert_input_ids, bert_attention_mask, bert_token_type_ids, first_vec, mid_vec):
+    def forward(self, bert_input_ids, bert_attention_mask, bert_token_type_ids, first_vec, mid_vec, sample_features=None):
         bert_prev, bert_last = self.bert(
             input_ids=bert_input_ids,
             attention_mask=bert_attention_mask,
@@ -319,7 +340,17 @@ class InternalTwoRouterCachedJointModel(nn.Module):
         )
         first_feat = self.router_first(first_vec, bert_prev, bert_last, bert_attention_mask)
         mid_feat = self.router_mid(mid_vec, bert_prev, bert_last, bert_attention_mask)
-        pair_logits = self.pair_classifier(torch.cat([first_feat, mid_feat], dim=-1))
+        pair_input = torch.cat([first_feat, mid_feat], dim=-1)
+        if self.sample_feature_dim > 0:
+            if sample_features is None:
+                sample_features = torch.zeros(
+                    pair_input.size(0),
+                    self.sample_feature_dim,
+                    dtype=pair_input.dtype,
+                    device=pair_input.device,
+                )
+            pair_input = torch.cat([pair_input, sample_features.to(device=pair_input.device, dtype=pair_input.dtype)], dim=-1)
+        pair_logits = self.pair_classifier(pair_input)
         return pair_logits
 
 
@@ -346,6 +377,15 @@ def compute_self_pair_ce(pair_logits: torch.Tensor, task_ids: torch.Tensor, num_
     return loss, self_pair
 
 
+def resolve_sample_features(batch: Batch, mode: str, device) -> Optional[torch.Tensor]:
+    mode = str(mode)
+    if mode == "none":
+        return None
+    if mode == "base_option_stats":
+        return batch.sample_features.to(device)
+    raise ValueError(f"Unknown sample_feature_mode: {mode}")
+
+
 @torch.no_grad()
 def evaluate(
     model,
@@ -361,6 +401,7 @@ def evaluate(
     supervision_mode,
     correct_soft_ce_temperature,
     topk_weighted_temperatures,
+    sample_feature_mode,
 ):
     model.eval()
     total_loss = 0.0
@@ -394,6 +435,7 @@ def evaluate(
             bert_token_type_ids=bert_token_type_ids,
             first_vec=batch.first_vec.to(device),
             mid_vec=batch.mid_vec.to(device),
+            sample_features=resolve_sample_features(batch, sample_feature_mode, device),
         )
         oracle_loss, metrics, best_first, best_mid, flat_best = compute_pair_losses(
             pair_logits=pair_logits,
@@ -594,6 +636,8 @@ def save_ckpt(
     supervision_mode,
     best_metric,
     best_metric_value,
+    sample_feature_mode,
+    sample_feature_dim,
 ):
     os.makedirs(out_dir, exist_ok=True)
     model.bert.encoder.save_pretrained(os.path.join(out_dir, "encoder"))
@@ -614,6 +658,8 @@ def save_ckpt(
             "num_pairs": len(expert_names) * len(expert_names),
             "router_max_len": max_bert_len,
             "router_feature_type": "cached_prompt_vectors_with_loss_matrix",
+            "sample_feature_mode": str(sample_feature_mode),
+            "sample_feature_dim": int(sample_feature_dim),
             "supervision_type": "cached_pair_ce_main",
             "supervision_mode": str(supervision_mode),
             "joint_loss": str(joint_loss),
@@ -652,6 +698,13 @@ def main():
     parser.add_argument("--warmup_ratio", type=float, default=0.05)
     parser.add_argument("--max_bert_len", type=int, default=512)
     parser.add_argument("--router_dim", type=int, default=512)
+    parser.add_argument(
+        "--sample_feature_mode",
+        type=str,
+        default="none",
+        choices=["none", "base_option_stats"],
+        help="Extra per-sample features concatenated into the pair classifier.",
+    )
     parser.add_argument("--freeze_bert", action="store_true")
     parser.add_argument(
         "--joint_loss",
@@ -815,7 +868,8 @@ def main():
         f"pseudo_ce_weight={args.pseudo_ce_weight} pseudo_ce_margin={args.pseudo_ce_margin} "
         f"correct_soft_ce_temperature={args.correct_soft_ce_temperature} "
         f"pair_loss_normalization={args.pair_loss_normalization} "
-        f"best_metric={args.best_metric}"
+        f"best_metric={args.best_metric} "
+        f"sample_feature_mode={args.sample_feature_mode}"
     )
     train_cfg = vars(args).copy()
     train_cfg["resolved_sample_task_names"] = sample_task_names
@@ -861,6 +915,7 @@ def main():
         llama_hidden_size=llama_hidden_size,
         router_dim=args.router_dim,
         num_pairs=len(expert_names) * len(expert_names),
+        sample_feature_dim=4 if args.sample_feature_mode == "base_option_stats" else 0,
     ).to(device)
 
     if args.load_from is not None:
@@ -926,6 +981,7 @@ def main():
                 bert_token_type_ids=bert_token_type_ids,
                 first_vec=batch.first_vec.to(device),
                 mid_vec=batch.mid_vec.to(device),
+                sample_features=resolve_sample_features(batch, args.sample_feature_mode, device),
             )
             ###if --supervision_mode oracle_loss, loss=orcale_loss
             ###compute_pair_losses 應該只是算loss的方向而已
@@ -1089,6 +1145,7 @@ def main():
             supervision_mode=args.supervision_mode,
             correct_soft_ce_temperature=args.correct_soft_ce_temperature,
             topk_weighted_temperatures=topk_weighted_temperatures,
+            sample_feature_mode=args.sample_feature_mode,
         )
         print(
             f"[VAL] epoch={epoch} loss={val_metrics['loss']:.4f} "
@@ -1138,6 +1195,7 @@ def main():
                 supervision_mode=args.supervision_mode,
                 correct_soft_ce_temperature=args.correct_soft_ce_temperature,
                 topk_weighted_temperatures=topk_weighted_temperatures,
+                sample_feature_mode=args.sample_feature_mode,
             )
             print(
                 f"[TRAIN-EVAL] epoch={epoch} loss={train_eval_metrics['loss']:.4f} "
@@ -1291,6 +1349,8 @@ def main():
                 supervision_mode=args.supervision_mode,
                 best_metric=args.best_metric,
                 best_metric_value=best_metric_value,
+                sample_feature_mode=args.sample_feature_mode,
+                sample_feature_dim=4 if args.sample_feature_mode == "base_option_stats" else 0,
             )
             print(
                 f"[SAVE] best checkpoint updated at epoch={epoch} "
