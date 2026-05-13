@@ -1,4 +1,6 @@
 import atexit
+import hashlib
+import json
 import os
 from collections import Counter
 from typing import List, Optional
@@ -35,6 +37,10 @@ def _dataset_name_from_context(
     return "unknown"
 
 
+def _prompt_hash(text: str) -> str:
+    return hashlib.sha1(str(text).encode("utf-8")).hexdigest()
+
+
 @MODELS.register_module()
 class RouterMoELlamaInternalCompactCachedJoint(HuggingFacewithChatTemplate):
     is_api = False
@@ -60,6 +66,7 @@ class RouterMoELlamaInternalCompactCachedJoint(HuggingFacewithChatTemplate):
         hf_offline: bool = False,
         debug_router_topk: int = 0,
         debug_router_max_prints: int = 0,
+        debug_router_record_path: Optional[str] = None,
         **kwargs,
     ):
         if hf_offline:
@@ -101,6 +108,12 @@ class RouterMoELlamaInternalCompactCachedJoint(HuggingFacewithChatTemplate):
         )
         self._active_dataset_name = None
         self._printed_dataset_totals = {}
+        self.debug_router_record_path = debug_router_record_path
+        self._dataset_sample_counter = Counter()
+        if self.debug_router_record_path:
+            record_dir = os.path.dirname(os.path.abspath(self.debug_router_record_path))
+            if record_dir:
+                os.makedirs(record_dir, exist_ok=True)
         atexit.register(self._flush_all_dataset_routing_summaries)
 
     def _to_prompt_str(self, x):
@@ -177,6 +190,33 @@ class RouterMoELlamaInternalCompactCachedJoint(HuggingFacewithChatTemplate):
         if dataset_name not in self._dataset_pair_counter:
             self._dataset_pair_counter[dataset_name] = Counter()
         self._dataset_pair_counter[dataset_name][pair_key] += 1
+
+    def _append_routing_record(
+        self,
+        dataset_name: str,
+        prompt: str,
+        first_eid: Optional[int],
+        mid_eid: Optional[int],
+    ):
+        if not self.debug_router_record_path:
+            return
+        sample_index = self._dataset_sample_counter[dataset_name]
+        self._dataset_sample_counter[dataset_name] += 1
+        first_task = self._eid_to_task(first_eid)
+        mid_task = self._eid_to_task(mid_eid)
+        record = {
+            "dataset": dataset_name,
+            "sample_index": int(sample_index),
+            "prompt_sha1": _prompt_hash(prompt),
+            "pred_pair": f"{first_task}->{mid_task}",
+            "first_task": first_task,
+            "mid_task": mid_task,
+            "first_eid": None if first_eid is None else int(first_eid),
+            "mid_eid": None if mid_eid is None else int(mid_eid),
+            "prompt_preview": prompt.replace("\n", "\\n")[:240],
+        }
+        with open(self.debug_router_record_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
     def _flush_dataset_routing_summary(self, dataset_name: str):
         if not hasattr(self, "_dataset_pair_counter"):
@@ -256,6 +296,12 @@ class RouterMoELlamaInternalCompactCachedJoint(HuggingFacewithChatTemplate):
                 outputs.append(one_out)
             self._append_routing_log(
                 dataset_name=dataset_name,
+                first_eid=getattr(self.core, "cached_first_eid", None),
+                mid_eid=getattr(self.core, "cached_mid_eid", None),
+            )
+            self._append_routing_record(
+                dataset_name=dataset_name,
+                prompt=prompt,
                 first_eid=getattr(self.core, "cached_first_eid", None),
                 mid_eid=getattr(self.core, "cached_mid_eid", None),
             )
