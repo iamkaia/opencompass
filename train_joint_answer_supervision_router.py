@@ -440,6 +440,10 @@ class JointAnswerSupervisionRouterModel(nn.Module):
         loss_matrix = torch.empty(batch_size, num_tasks, num_tasks, dtype=torch.float32, device=prompt_input_ids.device)
         correct_matrix = torch.zeros(batch_size, num_tasks, num_tasks, dtype=torch.bool, device=prompt_input_ids.device)
         option_prob_matrices: List[Optional[torch.Tensor]] = [None for _ in range(batch_size)]
+        prediction_matrices: List[List[List[str]]]= [
+            [["" for _ in range(num_tasks)] for _ in range(num_tasks)]
+            for _ in range(batch_size)
+        ]
         score_mode = str(score_mode)
 
         ####這個像sft的算法嗎?
@@ -535,6 +539,10 @@ class JointAnswerSupervisionRouterModel(nn.Module):
                                 device=prompt_input_ids.device,
                             )
                         option_prob_matrices[sample_idx][first_tid, mid_tid] = option_probs
+                        pred_idx = int(option_probs.argmax().item())
+                        option_labels = _task_option_labels(option_tasks[local_idx]) or []
+                        pred_label = option_labels[pred_idx] if pred_idx < len(option_labels) else str(pred_idx)
+                        prediction_matrices[sample_idx][first_tid][mid_tid] = str(pred_label)
 
                 ###找出哪些 sample 不需要 generation evaluator，也沒有選項 proxy，用 token NLL 即可。
                 token_nll_indices = [
@@ -599,11 +607,14 @@ class JointAnswerSupervisionRouterModel(nn.Module):
                         generation_index_tensor,
                         generation_loss <= 1e-6,
                     )
+                    for local_idx, sample_idx in enumerate(generation_indices):
+                        prediction_matrices[sample_idx][first_tid][mid_tid] = str(generated_texts[local_idx])
                 loss_matrix[:, first_tid, mid_tid] = combo_loss
 
         set_all_experts(self.model, NULL_EXPERT_ID)
         self.last_route_correct_matrix = correct_matrix
         self.last_route_option_prob_matrices = option_prob_matrices
+        self.last_route_prediction_matrices = prediction_matrices
         return loss_matrix
 
     ####在目前已設定好的 expert pair 下 generate。

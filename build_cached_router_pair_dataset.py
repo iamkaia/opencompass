@@ -224,6 +224,7 @@ def process_split(
             )
             correct_matrix = getattr(model, "last_route_correct_matrix", None)
             option_prob_matrices = getattr(model, "last_route_option_prob_matrices", None)
+            prediction_matrices = getattr(model, "last_route_prediction_matrices", None)
 
         flat_loss = loss_matrix.view(loss_matrix.size(0), -1)
         best_pair = flat_loss.argmin(dim=-1)
@@ -260,6 +261,11 @@ def process_split(
                     "option_prob_matrix": (
                         option_prob_matrices[idx].to(dtype=torch.float32).cpu().clone()
                         if option_prob_matrices is not None and option_prob_matrices[idx] is not None
+                        else None
+                    ),
+                    "prediction_matrix": (
+                        prediction_matrices[idx]
+                        if prediction_matrices is not None
                         else None
                     ),
                     "base_option_probs": (
@@ -328,6 +334,7 @@ def process_split(
             "supervision_type": "cached_loss_matrix",
             "has_correct_matrix": True,
             "has_option_prob_matrix": True,
+            "has_prediction_matrix": True,
             "has_base_option_features": True,
             "score_mode": str(score_mode),
         },
