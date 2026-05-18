@@ -96,6 +96,7 @@ def process_split(
     seed: int,
     num_workers: int,
     chunk_size: int,
+    compute_base_option_features: bool,
 ):
     dataset, task_names = build_dataset(
         data_root=data_root,
@@ -177,39 +178,40 @@ def process_split(
             )
             base_option_probs = None
             base_option_stats = None
-            try:
-                set_all_experts(model.model, NULL_EXPERT_ID)
-                base_logits = model.model(
-                    input_ids=prompt_input_ids,
-                    attention_mask=prompt_attention_mask,
-                    use_cache=False,
-                ).logits
-                _, _, base_option_probs = compute_option_nll_proxy_scores(
-                    logits=base_logits,
-                    prompt_attention_mask=prompt_attention_mask,
-                    targets=batch.targets,
-                    task_names=batch.task_names,
-                    tokenizer=llm_tokenizer,
-                    debug_prefix="base",
-                )
-                base_option_stats = torch.stack(
-                    [build_single_option_stats(probs.to(device=device)) for probs in base_option_probs],
-                    dim=0,
-                )
-                max_num_options = max(int(probs.numel()) for probs in base_option_probs)
-                padded_base_option_probs = torch.zeros(
-                    len(base_option_probs),
-                    max_num_options,
-                    dtype=torch.float32,
-                    device=device,
-                )
-                for option_idx, probs in enumerate(base_option_probs):
-                    padded_base_option_probs[option_idx, : probs.numel()] = probs.to(device=device, dtype=torch.float32)
-                base_option_probs = padded_base_option_probs
-            except Exception as exc:
-                print(f"[WARN] failed to compute base option features for split={split} batch={batch_idx}: {exc}", flush=True)
-                base_option_probs = None
-                base_option_stats = None
+            if compute_base_option_features:
+                try:
+                    set_all_experts(model.model, NULL_EXPERT_ID)
+                    base_logits = model.model(
+                        input_ids=prompt_input_ids,
+                        attention_mask=prompt_attention_mask,
+                        use_cache=False,
+                    ).logits
+                    _, _, base_option_probs = compute_option_nll_proxy_scores(
+                        logits=base_logits,
+                        prompt_attention_mask=prompt_attention_mask,
+                        targets=batch.targets,
+                        task_names=batch.task_names,
+                        tokenizer=llm_tokenizer,
+                        debug_prefix="base",
+                    )
+                    base_option_stats = torch.stack(
+                        [build_single_option_stats(probs.to(device=device)) for probs in base_option_probs],
+                        dim=0,
+                    )
+                    max_num_options = max(int(probs.numel()) for probs in base_option_probs)
+                    padded_base_option_probs = torch.zeros(
+                        len(base_option_probs),
+                        max_num_options,
+                        dtype=torch.float32,
+                        device=device,
+                    )
+                    for option_idx, probs in enumerate(base_option_probs):
+                        padded_base_option_probs[option_idx, : probs.numel()] = probs.to(device=device, dtype=torch.float32)
+                    base_option_probs = padded_base_option_probs
+                except Exception as exc:
+                    print(f"[WARN] failed to compute base option features for split={split} batch={batch_idx}: {exc}", flush=True)
+                    base_option_probs = None
+                    base_option_stats = None
             loss_matrix = model.score_all_route_pairs(
                 prompt_input_ids=prompt_input_ids,
                 prompt_attention_mask=prompt_attention_mask,
@@ -335,7 +337,7 @@ def process_split(
             "has_correct_matrix": True,
             "has_option_prob_matrix": True,
             "has_prediction_matrix": True,
-            "has_base_option_features": True,
+            "has_base_option_features": bool(compute_base_option_features),
             "score_mode": str(score_mode),
         },
         os.path.join(split_dir, "manifest.json"),
@@ -376,6 +378,11 @@ def main():
     parser.add_argument("--num_workers", type=int, default=0)
     parser.add_argument("--chunk_size", type=int, default=2048)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--compute_base_option_features",
+        action="store_true",
+        help="Also compute optional base-model option-probability features for MCQ-style tasks.",
+    )
 
     parser.add_argument("--lora_iwslt", type=str, default='./saves/llama2-7b-chat-hf/lora/sft_iwslt')
     parser.add_argument("--lora_medmcqa", type=str, default='./saves/llama2-7b-chat-hf/lora/sft_medmcqa')
@@ -451,6 +458,7 @@ def main():
             "router_pooling_last_k": args.router_pooling_last_k,
             "dtype": args.dtype,
             "score_mode": str(args.score_mode),
+            "compute_base_option_features": bool(args.compute_base_option_features),
             "chunk_size": args.chunk_size,
             "seed": args.seed,
         },
@@ -472,6 +480,7 @@ def main():
         seed=args.seed,
         num_workers=args.num_workers,
         chunk_size=args.chunk_size,
+        compute_base_option_features=args.compute_base_option_features,
     )
     process_split(
         model=model,
@@ -488,6 +497,7 @@ def main():
         seed=args.seed,
         num_workers=args.num_workers,
         chunk_size=args.chunk_size,
+        compute_base_option_features=args.compute_base_option_features,
     )
     print("[DONE] cached dataset build finished")
 
