@@ -74,6 +74,8 @@ def task_option_labels(task_name: str) -> Optional[List[str]]:
     if task_name == "siqa":
         return ["A", "B", "C"]
     if task_name == "sst2":
+        if os.environ.get("ROUTER_SST2_OPTION_LABELS", "numeric") == "words":
+            return ["negative", "positive"]
         return ["0", "1"]
     return None
 
@@ -83,10 +85,11 @@ def normalize_task_label(task_name: str, target: str) -> str:
     target_text = str(target).strip()
     lower = target_text.lower()
     if task_name == "sst2":
+        use_words = os.environ.get("ROUTER_SST2_OPTION_LABELS", "numeric") == "words"
         if lower in {"1", "positive", "pos", "true"}:
-            return "1"
+            return "positive" if use_words else "1"
         if lower in {"0", "negative", "neg", "false"}:
-            return "0"
+            return "negative" if use_words else "0"
     if task_name == "boolq":
         if lower in {"yes", "true", "1", "a"}:
             return "A"

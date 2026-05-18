@@ -339,6 +339,7 @@ def process_split(
             "has_prediction_matrix": True,
             "has_base_option_features": bool(compute_base_option_features),
             "score_mode": str(score_mode),
+            "sst2_option_labels": os.environ.get("ROUTER_SST2_OPTION_LABELS", "numeric"),
         },
         os.path.join(split_dir, "manifest.json"),
     )
@@ -374,6 +375,13 @@ def main():
         default="official_eval_aligned_generation",
         choices=["official_eval_aligned_generation", "official_generation_only", "token_nll"],
     )
+    parser.add_argument(
+        "--sst2_option_labels",
+        type=str,
+        default="numeric",
+        choices=["numeric", "words"],
+        help="For SST2 option-proxy scoring, compare next-token probability of 0/1 or negative/positive.",
+    )
     parser.add_argument("--add_eos_to_target", action="store_true")
     parser.add_argument("--num_workers", type=int, default=0)
     parser.add_argument("--chunk_size", type=int, default=2048)
@@ -397,8 +405,10 @@ def main():
     args = parser.parse_args()
 
     os.makedirs(args.feature_root, exist_ok=True)
+    os.environ["ROUTER_SST2_OPTION_LABELS"] = str(args.sst2_option_labels)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"[INFO] device={device}")
+    print(f"[INFO] sst2_option_labels={args.sst2_option_labels}")
 
     requested_tasks = parse_csv_arg(args.task_names)
     requested_experts = parse_csv_arg(args.expert_names)
@@ -458,6 +468,7 @@ def main():
             "router_pooling_last_k": args.router_pooling_last_k,
             "dtype": args.dtype,
             "score_mode": str(args.score_mode),
+            "sst2_option_labels": str(args.sst2_option_labels),
             "compute_base_option_features": bool(args.compute_base_option_features),
             "chunk_size": args.chunk_size,
             "seed": args.seed,
