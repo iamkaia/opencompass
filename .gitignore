@@ -137,3 +137,34 @@ router_ckpt_*/
 saves/
 .codex
 *ckpt*/
+
+# Local experiment artifacts and cleanup buckets
+artifacts/*
+!artifacts/README.md
+!artifacts/MOVE_PLAN.md
+
+# Router / MoE generated outputs kept out of git
+all_router_ckpt/
+cached_router_pair_*/
+router_cache_*/
+router_cached_features_*/
+router_cached_pair_*/
+router_debug_*/
+router_features_*/
+router_qwen3_*/
+router_train_datasets*/
+router_valid_*/
+router_eval_only_*/
+router_eval_small_all/
+router_align_opencompass_eval_w05_0513/
+routing_compare_logs/
+
+# Generated datasets, caches, and local model/data outputs
+datasets_classifier*/
+datasets_opencompass_eval_*/
+expert_sft_datasets_*/
+hf_cache/
+hf_external_sources_*/
+task_classifier_ckpt/
+train_log/
+wandb/
