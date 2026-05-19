@@ -1,18 +1,17 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-
-from calendar import EPOCH
-import os
 import json
+import os
+
 import numpy as np
+import transformers
 from datasets import Dataset, DatasetDict
+from sklearn.metrics import accuracy_score, f1_score
 from transformers import (
-    AutoTokenizer,
     AutoModelForSequenceClassification,
+    AutoTokenizer,
     Trainer,
     TrainingArguments,
 )
-from sklearn.metrics import accuracy_score, f1_score
 
 DATA_DIR = "datasets_classifier"
 MODEL_NAME = "prajjwal1/bert-tiny"
@@ -21,6 +20,8 @@ OUT_DIR = "task_classifier_ckpt"
 # ------------------------------------------------
 # Load jsonl files
 # ------------------------------------------------
+
+
 def load_split(split):
     texts, labels = [], []
     label_map = {}
@@ -52,19 +53,21 @@ print("Label map:", label_map)
 # Build HF Dataset
 # ------------------------------------------------
 dataset = DatasetDict({
-    "train": Dataset.from_dict({"text": train_texts, "label": train_labels}), ###原本是text
+    "train": Dataset.from_dict({"text": train_texts, "label": train_labels}),  # 原本是text
     "validation": Dataset.from_dict({"text": val_texts, "label": val_labels}),
 })
 
 tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
 
+
 def tokenize(batch):
     return tokenizer(
-        batch["text"], ###原本是text
+        batch["text"],  # 原本是text
         truncation=True,
         padding="max_length",
         max_length=512,
     )
+
 
 dataset = dataset.map(tokenize, batched=True)
 dataset.set_format("torch", columns=["input_ids", "attention_mask", "label"])
@@ -82,6 +85,7 @@ model = AutoModelForSequenceClassification.from_pretrained(
 # ------------------------------------------------
 # Metrics
 # ------------------------------------------------
+
 def compute_metrics(eval_pred):
     logits, labels = eval_pred
     preds = np.argmax(logits, axis=-1)
@@ -90,10 +94,7 @@ def compute_metrics(eval_pred):
         "macro_f1": f1_score(labels, preds, average="macro"),
     }
 
-# ------------------------------------------------
-# Training
-# ------------------------------------------------
-import transformers
+
 print("transformers version:", transformers.__version__)
 
 common_kwargs = dict(
