@@ -338,8 +338,27 @@ def main():
     parser.add_argument("--train_samples", type=int, default=500)
     parser.add_argument("--val_samples", type=int, default=250)
     parser.add_argument("--seed", type=int, default=520)
+    parser.add_argument(
+        "--exclude_task_names",
+        type=str,
+        default="",
+        help="Comma-separated task names to omit from DATASET_CONFIGS.",
+    )
     parser.add_argument("--overwrite", action="store_true")
     args = parser.parse_args()
+    excluded_task_names = {
+        name.strip() for name in args.exclude_task_names.split(",") if name.strip()
+    }
+    selected_dataset_configs = [
+        (task, config_path)
+        for task, config_path in DATASET_CONFIGS
+        if task not in excluded_task_names
+    ]
+    unknown_exclusions = sorted(
+        excluded_task_names - {task for task, _config_path in DATASET_CONFIGS}
+    )
+    if unknown_exclusions:
+        raise ValueError(f"Unknown excluded task names: {unknown_exclusions}")
 
     if os.path.exists(args.output_root):
         if not args.overwrite:
@@ -355,10 +374,11 @@ def main():
         "note": (
             "Rows are sampled from dataset.train exposed by the OpenCompass config path."
         ),
+        "excluded_task_names": sorted(excluded_task_names),
         "tasks": {},
     }
 
-    for task_idx, (task, config_path) in enumerate(DATASET_CONFIGS):
+    for task_idx, (task, config_path) in enumerate(selected_dataset_configs):
         result = build_task(
             task=task,
             config_path=config_path,

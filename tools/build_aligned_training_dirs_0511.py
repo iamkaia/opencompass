@@ -124,6 +124,7 @@ def classifier_row(row: Dict) -> Dict:
         "_sample_id": row["_sample_id"],
         "target": row["target"],
         "text": row["text"],
+        "source_text": row["text"],
         "label": row["label"],
     }
 
