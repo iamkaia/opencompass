@@ -10,16 +10,14 @@ try:
 except Exception:
     tqdm = None
 
-from train_joint_answer_supervision_router import (
+from router_answer_supervision_core import (
     Collator,
     JointAnswerSupervisionRouterModel,
     build_lm_batch,
     build_dataset,
-    compute_option_nll_proxy_scores,
     discover_expert_names,
     save_json,
 )
-from opencompass.models.router_moe_shared import NULL_EXPERT_ID, set_all_experts
 
 
 def parse_csv_arg(raw: Optional[str]) -> Optional[List[str]]:
@@ -54,32 +52,6 @@ def save_chunk(items: List[Dict], split_dir: str, chunk_idx: int, manifest_files
     manifest_files.append(filename)
 
 
-def build_option_stats(option_probs: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
-    if option_probs is None:
-        return None
-    probs = option_probs.to(torch.float32)
-    if probs.dim() != 2 or probs.size(-1) <= 0:
-        return None
-    sorted_probs = probs.sort(dim=-1, descending=True).values
-    max_prob = sorted_probs[:, 0]
-    second_prob = sorted_probs[:, 1] if sorted_probs.size(-1) > 1 else torch.zeros_like(max_prob)
-    margin = max_prob - second_prob
-    entropy = -(probs.clamp_min(1e-8) * probs.clamp_min(1e-8).log()).sum(dim=-1)
-    num_options = torch.full_like(max_prob, float(probs.size(-1)))
-    return torch.stack([max_prob, entropy, margin, num_options], dim=-1)
-
-
-def build_single_option_stats(option_probs: torch.Tensor) -> torch.Tensor:
-    probs = option_probs.to(torch.float32).view(-1)
-    sorted_probs = probs.sort(descending=True).values
-    max_prob = sorted_probs[0]
-    second_prob = sorted_probs[1] if sorted_probs.numel() > 1 else torch.zeros_like(max_prob)
-    margin = max_prob - second_prob
-    entropy = -(probs.clamp_min(1e-8) * probs.clamp_min(1e-8).log()).sum()
-    num_options = torch.tensor(float(probs.numel()), dtype=torch.float32, device=probs.device)
-    return torch.stack([max_prob, entropy, margin, num_options], dim=0)
-
-
 ###建datasets的cache
 def process_split(
     model: JointAnswerSupervisionRouterModel,
@@ -96,12 +68,13 @@ def process_split(
     seed: int,
     num_workers: int,
     chunk_size: int,
-    compute_base_option_features: bool,
+    feature_contract: Dict,
 ):
     dataset, task_names = build_dataset(
         data_root=data_root,
         split=split,
         requested_tasks=requested_tasks,
+        expert_names=model.expert_names,
         max_samples=max_samples,
         seed=seed,
     )
@@ -176,42 +149,6 @@ def process_split(
                 input_ids=prompt_input_ids,
                 attention_mask=prompt_attention_mask,
             )
-            base_option_probs = None
-            base_option_stats = None
-            if compute_base_option_features:
-                try:
-                    set_all_experts(model.model, NULL_EXPERT_ID)
-                    base_logits = model.model(
-                        input_ids=prompt_input_ids,
-                        attention_mask=prompt_attention_mask,
-                        use_cache=False,
-                    ).logits
-                    _, _, base_option_probs = compute_option_nll_proxy_scores(
-                        logits=base_logits,
-                        prompt_attention_mask=prompt_attention_mask,
-                        targets=batch.targets,
-                        task_names=batch.task_names,
-                        tokenizer=llm_tokenizer,
-                        debug_prefix="base",
-                    )
-                    base_option_stats = torch.stack(
-                        [build_single_option_stats(probs.to(device=device)) for probs in base_option_probs],
-                        dim=0,
-                    )
-                    max_num_options = max(int(probs.numel()) for probs in base_option_probs)
-                    padded_base_option_probs = torch.zeros(
-                        len(base_option_probs),
-                        max_num_options,
-                        dtype=torch.float32,
-                        device=device,
-                    )
-                    for option_idx, probs in enumerate(base_option_probs):
-                        padded_base_option_probs[option_idx, : probs.numel()] = probs.to(device=device, dtype=torch.float32)
-                    base_option_probs = padded_base_option_probs
-                except Exception as exc:
-                    print(f"[WARN] failed to compute base option features for split={split} batch={batch_idx}: {exc}", flush=True)
-                    base_option_probs = None
-                    base_option_stats = None
             loss_matrix = model.score_all_route_pairs(
                 prompt_input_ids=prompt_input_ids,
                 prompt_attention_mask=prompt_attention_mask,
@@ -225,7 +162,6 @@ def process_split(
                 score_mode=score_mode,
             )
             correct_matrix = getattr(model, "last_route_correct_matrix", None)
-            option_prob_matrices = getattr(model, "last_route_option_prob_matrices", None)
             prediction_matrices = getattr(model, "last_route_prediction_matrices", None)
 
         flat_loss = loss_matrix.view(loss_matrix.size(0), -1)
@@ -233,6 +169,7 @@ def process_split(
         best_first = best_pair // num_tasks
         best_mid = best_pair % num_tasks
 
+        ####為甚麼都要給cpu?
         first_vec_cpu = first_vec.to(dtype=torch.float16).cpu()
         mid_vec_cpu = mid_vec.to(dtype=torch.float16).cpu()
         loss_matrix_cpu = loss_matrix.to(dtype=torch.float32).cpu()
@@ -245,14 +182,19 @@ def process_split(
         best_first_cpu = best_first.cpu()
         best_mid_cpu = best_mid.cpu()
         task_ids_cpu = batch.task_ids.cpu()
-        base_option_probs_cpu = base_option_probs.to(dtype=torch.float32).cpu() if base_option_probs is not None else None
-        base_option_stats_cpu = base_option_stats.to(dtype=torch.float32).cpu() if base_option_stats is not None else None
 
         for idx in range(len(batch.texts)):
+            prompt_text = batch.texts[idx]
             chunk_items.append(
                 {
-                    "text": batch.source_texts[idx],
-                    "prompt_text": batch.texts[idx],
+                    # Cache the same canonical prompt for both legacy `text`
+                    # readers and newer `prompt_text` readers so cached BERT
+                    # inputs and cached LLM prompt vectors are guaranteed to
+                    # refer to the same string.
+                    "text": prompt_text,
+                    "source_text": prompt_text,
+                    "prompt_text": prompt_text,
+                    "original_source_text": batch.source_texts[idx],
                     "target": batch.targets[idx],
                     "task": batch.task_names[idx],
                     "task_id": int(task_ids_cpu[idx].item()),
@@ -260,24 +202,9 @@ def process_split(
                     "mid_vec": mid_vec_cpu[idx].clone(),
                     "loss_matrix": loss_matrix_cpu[idx].clone(),
                     "correct_matrix": correct_matrix_cpu[idx].clone(),
-                    "option_prob_matrix": (
-                        option_prob_matrices[idx].to(dtype=torch.float32).cpu().clone()
-                        if option_prob_matrices is not None and option_prob_matrices[idx] is not None
-                        else None
-                    ),
                     "prediction_matrix": (
                         prediction_matrices[idx]
                         if prediction_matrices is not None
-                        else None
-                    ),
-                    "base_option_probs": (
-                        base_option_probs_cpu[idx].clone()
-                        if base_option_probs_cpu is not None
-                        else None
-                    ),
-                    "base_option_stats": (
-                        base_option_stats_cpu[idx].clone()
-                        if base_option_stats_cpu is not None
                         else None
                     ),
                     "pair_label": int(best_pair_cpu[idx].item()),
@@ -335,11 +262,11 @@ def process_split(
             "num_tasks": len(model.expert_names),
             "supervision_type": "cached_loss_matrix",
             "has_correct_matrix": True,
-            "has_option_prob_matrix": True,
+            "has_option_prob_matrix": False,
             "has_prediction_matrix": True,
-            "has_base_option_features": bool(compute_base_option_features),
             "score_mode": str(score_mode),
-            "sst2_option_labels": os.environ.get("ROUTER_SST2_OPTION_LABELS", "numeric"),
+            "sst2_option_labels": "words",
+            **feature_contract,
         },
         os.path.join(split_dir, "manifest.json"),
     )
@@ -373,44 +300,30 @@ def main():
         "--score_mode",
         type=str,
         default="official_eval_aligned_generation",
-        choices=["official_eval_aligned_generation", "official_generation_only", "token_nll"],
+        choices=["official_eval_aligned_generation", "official_generation_only"],
     )
-    parser.add_argument(
-        "--sst2_option_labels",
-        type=str,
-        default="numeric",
-        choices=["numeric", "words"],
-        help="For SST2 option-proxy scoring, compare next-token probability of 0/1 or negative/positive.",
-    )
+    ####--add_eos_to_target又是甚麼意思? Ans. 就是label後面要不要加eos, 但現在好像沒有直接針對label的算score的方法，所以你可以等一下再看看
     parser.add_argument("--add_eos_to_target", action="store_true")
     parser.add_argument("--num_workers", type=int, default=0)
+    ###chunk_size是甚麼意思?Ans. .pt cache 檔大約放多少筆 sample。
+
     parser.add_argument("--chunk_size", type=int, default=2048)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument(
-        "--compute_base_option_features",
-        action="store_true",
-        help="Also compute optional base-model option-probability features for MCQ-style tasks.",
-    )
-
+    ####有的時候不會所有expert都掛上去這樣可以嗎?
     parser.add_argument("--lora_iwslt", type=str, default='./saves/llama2-7b-chat-hf/lora/sft_iwslt')
     parser.add_argument("--lora_medmcqa", type=str, default='./saves/llama2-7b-chat-hf/lora/sft_medmcqa')
     parser.add_argument("--lora_race", type=str, default='./saves/llama2-7b-chat-hf/lora/sft_race')
     parser.add_argument("--lora_squad2", type=str, default='./saves/llama2-7b-chat-hf/lora/sft_squad20')
     parser.add_argument("--lora_sst2", type=str, default='./saves/llama2-7b-chat-hf/lora/sft_sst2')
-    #parser.add_argument("--lora_piqa", type=str, default=None)
-    #parser.add_argument("--lora_copa", type=str, default=None)
-    #parser.add_argument("--lora_hellaswag", type=str, default=None)
-    #parser.add_argument("--lora_boolq", type=str, default=None)
-    #parser.add_argument("--lora_siqa", type=str, default=None)
     args = parser.parse_args()
 
     os.makedirs(args.feature_root, exist_ok=True)
-    os.environ["ROUTER_SST2_OPTION_LABELS"] = str(args.sst2_option_labels)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"[INFO] device={device}")
-    print(f"[INFO] sst2_option_labels={args.sst2_option_labels}")
 
+    ###這次要拿哪些 tasks
     requested_tasks = parse_csv_arg(args.task_names)
+    ###這次要拿哪些 expert
     requested_experts = parse_csv_arg(args.expert_names)
     all_lora_paths = {
         "iwslt2017": args.lora_iwslt,
@@ -436,7 +349,6 @@ def main():
     5. 建 BERT
     6. 建 router_first/router_mid/pair_classifier
     '''
-
     model = JointAnswerSupervisionRouterModel(
         base_model_path=args.base_model_path,
         router_bert_init=args.router_bert_init,
@@ -452,6 +364,14 @@ def main():
         router_pooling_last_k=args.router_pooling_last_k,
     ).to(device)
     model.eval()
+    feature_contract = {
+        "feature_contract_version": 1,
+        "first_layer_idx": int(args.first_layer_idx),
+        "middle_layer_idx": int(args.middle_layer_idx),
+        "router_pooling": str(args.router_pooling),
+        "router_pooling_last_k": int(args.router_pooling_last_k),
+        "llama_hidden_size": int(model.model.config.hidden_size),
+    }
 
     save_json(
         {
@@ -466,10 +386,11 @@ def main():
             "middle_layer_idx": args.middle_layer_idx,
             "router_pooling": args.router_pooling,
             "router_pooling_last_k": args.router_pooling_last_k,
+            "llama_hidden_size": int(model.model.config.hidden_size),
+            "feature_contract_version": 1,
             "dtype": args.dtype,
             "score_mode": str(args.score_mode),
-            "sst2_option_labels": str(args.sst2_option_labels),
-            "compute_base_option_features": bool(args.compute_base_option_features),
+            "sst2_option_labels": "words",
             "chunk_size": args.chunk_size,
             "seed": args.seed,
         },
@@ -491,7 +412,7 @@ def main():
         seed=args.seed,
         num_workers=args.num_workers,
         chunk_size=args.chunk_size,
-        compute_base_option_features=args.compute_base_option_features,
+        feature_contract=feature_contract,
     )
     process_split(
         model=model,
@@ -508,7 +429,7 @@ def main():
         seed=args.seed,
         num_workers=args.num_workers,
         chunk_size=args.chunk_size,
-        compute_base_option_features=args.compute_base_option_features,
+        feature_contract=feature_contract,
     )
     print("[DONE] cached dataset build finished")
 

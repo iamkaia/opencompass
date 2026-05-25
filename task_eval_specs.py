@@ -48,6 +48,56 @@ def normalize_boolq_label(text: str) -> str:
     return value.upper()[:1]
 
 
+def normalize_rte_label(text: str) -> str:
+    value = str(text).strip().lower()
+    if value in {"a", "yes", "true", "1", "entailment", "entailed"}:
+        return "A"
+    if value in {"b", "no", "false", "0", "not_entailment", "not entailment", "not-entailed"}:
+        return "B"
+    return value.upper()[:1]
+
+
+def normalize_option_label(text: str, options: str) -> str:
+    value = str(text).strip().upper()
+    if value and value[0] in set(options):
+        return value[0]
+    return value[:1]
+
+
+def router_option_labels(task_name: str) -> Optional[List[str]]:
+    task_name = str(task_name).lower()
+    if task_name in {"race", "medmcqa", "hellaswag"}:
+        return ["A", "B", "C", "D"]
+    if task_name in {"piqa", "copa", "boolq", "rte"}:
+        return ["A", "B"]
+    if task_name == "siqa":
+        return ["A", "B", "C"]
+    if task_name == "sst2":
+        return ["negative", "positive"]
+    return None
+
+
+def normalize_router_option_label(task_name: str, target: str) -> str:
+    task_name = str(task_name).lower()
+    if task_name == "sst2":
+        value = str(target).strip().lower()
+        if value in {"1", "positive", "pos", "true"}:
+            return "positive"
+        elif value in {"0", "negative", "neg", "false"}:
+            return "negative"
+        else:
+            normalized = normalize_sst2_label(target)
+            return {"0": "negative", "1": "positive"}.get(normalized, normalized)
+    if task_name == "boolq":
+        return normalize_boolq_label(target)
+    if task_name == "rte":
+        return normalize_rte_label(target)
+    labels = router_option_labels(task_name)
+    if labels:
+        return normalize_option_label(target, "".join(labels))
+    return str(target).strip()
+
+
 def parse_squad_references(target: str) -> List[str]:
     raw = target
     if isinstance(raw, (list, tuple)):
@@ -134,6 +184,10 @@ def build_race_score_kwargs(source_text: str, _target: str) -> Dict[str, Any]:
     return {"origin_prompt": [str(source_text or "")]}
 
 
+def build_origin_prompt_score_kwargs(source_text: str, _target: str) -> Dict[str, Any]:
+    return {"origin_prompt": [str(source_text or "")]}
+
+
 def resolve_postprocessor(proc_spec: Dict[str, Any]):
     kwargs = dict(proc_spec)
     proc = kwargs.pop("type")
@@ -164,8 +218,21 @@ TASK_EVAL_SPECS: Dict[str, TaskEvalSpec] = {
     ),
     "hellaswag": TaskEvalSpec(
         score_family="accuracy",
-        evaluator_key="acc",
+        evaluator_key="acc_with_details",
         pred_postprocessor={"type": first_option_postprocess, "options": "ABCD"},
+        extra_score_kwargs_builder=build_origin_prompt_score_kwargs,
+    ),
+    "commonsenseqa": TaskEvalSpec(
+        score_family="accuracy",
+        evaluator_key="acc",
+        pred_postprocessor={"type": first_option_postprocess, "options": "ABCDE"},
+        reference_adapter=lambda _source, target: normalize_option_label(target, "ABCDE"),
+    ),
+    "commonsense_qa": TaskEvalSpec(
+        score_family="accuracy",
+        evaluator_key="acc",
+        pred_postprocessor={"type": first_option_postprocess, "options": "ABCDE"},
+        reference_adapter=lambda _source, target: normalize_option_label(target, "ABCDE"),
     ),
     "piqa": TaskEvalSpec(
         score_family="accuracy",
@@ -185,7 +252,20 @@ TASK_EVAL_SPECS: Dict[str, TaskEvalSpec] = {
     "boolq": TaskEvalSpec(
         score_family="accuracy",
         evaluator_key="acc",
-        pred_postprocessor={"type": first_capital_postprocess},
+        pred_postprocessor={"type": first_option_postprocess, "options": "AB"},
+        reference_adapter=lambda _source, target: normalize_boolq_label(target),
+    ),
+    "rte": TaskEvalSpec(
+        score_family="accuracy",
+        evaluator_key="acc",
+        pred_postprocessor={"type": first_option_postprocess, "options": "AB"},
+        reference_adapter=lambda _source, target: normalize_rte_label(target),
+    ),
+    "RTE": TaskEvalSpec(
+        score_family="accuracy",
+        evaluator_key="acc",
+        pred_postprocessor={"type": first_option_postprocess, "options": "AB"},
+        reference_adapter=lambda _source, target: normalize_rte_label(target),
     ),
     "siqa": TaskEvalSpec(
         score_family="accuracy",

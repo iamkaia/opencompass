@@ -12,7 +12,9 @@ from torch.utils.data import DataLoader, Dataset
 from transformers import AutoTokenizer, get_linear_schedule_with_warmup
 
 from opencompass.models.router_moe_components import BertExternalEncoder, CompactRouterFeatureEncoder
+from task_eval_specs import normalize_router_option_label, router_option_labels
 from router_pair_common import (
+    add_joint_loss_arguments,
     build_oracle_debug_summary,
     build_routing_summary,
     compute_pair_losses,
@@ -20,9 +22,18 @@ from router_pair_common import (
     compute_routing_accuracy_stats,
     flatten_routing_summary,
     init_oracle_debug_accumulator,
+    normalize_pair_loss_matrix,
     print_oracle_debug_summary,
     print_routing_summary,
     update_oracle_debug_accumulator,
+)
+
+FEATURE_CONTRACT_KEYS = (
+    "first_layer_idx",
+    "middle_layer_idx",
+    "router_pooling",
+    "router_pooling_last_k",
+    "llama_hidden_size",
 )
 
 
@@ -61,41 +72,119 @@ def parse_float_list(raw: Optional[str], default: Sequence[float]) -> List[float
     return [float(value) for value in default]
 
 
+def parse_feature_roots(feature_root: Optional[str], feature_roots: Optional[str]) -> List[str]:
+    if feature_roots:
+        roots = [part.strip() for part in feature_roots.split(",") if part.strip()]
+    elif feature_root:
+        roots = [str(feature_root)]
+    else:
+        roots = []
+    if not roots:
+        raise ValueError("Set --feature_root or --feature_roots")
+    return roots
+
+
 def metric_float_tag(value: float) -> str:
     return str(float(value)).replace("-", "m").replace(".", "p")
 
 
-def task_option_labels(task_name: str) -> Optional[List[str]]:
-    task_name = str(task_name)
-    if task_name in {"race", "medmcqa", "hellaswag"}:
-        return ["A", "B", "C", "D"]
-    if task_name in {"piqa", "copa", "boolq"}:
-        return ["A", "B"]
-    if task_name == "siqa":
-        return ["A", "B", "C"]
-    if task_name == "sst2":
-        if os.environ.get("ROUTER_SST2_OPTION_LABELS", "numeric") == "words":
-            return ["negative", "positive"]
-        return ["0", "1"]
+def build_router_target_distribution(
+    *,
+    pair_logits: torch.Tensor,
+    loss_matrix: torch.Tensor,
+    correct_matrix: torch.Tensor,
+    task_ids: torch.Tensor,
+    joint_loss: str,
+    loss_normalization: str,
+    correct_soft_ce_temperature: float,
+    self_preserve_weight: float,
+) -> Optional[torch.Tensor]:
+    num_tasks = loss_matrix.size(2)
+    flat_correct = correct_matrix.to(device=pair_logits.device, dtype=torch.float32).view(loss_matrix.size(0), -1)
+    correct_counts = flat_correct.sum(dim=-1, keepdim=True)
+    correct_available = correct_counts > 0
+    zero_target = torch.zeros_like(flat_correct)
+
+    if str(joint_loss) == "correct_soft_ce":
+        target = torch.where(
+            correct_available,
+            flat_correct / correct_counts.clamp_min(1.0),
+            zero_target,
+        )
+        return target.view(loss_matrix.size(0), num_tasks, num_tasks)
+
+    if str(joint_loss) in {"correct_conf_ce", "correct_conf_ce_plus_margin", "self_preserving_correct_conf_ce"}:
+        normalized_loss_matrix = normalize_pair_loss_matrix(
+            loss_matrix=loss_matrix,
+            method=loss_normalization,
+        )
+        normalized_flat_loss = normalized_loss_matrix.view(normalized_loss_matrix.size(0), -1)
+        temperature = max(float(correct_soft_ce_temperature), 1e-6)
+        correct_conf_logits = -normalized_flat_loss / temperature
+        correct_conf_logits = correct_conf_logits.masked_fill(flat_correct <= 0, -1e9)
+        correct_conf_target = torch.softmax(correct_conf_logits, dim=-1)
+        correct_conf_target = torch.where(
+            correct_available,
+            correct_conf_target,
+            zero_target,
+        )
+        if str(joint_loss) != "self_preserving_correct_conf_ce":
+            return correct_conf_target.view(loss_matrix.size(0), num_tasks, num_tasks)
+
+        preserve_weight = min(max(float(self_preserve_weight), 0.0), 1.0)
+        task_ids_device = task_ids.to(device=pair_logits.device, dtype=torch.long)
+        valid_self_task = (task_ids_device >= 0) & (task_ids_device < num_tasks)
+        self_pair_ids = task_ids_device.clamp(min=0, max=max(num_tasks - 1, 0)) * num_tasks + task_ids_device.clamp(
+            min=0, max=max(num_tasks - 1, 0)
+        )
+        self_correct = torch.zeros(loss_matrix.size(0), dtype=torch.bool, device=pair_logits.device)
+        self_correct[valid_self_task] = flat_correct.bool().gather(
+            1, self_pair_ids.unsqueeze(1)
+        ).squeeze(1)[valid_self_task]
+        self_target = torch.zeros_like(correct_conf_target)
+        self_target.scatter_(1, self_pair_ids.unsqueeze(1), 1.0)
+        soft_self_target = preserve_weight * self_target + (1.0 - preserve_weight) * correct_conf_target
+        self_preserving_target = torch.where(
+            (valid_self_task & self_correct).unsqueeze(1),
+            soft_self_target,
+            correct_conf_target,
+        )
+        return self_preserving_target.view(loss_matrix.size(0), num_tasks, num_tasks)
+
     return None
 
 
+def load_cache_feature_contract(root: str, manifest: Dict) -> Dict:
+    config_path = os.path.join(root, "cache_config.json")
+    cache_config = {}
+    if os.path.exists(config_path):
+        with open(config_path, "r", encoding="utf-8") as f:
+            cache_config = json.load(f)
+    contract = {
+        key: manifest.get(key, cache_config.get(key))
+        for key in FEATURE_CONTRACT_KEYS
+    }
+    missing = [key for key, value in contract.items() if value is None and key != "llama_hidden_size"]
+    if missing:
+        raise ValueError(
+            f"Missing cached feature contract fields {missing} under {root}. "
+            "Rebuild this cache with build_cached_router_pair_dataset.py."
+        )
+    contract["first_layer_idx"] = int(contract["first_layer_idx"])
+    contract["middle_layer_idx"] = int(contract["middle_layer_idx"])
+    contract["router_pooling"] = str(contract["router_pooling"])
+    contract["router_pooling_last_k"] = int(contract["router_pooling_last_k"])
+    if contract["llama_hidden_size"] is not None:
+        contract["llama_hidden_size"] = int(contract["llama_hidden_size"])
+    return contract
+
+
+def task_option_labels(task_name: str) -> Optional[List[str]]:
+    return router_option_labels(task_name)
+
+
 def normalize_task_label(task_name: str, target: str) -> str:
-    task_name = str(task_name)
-    target_text = str(target).strip()
-    lower = target_text.lower()
-    if task_name == "sst2":
-        use_words = os.environ.get("ROUTER_SST2_OPTION_LABELS", "numeric") == "words"
-        if lower in {"1", "positive", "pos", "true"}:
-            return "positive" if use_words else "1"
-        if lower in {"0", "negative", "neg", "false"}:
-            return "negative" if use_words else "0"
-    if task_name == "boolq":
-        if lower in {"yes", "true", "1", "a"}:
-            return "A"
-        if lower in {"no", "false", "0", "b"}:
-            return "B"
-    return target_text.upper()[:1]
+    return normalize_router_option_label(task_name, target)
 
 
 def batch_gold_option_indices(tasks: Sequence[str], targets: Sequence[str], device) -> tuple[torch.Tensor, torch.Tensor]:
@@ -122,22 +211,58 @@ def batch_gold_option_indices(tasks: Sequence[str], targets: Sequence[str], devi
 class CachedLossMatrixDataset(Dataset):
     def __init__(
         self,
-        feature_root: str,
+        feature_root: str | Sequence[str],
         split: str,
         selected_sample_task_names: Optional[Sequence[str]] = None,
         selected_expert_names: Optional[Sequence[str]] = None,
     ):
-        split_dir = os.path.join(feature_root, split)
-        manifest_path = os.path.join(split_dir, "manifest.json")
-        with open(manifest_path, "r", encoding="utf-8") as f:
-            manifest = json.load(f)
+        feature_roots = [feature_root] if isinstance(feature_root, str) else [str(root) for root in feature_root]
+        manifests = []
+        source_sample_task_names = []
+        source_expert_names = None
+        expected_manifest_fields = None
+        expected_feature_contract = None
+        for root in feature_roots:
+            split_dir = os.path.join(root, split)
+            manifest_path = os.path.join(split_dir, "manifest.json")
+            with open(manifest_path, "r", encoding="utf-8") as f:
+                manifest = json.load(f)
+            current_expert_names = list(manifest.get("expert_names") or manifest.get("task_names") or [])
+            if not current_expert_names:
+                raise ValueError(f"Missing expert_names in {manifest_path}")
+            if source_expert_names is None:
+                source_expert_names = current_expert_names
+            elif current_expert_names != source_expert_names:
+                raise ValueError(
+                    f"Incompatible expert_names across cache roots: {manifest_path} has {current_expert_names}, "
+                    f"expected {source_expert_names}"
+                )
+            current_fields = {
+                key: manifest.get(key)
+                for key in ("score_mode", "option_prob_normalization", "sst2_option_labels")
+            }
+            if expected_manifest_fields is None:
+                expected_manifest_fields = current_fields
+            elif current_fields != expected_manifest_fields:
+                raise ValueError(
+                    f"Incompatible scoring fields across cache roots: {manifest_path} has {current_fields}, "
+                    f"expected {expected_manifest_fields}"
+                )
+            current_feature_contract = load_cache_feature_contract(root, manifest)
+            if expected_feature_contract is None:
+                expected_feature_contract = current_feature_contract
+            elif current_feature_contract != expected_feature_contract:
+                raise ValueError(
+                    f"Incompatible feature contract across cache roots: {manifest_path} has "
+                    f"{current_feature_contract}, expected {expected_feature_contract}"
+                )
+            for name in manifest.get("task_names") or []:
+                if name not in source_sample_task_names:
+                    source_sample_task_names.append(name)
+            manifests.append((root, manifest))
 
-        source_sample_task_names = list(manifest.get("task_names") or [])
-        source_expert_names = list(manifest.get("expert_names") or source_sample_task_names)
         if not source_sample_task_names:
-            raise ValueError(f"Missing task_names/expert_names in {manifest_path}")
-        if not source_expert_names:
-            raise ValueError(f"Missing expert_names in {manifest_path}")
+            raise ValueError(f"Missing task_names in cache roots: {feature_roots}")
 
         if selected_sample_task_names:
             resolved_sample_task_names = [str(name) for name in selected_sample_task_names]
@@ -166,56 +291,59 @@ class CachedLossMatrixDataset(Dataset):
         expert2id = {name: idx for idx, name in enumerate(resolved_expert_names)}
 
         self.items = []
-        for fn in manifest["files"]:
-            payload = torch.load(os.path.join(split_dir, fn), map_location="cpu")
-            for item in payload["items"]:
-                task_name = str(item["task"])
-                if task_name not in resolved_sample_task_names:
-                    continue
+        for root, manifest in manifests:
+            split_dir = os.path.join(root, split)
+            for fn in manifest["files"]:
+                payload = torch.load(os.path.join(split_dir, fn), map_location="cpu")
+                for item in payload["items"]:
+                    task_name = str(item["task"])
+                    if task_name not in resolved_sample_task_names:
+                        continue
 
-                loss_matrix = item["loss_matrix"]
-                sliced_loss_matrix = loss_matrix.index_select(0, torch.tensor(selected_expert_indices)).index_select(
-                    1, torch.tensor(selected_expert_indices)
-                )
-                correct_matrix = item.get("correct_matrix")
-                has_correct_matrix = correct_matrix is not None
-                if has_correct_matrix:
-                    sliced_correct_matrix = correct_matrix.index_select(
-                        0, torch.tensor(selected_expert_indices)
-                    ).index_select(1, torch.tensor(selected_expert_indices))
-                else:
-                    sliced_correct_matrix = torch.zeros_like(sliced_loss_matrix, dtype=torch.bool)
-                flat_loss = sliced_loss_matrix.view(-1)
-                best_pair = int(flat_loss.argmin().item())
-                num_tasks = len(resolved_expert_names)
-                best_first = best_pair // num_tasks
-                best_mid = best_pair % num_tasks
-                remapped = dict(item)
-                ####把 sample 的 task name 對應到 expert id。
-                remapped["task_id"] = int(expert2id.get(task_name, -1))
-                remapped["loss_matrix"] = sliced_loss_matrix
-                remapped["correct_matrix"] = sliced_correct_matrix.to(torch.bool)
-                remapped["base_option_stats"] = item.get("base_option_stats")
-                option_prob_matrix = item.get("option_prob_matrix")
-                if option_prob_matrix is not None:
-                    remapped["option_prob_matrix"] = option_prob_matrix.index_select(
-                        0, torch.tensor(selected_expert_indices)
-                    ).index_select(1, torch.tensor(selected_expert_indices))
-                else:
-                    remapped["option_prob_matrix"] = None
-                remapped["has_correct_matrix"] = bool(has_correct_matrix)
-                remapped["pair_label"] = best_pair
-                remapped["first_label"] = best_first
-                remapped["mid_label"] = best_mid
-                remapped["item_id"] = f"{split}:{len(self.items):08d}"
-                self.items.append(remapped)
+                    loss_matrix = item["loss_matrix"]
+                    sliced_loss_matrix = loss_matrix.index_select(0, torch.tensor(selected_expert_indices)).index_select(
+                        1, torch.tensor(selected_expert_indices)
+                    )
+                    correct_matrix = item.get("correct_matrix")
+                    has_correct_matrix = correct_matrix is not None
+                    if has_correct_matrix:
+                        sliced_correct_matrix = correct_matrix.index_select(
+                            0, torch.tensor(selected_expert_indices)
+                        ).index_select(1, torch.tensor(selected_expert_indices))
+                    else:
+                        sliced_correct_matrix = torch.zeros_like(sliced_loss_matrix, dtype=torch.bool)
+                    flat_loss = sliced_loss_matrix.view(-1)
+                    best_pair = int(flat_loss.argmin().item())
+                    num_tasks = len(resolved_expert_names)
+                    best_first = best_pair // num_tasks
+                    best_mid = best_pair % num_tasks
+                    remapped = dict(item)
+                    ####把 sample 的 task name 對應到 expert id。
+                    remapped["task_id"] = int(expert2id.get(task_name, -1))
+                    remapped["loss_matrix"] = sliced_loss_matrix
+                    remapped["correct_matrix"] = sliced_correct_matrix.to(torch.bool)
+                    option_prob_matrix = item.get("option_prob_matrix")
+                    if option_prob_matrix is not None:
+                        remapped["option_prob_matrix"] = option_prob_matrix.index_select(
+                            0, torch.tensor(selected_expert_indices)
+                        ).index_select(1, torch.tensor(selected_expert_indices))
+                    else:
+                        remapped["option_prob_matrix"] = None
+                    remapped["has_correct_matrix"] = bool(has_correct_matrix)
+                    remapped["pair_label"] = best_pair
+                    remapped["first_label"] = best_first
+                    remapped["mid_label"] = best_mid
+                    remapped["item_id"] = f"{os.path.basename(root)}:{split}:{len(self.items):08d}"
+                    self.items.append(remapped)
         if not self.items:
-            raise ValueError(f"No items loaded from {split_dir}")
+            raise ValueError(f"No items loaded from cache roots: {feature_roots}")
         self.sample_task_names = resolved_sample_task_names
         self.expert_names = resolved_expert_names
         self.task_names = resolved_expert_names
         self.source_sample_task_names = source_sample_task_names
         self.source_expert_names = source_expert_names
+        self.feature_roots = feature_roots
+        self.feature_contract = expected_feature_contract
 
     def __len__(self):
         return len(self.items)
@@ -234,7 +362,7 @@ class CachedLossMatrixDataset(Dataset):
             "loss_matrix": item["loss_matrix"],
             "correct_matrix": item["correct_matrix"],
             "option_prob_matrix": item.get("option_prob_matrix"),
-            "base_option_stats": item.get("base_option_stats"),
+            "prediction_matrix": item.get("prediction_matrix"),
             "has_correct_matrix": bool(item.get("has_correct_matrix", False)),
             "pair_label": int(item["pair_label"]),
             "first_label": int(item["first_label"]),
@@ -255,8 +383,7 @@ class Batch:
     loss_matrix: torch.Tensor
     correct_matrix: torch.Tensor
     option_prob_matrix: torch.Tensor
-    sample_features: torch.Tensor
-    sample_feature_available: torch.Tensor
+    prediction_matrices: List[Optional[List[List[str]]]]
     option_prob_available: torch.Tensor
     correct_available: torch.Tensor
     pair_labels: torch.Tensor
@@ -273,8 +400,6 @@ class Collator:
                 max_num_options = max(max_num_options, int(option_prob_matrix.size(-1)))
         option_prob_tensors = []
         option_prob_available = []
-        sample_feature_tensors = []
-        sample_feature_available = []
         for item in batch:
             option_prob_matrix = item.get("option_prob_matrix")
             if option_prob_matrix is None:
@@ -291,18 +416,6 @@ class Collator:
                 padded[..., : option_prob_matrix.size(-1)] = option_prob_matrix.to(torch.float32)
                 option_prob_tensors.append(padded)
                 option_prob_available.append(True)
-            base_option_stats = item.get("base_option_stats")
-            if base_option_stats is None:
-                sample_feature_tensors.append(torch.zeros(4, dtype=torch.float32))
-                sample_feature_available.append(False)
-            else:
-                feature = base_option_stats.to(torch.float32).view(-1)
-                if feature.numel() < 4:
-                    padded_feature = torch.zeros(4, dtype=torch.float32)
-                    padded_feature[: feature.numel()] = feature
-                    feature = padded_feature
-                sample_feature_tensors.append(feature[:4])
-                sample_feature_available.append(True)
         return Batch(
             texts=[x["text"] for x in batch],
             prompt_texts=[str(x["prompt_text"]) for x in batch],
@@ -315,8 +428,7 @@ class Collator:
             loss_matrix=torch.stack([x["loss_matrix"] for x in batch], dim=0).to(torch.float32),
             correct_matrix=torch.stack([x["correct_matrix"] for x in batch], dim=0).to(torch.bool),
             option_prob_matrix=torch.stack(option_prob_tensors, dim=0).to(torch.float32),
-            sample_features=torch.stack(sample_feature_tensors, dim=0).to(torch.float32),
-            sample_feature_available=torch.tensor(sample_feature_available, dtype=torch.bool),
+            prediction_matrices=[x.get("prediction_matrix") for x in batch],
             option_prob_available=torch.tensor(option_prob_available, dtype=torch.bool),
             correct_available=torch.tensor([bool(x["has_correct_matrix"]) for x in batch], dtype=torch.bool),
             pair_labels=torch.tensor([x["pair_label"] for x in batch], dtype=torch.long),
@@ -326,21 +438,20 @@ class Collator:
 
 #### 沒有base llm
 class InternalTwoRouterCachedJointModel(nn.Module):
-    def __init__(self, bert_init: str, llama_hidden_size: int, router_dim: int, num_pairs: int, sample_feature_dim: int = 0):
+    def __init__(self, bert_init: str, llama_hidden_size: int, router_dim: int, num_pairs: int):
         super().__init__()
-        self.sample_feature_dim = int(sample_feature_dim)
         self.bert = BertExternalEncoder(bert_init)
         bert_hidden_size = self.bert.encoder.config.hidden_size
         self.router_first = CompactRouterFeatureEncoder(llama_hidden_size, bert_hidden_size, router_dim)
         self.router_mid = CompactRouterFeatureEncoder(llama_hidden_size, bert_hidden_size, router_dim)
         self.pair_classifier = nn.Sequential(
-            nn.LayerNorm(router_dim * 4 + self.sample_feature_dim),
-            nn.Linear(router_dim * 4 + self.sample_feature_dim, router_dim * 2),
+            nn.LayerNorm(router_dim * 4),
+            nn.Linear(router_dim * 4, router_dim * 2),
             nn.GELU(),
             nn.Linear(router_dim * 2, num_pairs),
         )
 
-    def forward(self, bert_input_ids, bert_attention_mask, bert_token_type_ids, first_vec, mid_vec, sample_features=None):
+    def forward(self, bert_input_ids, bert_attention_mask, bert_token_type_ids, first_vec, mid_vec):
         bert_prev, bert_last = self.bert(
             input_ids=bert_input_ids,
             attention_mask=bert_attention_mask,
@@ -349,25 +460,14 @@ class InternalTwoRouterCachedJointModel(nn.Module):
         first_feat = self.router_first(first_vec, bert_prev, bert_last, bert_attention_mask)
         mid_feat = self.router_mid(mid_vec, bert_prev, bert_last, bert_attention_mask)
         pair_input = torch.cat([first_feat, mid_feat], dim=-1)
-        if self.sample_feature_dim > 0:
-            if sample_features is None:
-                sample_features = torch.zeros(
-                    pair_input.size(0),
-                    self.sample_feature_dim,
-                    dtype=pair_input.dtype,
-                    device=pair_input.device,
-                )
-            pair_input = torch.cat([pair_input, sample_features.to(device=pair_input.device, dtype=pair_input.dtype)], dim=-1)
         pair_logits = self.pair_classifier(pair_input)
         return pair_logits
 
 
-def set_trainable(model, freeze_bert: bool = False):
+def set_trainable(model, freeze_bert: bool = True):
+    """Train router heads while keeping the shared BERT encoder fixed."""
     for p in model.parameters():
         p.requires_grad = False
-    if not freeze_bert:
-        for p in model.bert.parameters():
-            p.requires_grad = True
     for p in model.router_first.parameters():
         p.requires_grad = True
     for p in model.router_mid.parameters():
@@ -385,13 +485,33 @@ def compute_self_pair_ce(pair_logits: torch.Tensor, task_ids: torch.Tensor, num_
     return loss, self_pair
 
 
-def resolve_sample_features(batch: Batch, mode: str, device) -> Optional[torch.Tensor]:
-    mode = str(mode)
-    if mode == "none":
+def extract_pair_prediction(
+    prediction_matrix: Optional[List[List[str]]],
+    first_idx: int,
+    mid_idx: int,
+) -> Optional[str]:
+    if prediction_matrix is None:
         return None
-    if mode == "base_option_stats":
-        return batch.sample_features.to(device)
-    raise ValueError(f"Unknown sample_feature_mode: {mode}")
+    if not (0 <= int(first_idx) < len(prediction_matrix)):
+        return None
+    row = prediction_matrix[int(first_idx)]
+    if not (0 <= int(mid_idx) < len(row)):
+        return None
+    value = row[int(mid_idx)]
+    return None if value is None else str(value)
+
+
+def extract_pair_option_probs(
+    option_prob_matrix: torch.Tensor,
+    first_idx: int,
+    mid_idx: int,
+    task_name: str,
+) -> List[float]:
+    probs = option_prob_matrix[int(first_idx), int(mid_idx)].detach().cpu().to(torch.float32).tolist()
+    labels = task_option_labels(task_name)
+    if labels:
+        return [float(probs[idx]) for idx in range(min(len(labels), len(probs)))]
+    return [float(value) for value in probs]
 
 
 @torch.no_grad()
@@ -410,7 +530,7 @@ def evaluate(
     correct_soft_ce_temperature,
     self_preserve_weight,
     topk_weighted_temperatures,
-    sample_feature_mode,
+    collect_route_records: bool = False,
 ):
     model.eval()
     total_loss = 0.0
@@ -426,7 +546,7 @@ def evaluate(
 
     for batch in loader:
         bert_enc = bert_tokenizer(
-            batch.texts,
+            batch.prompt_texts,
             return_tensors="pt",
             padding=True,
             truncation=True,
@@ -444,7 +564,6 @@ def evaluate(
             bert_token_type_ids=bert_token_type_ids,
             first_vec=batch.first_vec.to(device),
             mid_vec=batch.mid_vec.to(device),
-            sample_features=resolve_sample_features(batch, sample_feature_mode, device),
         )
         oracle_loss, metrics, best_first, best_mid, flat_best = compute_pair_losses(
             pair_logits=pair_logits,
@@ -454,6 +573,21 @@ def evaluate(
             joint_loss=joint_loss,
             pseudo_ce_weight=pseudo_ce_weight,
             margin=pseudo_ce_margin,
+            loss_normalization=pair_loss_normalization,
+            correct_soft_ce_temperature=correct_soft_ce_temperature,
+            self_preserve_weight=self_preserve_weight,
+        )
+        pair_prob_matrix = torch.softmax(pair_logits, dim=-1).view(
+            batch.loss_matrix.size(0),
+            batch.loss_matrix.size(1),
+            batch.loss_matrix.size(2),
+        )
+        router_target_matrix = build_router_target_distribution(
+            pair_logits=pair_logits,
+            loss_matrix=batch.loss_matrix.to(device),
+            correct_matrix=batch.correct_matrix.to(device),
+            task_ids=batch.task_ids.to(device),
+            joint_loss=joint_loss,
             loss_normalization=pair_loss_normalization,
             correct_soft_ce_temperature=correct_soft_ce_temperature,
             self_preserve_weight=self_preserve_weight,
@@ -595,10 +729,41 @@ def evaluate(
         pred_mid_cpu = pred_mid.detach().cpu().tolist()
         best_first_cpu = best_first.detach().cpu().tolist()
         best_mid_cpu = best_mid.detach().cpu().tolist()
+        pair_prob_matrix_cpu = pair_prob_matrix.detach().cpu()
+        router_target_matrix_cpu = router_target_matrix.detach().cpu() if router_target_matrix is not None else None
         raw_flat_loss = batch.loss_matrix.view(batch.loss_matrix.size(0), -1)
         for idx, item_id in enumerate(batch.item_ids):
             pred_pair_name = f"{task_names[pred_first_cpu[idx]]}->{task_names[pred_mid_cpu[idx]]}"
             gold_pair_name = f"{task_names[best_first_cpu[idx]]}->{task_names[best_mid_cpu[idx]]}"
+            pred_answer = extract_pair_prediction(
+                batch.prediction_matrices[idx],
+                pred_first_cpu[idx],
+                pred_mid_cpu[idx],
+            )
+            gold_answer = extract_pair_prediction(
+                batch.prediction_matrices[idx],
+                best_first_cpu[idx],
+                best_mid_cpu[idx],
+            )
+            pred_option_probs = None
+            pred_option_confidence = None
+            gold_option_probs = None
+            gold_option_confidence = None
+            if bool(batch.option_prob_available[idx].item()):
+                pred_option_probs = extract_pair_option_probs(
+                    batch.option_prob_matrix[idx],
+                    pred_first_cpu[idx],
+                    pred_mid_cpu[idx],
+                    batch.tasks[idx],
+                )
+                gold_option_probs = extract_pair_option_probs(
+                    batch.option_prob_matrix[idx],
+                    best_first_cpu[idx],
+                    best_mid_cpu[idx],
+                    batch.tasks[idx],
+                )
+                pred_option_confidence = max(pred_option_probs) if pred_option_probs else None
+                gold_option_confidence = max(gold_option_probs) if gold_option_probs else None
             route_records.append(
                 {
                     "item_id": item_id,
@@ -612,8 +777,22 @@ def evaluate(
                     "gold_correct": bool(oracle_correct.detach().cpu().tolist()[idx]),
                     "any_pair_correct": bool(any_correct.detach().cpu().tolist()[idx]),
                     "correct_matrix_available": bool(batch.correct_available.detach().cpu().tolist()[idx]),
+                    "option_prob_available": bool(batch.option_prob_available[idx].item()),
                     "pred_raw_loss": float(raw_flat_loss[idx, pred_pair_cpu[idx]].item()),
                     "gold_raw_loss": float(raw_flat_loss[idx, flat_best_cpu[idx]].item()),
+                    "pred_pair_prob": float(pair_prob_matrix_cpu[idx, pred_first_cpu[idx], pred_mid_cpu[idx]].item()),
+                    "gold_pair_prob": float(pair_prob_matrix_cpu[idx, best_first_cpu[idx], best_mid_cpu[idx]].item()),
+                    "pair_prob_matrix": pair_prob_matrix_cpu[idx].tolist(),
+                    "router_target_type": str(joint_loss),
+                    "router_target_matrix": (
+                        router_target_matrix_cpu[idx].tolist() if router_target_matrix_cpu is not None else None
+                    ),
+                    "pred_answer": pred_answer,
+                    "gold_answer": gold_answer,
+                    "pred_option_probs": pred_option_probs,
+                    "gold_option_probs": gold_option_probs,
+                    "pred_option_confidence": pred_option_confidence,
+                    "gold_option_confidence": gold_option_confidence,
                     "prompt_sha1": prompt_hash(batch.prompt_texts[idx]),
                     "text": batch.texts[idx],
                     "prompt_text": batch.prompt_texts[idx],
@@ -629,7 +808,7 @@ def evaluate(
         pred_first_all, pred_mid_all, best_first_all, best_mid_all, task_ids_all, task_names
     )
     result["oracle_debug_summary"] = build_oracle_debug_summary(oracle_debug_acc)
-    result["route_records"] = route_records
+    result["route_records"] = route_records if collect_route_records else []
     return result
 
 
@@ -649,8 +828,10 @@ def save_ckpt(
     supervision_mode,
     best_metric,
     best_metric_value,
-    sample_feature_mode,
-    sample_feature_dim,
+    freeze_bert,
+    feature_contract,
+    llama_hidden_size,
+    router_dim,
 ):
     os.makedirs(out_dir, exist_ok=True)
     model.bert.encoder.save_pretrained(os.path.join(out_dir, "encoder"))
@@ -671,8 +852,16 @@ def save_ckpt(
             "num_pairs": len(expert_names) * len(expert_names),
             "router_max_len": max_bert_len,
             "router_feature_type": "cached_prompt_vectors_with_loss_matrix",
-            "sample_feature_mode": str(sample_feature_mode),
-            "sample_feature_dim": int(sample_feature_dim),
+            "sample_feature_mode": "none",
+            "sample_feature_dim": 0,
+            "freeze_bert": bool(freeze_bert),
+            "first_layer_idx": int(feature_contract["first_layer_idx"]),
+            "middle_layer_idx": int(feature_contract["middle_layer_idx"]),
+            "router_pooling": str(feature_contract["router_pooling"]),
+            "router_pooling_last_k": int(feature_contract["router_pooling_last_k"]),
+            "llama_hidden_size": int(llama_hidden_size),
+            "router_dim": int(router_dim),
+            "feature_contract_version": 1,
             "supervision_type": "cached_pair_ce_main",
             "supervision_mode": str(supervision_mode),
             "joint_loss": str(joint_loss),
@@ -689,12 +878,14 @@ def save_ckpt(
         },
         os.path.join(out_dir, "router_config.json"),
     )
-    save_json({"best_epoch": epoch, "metrics": metrics}, os.path.join(out_dir, "best_metrics.json"))
+    metrics_without_records = {key: value for key, value in metrics.items() if key != "route_records"}
+    save_json({"best_epoch": epoch, "metrics": metrics_without_records}, os.path.join(out_dir, "best_metrics.json"))
 
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--feature_root", type=str, required=True)
+    parser.add_argument("--feature_root", type=str, default=None, help="Single cached feature root.")
+    parser.add_argument("--feature_roots", type=str, default=None, help="Comma-separated cached feature roots to combine.")
     parser.add_argument("--bert_init", type=str, required=True)
     ###輸出 router checkpoint。
     parser.add_argument("--out_dir", type=str, required=True)
@@ -716,37 +907,16 @@ def main():
         "--sample_feature_mode",
         type=str,
         default="none",
-        choices=["none", "base_option_stats"],
-        help="Extra per-sample features concatenated into the pair classifier.",
-    )
-    parser.add_argument("--freeze_bert", action="store_true")
-    parser.add_argument(
-        "--joint_loss",
-        type=str,
-        default="expected_loss",
-        choices=[
-            "ce_pair",
-            "expected_loss",
-            "ce_pair_plus_expected",
-            "correct_soft_ce",
-            "correct_conf_ce",
-            "self_preserving_correct_conf_ce",
-            "correct_max_margin",
-            "correct_conf_ce_plus_margin",
-        ],
+        choices=["none"],
+        help="Compatibility argument; extra base-option sample features are no longer supported.",
     )
     parser.add_argument(
-        "--correct_soft_ce_temperature",
-        type=float,
-        default=1.0,
-        help="Temperature for correct_conf_ce. Lower values put more target mass on lower-loss correct pairs.",
+        "--freeze_bert",
+        action="store_true",
+        default=True,
+        help="Retained for command compatibility; the BERT encoder is always frozen.",
     )
-    parser.add_argument(
-        "--self_preserve_weight",
-        type=float,
-        default=1.0,
-        help="For self_preserving_correct_conf_ce: target mass reserved for a correct self pair. 1.0 keeps the old hard self-preserve behavior.",
-    )
+    add_joint_loss_arguments(parser)
     parser.add_argument(
         "--topk_weighted_temperatures",
         type=str,
@@ -765,17 +935,6 @@ def main():
         default="oracle_loss",
         choices=["oracle_loss", "self_pair_ce"],
         help="oracle_loss uses the cached loss_matrix objective; self_pair_ce trains each sample to route task->task.",
-    )
-    ####在 ce_pair_plus_expected 裡控制 expected loss 權重。
-    parser.add_argument("--pseudo_ce_weight", type=float, default=0.0)
-    ####只對 best pair 和 second best pair 差距夠大的 sample 做 hard CE。差距小代表 oracle 不明確，CE label 可能太硬。這個是用在哪個算式?
-    parser.add_argument("--pseudo_ce_margin", type=float, default=0.0)
-    ####sample_minmax 會把每筆 sample 的 loss matrix normalize 到 0~1。通常建議開，因為不同 sample 的 NLL scale 可能差很多。這個可能要看一下數學式
-    parser.add_argument(
-        "--pair_loss_normalization",
-        type=str,
-        default="sample_minmax",
-        choices=["none", "sample_minmax"],
     )
     parser.add_argument(
         "--best_metric",
@@ -838,6 +997,7 @@ def main():
     args = parser.parse_args()
 
     os.makedirs(args.out_dir, exist_ok=True)
+    feature_roots = parse_feature_roots(args.feature_root, args.feature_roots)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"[INFO] device={device}")
     wandb_run = None
@@ -859,8 +1019,8 @@ def main():
         print(f"[INFO] wandb enabled project={args.wandb_project}")
     
     ###先讀 manifest 看有哪些 task/expert。
-    probe_train_ds = CachedLossMatrixDataset(args.feature_root, "train")
-    probe_val_ds = CachedLossMatrixDataset(args.feature_root, "validation")
+    probe_train_ds = CachedLossMatrixDataset(feature_roots, "train")
+    probe_val_ds = CachedLossMatrixDataset(feature_roots, "validation")
     
     ###要拿哪些 sample, 要保留哪些 expert
     alias_task_names = parse_optional_task_names(args.task_names)
@@ -875,19 +1035,25 @@ def main():
     
     ####然後真正建立train_ds跟val_ds
     train_ds = CachedLossMatrixDataset(
-        args.feature_root,
+        feature_roots,
         "train",
         selected_sample_task_names=sample_task_names,
         selected_expert_names=expert_names,
     )
     val_ds = CachedLossMatrixDataset(
-        args.feature_root,
+        feature_roots,
         "validation",
         selected_sample_task_names=sample_task_names,
         selected_expert_names=expert_names,
     )
+    if train_ds.feature_contract != val_ds.feature_contract:
+        raise ValueError(
+            f"Training and validation caches use different feature contracts: "
+            f"train={train_ds.feature_contract}, validation={val_ds.feature_contract}"
+        )
     print(f"[INFO] sample_task_names={sample_task_names}")
     print(f"[INFO] expert_names={expert_names}")
+    print(f"[INFO] feature_roots={feature_roots}")
     print(f"[INFO] num_pairs={len(expert_names) * len(expert_names)}")
     print(
         f"[INFO] supervision_mode={args.supervision_mode} joint_loss={args.joint_loss} "
@@ -899,8 +1065,10 @@ def main():
         f"sample_feature_mode={args.sample_feature_mode}"
     )
     train_cfg = vars(args).copy()
+    train_cfg["resolved_feature_roots"] = feature_roots
     train_cfg["resolved_sample_task_names"] = sample_task_names
     train_cfg["resolved_expert_names"] = expert_names
+    train_cfg["feature_contract"] = train_ds.feature_contract
     topk_weighted_temperatures = parse_float_list(args.topk_weighted_temperatures, default=[0.5, 1.0])
     train_cfg["resolved_topk_weighted_temperatures"] = topk_weighted_temperatures
     print(f"[INFO] topk_weighted_temperatures={topk_weighted_temperatures}")
@@ -934,6 +1102,12 @@ def main():
 
     bert_tokenizer = AutoTokenizer.from_pretrained(args.bert_init)
     llama_hidden_size = int(train_ds[0]["first_vec"].numel())
+    expected_llama_hidden_size = train_ds.feature_contract.get("llama_hidden_size")
+    if expected_llama_hidden_size is not None and llama_hidden_size != expected_llama_hidden_size:
+        raise ValueError(
+            f"Cached vector dimension mismatch: item vectors have {llama_hidden_size}, "
+            f"feature contract declares {expected_llama_hidden_size}"
+        )
     '''
     這個model只有這幾個, BERT, router_first, router_mid, pair_classifier
     '''
@@ -942,7 +1116,6 @@ def main():
         llama_hidden_size=llama_hidden_size,
         router_dim=args.router_dim,
         num_pairs=len(expert_names) * len(expert_names),
-        sample_feature_dim=4 if args.sample_feature_mode == "base_option_stats" else 0,
     ).to(device)
 
     if args.load_from is not None:
@@ -975,7 +1148,7 @@ def main():
             correct_soft_ce_temperature=args.correct_soft_ce_temperature,
             self_preserve_weight=args.self_preserve_weight,
             topk_weighted_temperatures=topk_weighted_temperatures,
-            sample_feature_mode=args.sample_feature_mode,
+            collect_route_records=args.save_route_records,
         )
         print(
             f"[EVAL_ONLY][VAL] loss={val_metrics['loss']:.4f} "
@@ -1009,7 +1182,7 @@ def main():
             correct_soft_ce_temperature=args.correct_soft_ce_temperature,
             self_preserve_weight=args.self_preserve_weight,
             topk_weighted_temperatures=topk_weighted_temperatures,
-            sample_feature_mode=args.sample_feature_mode,
+            collect_route_records=args.save_route_records,
         )
         print(
             f"[EVAL_ONLY][TRAIN] loss={train_eval_metrics['loss']:.4f} "
@@ -1062,7 +1235,7 @@ def main():
             global_step += 1
             ###把文字餵給 BERT。
             bert_enc = bert_tokenizer(
-                batch.texts,
+                batch.prompt_texts,
                 return_tensors="pt",
                 padding=True,
                 truncation=True,
@@ -1082,7 +1255,6 @@ def main():
                 bert_token_type_ids=bert_token_type_ids,
                 first_vec=batch.first_vec.to(device),
                 mid_vec=batch.mid_vec.to(device),
-                sample_features=resolve_sample_features(batch, args.sample_feature_mode, device),
             )
             ###if --supervision_mode oracle_loss, loss=orcale_loss
             ###compute_pair_losses 應該只是算loss的方向而已
@@ -1249,7 +1421,7 @@ def main():
             correct_soft_ce_temperature=args.correct_soft_ce_temperature,
             self_preserve_weight=args.self_preserve_weight,
             topk_weighted_temperatures=topk_weighted_temperatures,
-            sample_feature_mode=args.sample_feature_mode,
+            collect_route_records=args.save_route_records,
         )
         print(
             f"[VAL] epoch={epoch} loss={val_metrics['loss']:.4f} "
@@ -1300,7 +1472,7 @@ def main():
                 correct_soft_ce_temperature=args.correct_soft_ce_temperature,
                 self_preserve_weight=args.self_preserve_weight,
                 topk_weighted_temperatures=topk_weighted_temperatures,
-                sample_feature_mode=args.sample_feature_mode,
+                collect_route_records=args.save_route_records,
             )
             print(
                 f"[TRAIN-EVAL] epoch={epoch} loss={train_eval_metrics['loss']:.4f} "
@@ -1455,8 +1627,10 @@ def main():
                 supervision_mode=args.supervision_mode,
                 best_metric=args.best_metric,
                 best_metric_value=best_metric_value,
-                sample_feature_mode=args.sample_feature_mode,
-                sample_feature_dim=4 if args.sample_feature_mode == "base_option_stats" else 0,
+                freeze_bert=args.freeze_bert,
+                feature_contract=train_ds.feature_contract,
+                llama_hidden_size=llama_hidden_size,
+                router_dim=args.router_dim,
             )
             print(
                 f"[SAVE] best checkpoint updated at epoch={epoch} "

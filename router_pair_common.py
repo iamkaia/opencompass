@@ -6,6 +6,59 @@ import torch
 import torch.nn as nn
 
 
+JOINT_LOSS_CHOICES = (
+    "ce_pair",
+    "expected_loss",
+    "ce_pair_plus_expected",
+    "correct_soft_ce",
+    "correct_conf_ce",
+    "self_preserving_correct_conf_ce",
+    "correct_max_margin",
+    "correct_conf_ce_plus_margin",
+)
+
+
+def add_joint_loss_arguments(parser) -> None:
+    parser.add_argument(
+        "--joint_loss",
+        type=str,
+        default="expected_loss",
+        choices=JOINT_LOSS_CHOICES,
+        help="Joint-mode objective. Ignored for stage1/stage2 when those modes are supported.",
+    )
+    parser.add_argument(
+        "--pseudo_ce_weight",
+        type=float,
+        default=0.0,
+        help="Weight for the auxiliary expected-loss or margin term in combined objectives.",
+    )
+    parser.add_argument(
+        "--pseudo_ce_margin",
+        type=float,
+        default=0.0,
+        help="Required best-versus-second-best gap for hard pair CE, or margin for correct-vs-wrong objectives.",
+    )
+    parser.add_argument(
+        "--correct_soft_ce_temperature",
+        type=float,
+        default=1.0,
+        help="Temperature for correct_conf_ce. Lower values favor lower-loss correct pairs.",
+    )
+    parser.add_argument(
+        "--self_preserve_weight",
+        type=float,
+        default=1.0,
+        help="Target mass reserved for a correct self pair in self_preserving_correct_conf_ce.",
+    )
+    parser.add_argument(
+        "--pair_loss_normalization",
+        type=str,
+        default="sample_minmax",
+        choices=["none", "sample_minmax"],
+        help="Normalization applied to each sample's pair-cost matrix.",
+    )
+
+
 def normalize_pair_loss_matrix(loss_matrix: torch.Tensor, method: str) -> torch.Tensor:
     method = str(method)
     loss_matrix = loss_matrix.to(torch.float32)
@@ -22,6 +75,7 @@ def normalize_pair_loss_matrix(loss_matrix: torch.Tensor, method: str) -> torch.
     return normalized_flat.view_as(loss_matrix)
 
 
+####算loss的方法? 這個也要講解一下太複雜了我看不懂
 def compute_pair_losses(
     pair_logits: torch.Tensor,
     logits_first: Optional[torch.Tensor] = None,
@@ -279,6 +333,7 @@ def masked_mean(values: torch.Tensor, mask: torch.Tensor) -> float:
     return 0.0
 
 
+####這個也講解一下，是統計嗎?
 def compute_routing_accuracy_stats(
     pred_first: torch.Tensor,
     pred_mid: torch.Tensor,
@@ -560,6 +615,7 @@ def init_oracle_debug_accumulator(expert_names: Sequence[str]) -> Dict:
     }
 
 
+####這個又是甚麼東西??
 def update_oracle_debug_accumulator(
     acc: Dict,
     loss_matrix: torch.Tensor,
