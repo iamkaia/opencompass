@@ -35,7 +35,8 @@ RTE_datasets = [
     dict(
         abbr='RTE',
         type=AXDatasetV2,  # rte share the same format with ax
-        path='./data/SuperGLUE/RTE/val.jsonl',
+        ###寫成絕對路徑不報錯
+        path='/home/u9472191/opencompass/data/SuperGLUE/RTE/val.jsonl',
         reader_cfg=RTE_reader_cfg,
         infer_cfg=RTE_infer_cfg,
         eval_cfg=RTE_eval_cfg,
