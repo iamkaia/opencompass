@@ -84,6 +84,18 @@ class UnifiedMoECoreInternalRouterCompactCachedJoint:
         self.first_layer_idx = int(cfg.get("first_layer_idx", first_layer_idx))
         self.middle_layer_idx = int(cfg.get("middle_layer_idx", middle_layer_idx))
         self.router_max_len = int(cfg.get("router_max_len", 512))
+        self.router_pooling = str(cfg.get("router_pooling", "last_token"))
+        self.router_pooling_last_k = int(cfg.get("router_pooling_last_k", 4))
+        self.router_dim = int(cfg.get("router_dim", router_dim))
+        self.sample_feature_mode = str(cfg.get("sample_feature_mode", "none"))
+        self.sample_feature_dim = int(cfg.get("sample_feature_dim", 0))
+        if self.sample_feature_mode != "none" or self.sample_feature_dim != 0:
+            raise ValueError(
+                "Runtime generation does not implement cached sample features: "
+                f"sample_feature_mode={self.sample_feature_mode!r}, "
+                f"sample_feature_dim={self.sample_feature_dim}. "
+                "Train with --sample_feature_mode none for OpenCompass evaluation."
+            )
         requested_lora_tasks = list(lora_paths.keys())
         missing_lora_tasks = [task for task in self.task_names if task not in lora_paths]
         extra_lora_tasks = [task for task in requested_lora_tasks if task not in self.task_names]
@@ -100,6 +112,9 @@ class UnifiedMoECoreInternalRouterCompactCachedJoint:
             f"task_names={self.task_names}, "
             f"first_layer_idx={self.first_layer_idx}, "
             f"middle_layer_idx={self.middle_layer_idx}, "
+            f"router_pooling={self.router_pooling}, "
+            f"router_pooling_last_k={self.router_pooling_last_k}, "
+            f"router_dim={self.router_dim}, "
             f"router_max_len={self.router_max_len}",
             flush=True,
         )
@@ -127,6 +142,12 @@ class UnifiedMoECoreInternalRouterCompactCachedJoint:
 
         self.backbone_spec = infer_backbone_spec(self.model)
         self.num_layers = len(get_decoder_layers(self.model, spec=self.backbone_spec))
+        expected_llama_hidden = cfg.get("llama_hidden_size")
+        if expected_llama_hidden is not None and int(expected_llama_hidden) != int(self.model.config.hidden_size):
+            raise ValueError(
+                f"Router checkpoint expects llama_hidden_size={expected_llama_hidden}, "
+                f"but runtime base model provides hidden_size={self.model.config.hidden_size}."
+            )
         self.model = patch_llama_with_hard_routed_lora(
             self.model,
             num_experts=1 + len(self.task_names),
@@ -149,13 +170,13 @@ class UnifiedMoECoreInternalRouterCompactCachedJoint:
 
         bert_hidden = self.bert_encoder.encoder.config.hidden_size
         llama_hidden = self.model.config.hidden_size
-        self.router_first = CompactRouterFeatureEncoder(llama_hidden, bert_hidden, router_dim)
-        self.router_mid = CompactRouterFeatureEncoder(llama_hidden, bert_hidden, router_dim)
+        self.router_first = CompactRouterFeatureEncoder(llama_hidden, bert_hidden, self.router_dim)
+        self.router_mid = CompactRouterFeatureEncoder(llama_hidden, bert_hidden, self.router_dim)
         self.pair_classifier = nn.Sequential(
-            nn.LayerNorm(router_dim * 4),
-            nn.Linear(router_dim * 4, router_dim * 2),
+            nn.LayerNorm(self.router_dim * 4),
+            nn.Linear(self.router_dim * 4, self.router_dim * 2),
             nn.GELU(),
-            nn.Linear(router_dim * 2, len(self.task_names) * len(self.task_names)),
+            nn.Linear(self.router_dim * 2, len(self.task_names) * len(self.task_names)),
         )
 
         state_path = os.path.join(router_ckpt_dir, "router_heads.pt")
@@ -217,6 +238,21 @@ class UnifiedMoECoreInternalRouterCompactCachedJoint:
         if task_name not in self.task_to_eid:
             raise ValueError(f"Unknown forced task: {task_name}. Available tasks: {self.task_names}")
         return self.task_to_eid[task_name]
+
+    def _pool_prompt_vector(self, hidden_states: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
+        if self.router_pooling == "last_token":
+            return hidden_states[:, -1, :]
+        mask = attention_mask.unsqueeze(-1).to(hidden_states.dtype)
+        if self.router_pooling == "mean":
+            return (hidden_states * mask).sum(dim=1) / mask.sum(dim=1).clamp_min(1.0)
+        if self.router_pooling == "lastk_mean":
+            k = max(self.router_pooling_last_k, 1)
+            outputs = []
+            for sample_hidden, sample_mask in zip(hidden_states, attention_mask):
+                valid_hidden = sample_hidden[sample_mask.to(dtype=torch.bool)]
+                outputs.append(valid_hidden[-k:].mean(dim=0))
+            return torch.stack(outputs, dim=0)
+        raise ValueError(f"Unknown router_pooling={self.router_pooling!r} in router checkpoint.")
 
     def _pair_idx_to_name(self, pair_idx: int) -> str:
         num_tasks = len(self.task_names)
@@ -334,8 +370,8 @@ class UnifiedMoECoreInternalRouterCompactCachedJoint:
                 return_dict=True,
             )
             hidden_states = prepass.hidden_states
-            first_vec = hidden_states[self.first_layer_idx][:, -1, :]
-            mid_vec = hidden_states[self.middle_layer_idx][:, -1, :]
+            first_vec = self._pool_prompt_vector(hidden_states[self.first_layer_idx], inp["attention_mask"])
+            mid_vec = self._pool_prompt_vector(hidden_states[self.middle_layer_idx], inp["attention_mask"])
 
             first_eid, mid_eid = self._route_pair_from_vecs(
                 first_vec,

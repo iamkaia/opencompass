@@ -1,4 +1,4 @@
-####主要釋放lora expert機制相關的東西
+####主要是放lora expert機制相關的東西
 from typing import Dict
 
 import torch
@@ -70,7 +70,7 @@ def patch_llama_with_hard_routed_lora(model, num_experts: int, r: int = 8, alpha
     return patch_causal_lm_with_hard_routed_lora(model, num_experts=num_experts, r=r, alpha=alpha)
 
 
-####目前還沒有用到，應該是指定所有layer的要用哪一個同樣的expert
+####是指定所有layer的要用哪一個同樣的expert，就是抽cached的時候現在是沒有掛任何expert的hidden state
 def set_all_experts(model, eid: int):
     for module in model.modules():
         if isinstance(module, HardRoutedLoRALinear):
