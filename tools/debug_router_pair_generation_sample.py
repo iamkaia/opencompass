@@ -67,6 +67,7 @@ def generate_for_pair(
         input_ids=prompt_input_ids,
         attention_mask=prompt_attention_mask,
         max_new_tokens=max_new_tokens,
+        # `do_sample=False` 且 `num_beams=1`：debug 顯示的 generated answer 是 greedy decoding。
         do_sample=False,
         num_beams=1,
         temperature=None,
@@ -230,7 +231,7 @@ def main():
     args = parser.parse_args()
 
     global NULL_EXPERT_ID, set_all_experts, set_layer_range_expert, build_lm_batch
-    from train_joint_answer_supervision_router import (
+    from router_answer_supervision_core import (
         JointAnswerSupervisionRouterModel,
         build_dataset,
         build_lm_batch as imported_build_lm_batch,
@@ -267,6 +268,7 @@ def main():
         data_root=args.data_root,
         split=args.split,
         requested_tasks=requested_tasks,
+        expert_names=expert_names,
         max_samples=args.num_samples,
         seed=args.seed,
     )
