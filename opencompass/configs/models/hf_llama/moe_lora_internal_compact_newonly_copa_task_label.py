@@ -1,12 +1,10 @@
 from opencompass.models.router_moe_llama_internal_compact_cached_joint import (
-            RouterMoELlamaInternalCompactCachedJoint,
+        RouterMoELlamaInternalCompactCachedJoint,
 )
 import os
 
-router_ckpt_dir = "./router_ckpt_cl_copa_from_5task_tokennll_mixed_norm_expected"
-####router_ckpt_dir = "./router_ckpt_cl_copa_expected_taskaware"
-####outer_ckpt_dir="./router_ckpt_newonly_copa_from_5expert_freezebert"
-
+#router_ckpt_dir = "./router_ckpt_new_end2end_copa_newonly"
+router_ckpt_dir = "./router_ckpt_cl_copa_end2end_taskaware"
 models = [
     dict(
         type=RouterMoELlamaInternalCompactCachedJoint,

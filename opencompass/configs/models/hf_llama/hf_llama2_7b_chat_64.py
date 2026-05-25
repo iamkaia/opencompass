@@ -5,7 +5,7 @@ models = [
         type=HuggingFacewithChatTemplate,
         abbr='llama-2-7b-chat-hf',
         path='meta-llama/Llama-2-7b-chat-hf',
-        max_out_len=128,
+        max_out_len=64,
         batch_size=64,
         run_cfg=dict(num_gpus=1),
         model_kwargs=dict(

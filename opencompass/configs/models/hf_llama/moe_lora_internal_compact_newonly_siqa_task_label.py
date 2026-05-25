@@ -1,13 +1,16 @@
-from opencompass.models.router_moe_llama_internal_compact import (
-    RouterMoELlamaInternalCompact,
+from opencompass.models.router_moe_llama_internal_compact_cached_joint import (
+            RouterMoELlamaInternalCompactCachedJoint,
 )
+import os
 
+#router_ckpt_dir = "./router_ckpt_new_end2end_siqa_newonly"
+router_ckpt_dir = "./router_ckpt_cl_siqa_end2end_taskaware"
 models = [
     dict(
-        type=RouterMoELlamaInternalCompact,
-        abbr="router_moe_internal_compact_replay_piqa",
+        type=RouterMoELlamaInternalCompactCachedJoint,
+        abbr=os.path.basename(os.path.normpath(router_ckpt_dir)),
         path="meta-llama/Llama-2-7b-chat-hf",
-        router_ckpt_dir="./router_ckpt_replay_piqa_from_5expert_freezebert",
+        router_ckpt_dir=router_ckpt_dir,
         router_bert_init="./task_classifier_ckpt",
         lora_paths=dict(
             iwslt2017="./saves/llama2-7b-chat-hf/lora/sft_iwslt",
@@ -22,7 +25,7 @@ models = [
         router_dim=512,
         batch_size=128,
         max_seq_len=2048,
-        max_out_len=128,
+        max_out_len=64,
         run_cfg=dict(num_gpus=1),
     )
 ]

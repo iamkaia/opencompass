@@ -1,12 +1,9 @@
 from opencompass.models.router_moe_llama_internal_compact_cached_joint import (
-            RouterMoELlamaInternalCompactCachedJoint,
+    RouterMoELlamaInternalCompactCachedJoint,
 )
 import os
 
-router_ckpt_dir = "./router_ckpt_cl_copa_from_5task_tokennll_mixed_norm_expected"
-####router_ckpt_dir = "./router_ckpt_cl_copa_expected_taskaware"
-####outer_ckpt_dir="./router_ckpt_newonly_copa_from_5expert_freezebert"
-
+router_ckpt_dir = "./router_ckpt_cachedjoint_5org_token_nll_mean_expected"
 models = [
     dict(
         type=RouterMoELlamaInternalCompactCachedJoint,
@@ -25,9 +22,11 @@ models = [
         r=8,
         alpha=32,
         router_dim=512,
-        batch_size=128,
+        first_layer_idx=0,
+        middle_layer_idx=15,
+        batch_size=32,
         max_seq_len=2048,
-        max_out_len=64,
+        max_out_len=128,
         run_cfg=dict(num_gpus=1),
     )
 ]
