@@ -69,6 +69,9 @@ class RouterMoELlamaInternalCompactCachedJoint(HuggingFacewithChatTemplate):
         debug_router_topk: int = 0,
         debug_router_max_prints: int = 0,
         debug_router_record_path: Optional[str] = None,
+        routing_mode: str = "hard",
+        routing_sharpness: float = 1.0,
+        routing_topk: Optional[int] = None,
         **kwargs,
     ):
         if hf_offline:
@@ -107,6 +110,9 @@ class RouterMoELlamaInternalCompactCachedJoint(HuggingFacewithChatTemplate):
             local_files_only=local_files_only or hf_offline,
             debug_router_topk=debug_router_topk,
             debug_router_max_prints=debug_router_max_prints,
+            routing_mode=routing_mode,
+            routing_sharpness=routing_sharpness,
+            routing_topk=routing_topk,
         )
         self._active_dataset_name = None
         self._printed_dataset_totals = {}
@@ -216,7 +222,16 @@ class RouterMoELlamaInternalCompactCachedJoint(HuggingFacewithChatTemplate):
             "first_eid": None if first_eid is None else int(first_eid),
             "mid_eid": None if mid_eid is None else int(mid_eid),
             "prompt_preview": prompt.replace("\n", "\\n")[:240],
+            "routing_mode": getattr(self.core, "routing_mode", "hard"),
+            "routing_sharpness": getattr(self.core, "routing_sharpness", 1.0),
+            "routing_topk": getattr(self.core, "routing_topk", None),
         }
+        first_weights = getattr(self.core, "cached_first_weights", None)
+        mid_weights = getattr(self.core, "cached_mid_weights", None)
+        if first_weights is not None:
+            record["first_weights"] = first_weights.detach().cpu().tolist()[1:]
+        if mid_weights is not None:
+            record["mid_weights"] = mid_weights.detach().cpu().tolist()[1:]
         with open(self.debug_router_record_path, "a", encoding="utf-8") as f:
             f.write(json.dumps(record, ensure_ascii=False) + "\n")
 

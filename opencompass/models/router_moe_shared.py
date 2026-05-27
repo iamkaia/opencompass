@@ -1,5 +1,5 @@
 ####主要是放lora expert機制相關的東西
-from typing import Dict
+from typing import Dict, Sequence
 
 import torch
 import torch.nn as nn
@@ -35,12 +35,37 @@ class HardRoutedLoRALinear(nn.Module):
             nn.init.zeros_(self.B[expert_idx])
 
         self.active_expert = NULL_EXPERT_ID
+        self.active_weights = None
 
     def set_expert(self, eid: int):
         self.active_expert = int(eid)
+        self.active_weights = None
+
+    def set_expert_weights(self, weights: Sequence[float] | torch.Tensor):
+        weights = torch.as_tensor(weights, dtype=torch.float32)
+        if weights.ndim != 1 or weights.numel() != self.num_experts:
+            raise ValueError(
+                f"Expected {self.num_experts} expert weights, got shape={tuple(weights.shape)}"
+            )
+        if bool((weights < 0).any().item()):
+            raise ValueError("Expert weights must be non-negative.")
+        weight_sum = float(weights.sum().item())
+        if weight_sum <= 0.0:
+            raise ValueError("Expert weights must contain positive mass.")
+        self.active_weights = (weights / weight_sum).detach().clone()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         y = self.base(x)
+        if self.active_weights is not None:
+            weights = self.active_weights.to(device=x.device, dtype=x.dtype)
+            delta = torch.zeros_like(y)
+            for eid in range(1, self.num_experts):
+                if float(weights[eid].item()) == 0.0:
+                    continue
+                A = self.A[eid].to(device=x.device, dtype=x.dtype)
+                B = self.B[eid].to(device=x.device, dtype=x.dtype)
+                delta = delta + weights[eid] * ((x @ A.t()) @ B.t())
+            return y + self.scale * delta
         eid = int(self.active_expert)
         A = self.A[eid].to(device=x.device, dtype=x.dtype)
         B = self.B[eid].to(device=x.device, dtype=x.dtype)
@@ -96,6 +121,20 @@ def set_layer_expert(model, layer_idx: int, eid: int):
         if isinstance(mod, HardRoutedLoRALinear):
             mod.set_expert(eid)
 
+
+def set_layer_expert_weights(model, layer_idx: int, weights: Sequence[float] | torch.Tensor):
+    layer = _unwrap_layer(get_decoder_layers(model)[layer_idx])
+
+    for name in ["gate_proj", "up_proj", "down_proj"]:
+        mod = getattr(layer.mlp, name)
+        if isinstance(mod, HardRoutedLoRALinear):
+            mod.set_expert_weights(weights)
+
+    for name in ["q_proj", "k_proj", "v_proj", "o_proj"]:
+        mod = getattr(layer.self_attn, name)
+        if isinstance(mod, HardRoutedLoRALinear):
+            mod.set_expert_weights(weights)
+
 ####控制哪些 layer 現在吃哪個 expert
 def set_layer_range_expert(model, start_idx: int, end_idx: int, eid: int):
     if end_idx < start_idx:
@@ -105,6 +144,16 @@ def set_layer_range_expert(model, start_idx: int, end_idx: int, eid: int):
     end_idx = min(int(end_idx), num_layers - 1)
     for layer_idx in range(start_idx, end_idx + 1):
         set_layer_expert(model, layer_idx, eid)
+
+
+def set_layer_range_expert_weights(model, start_idx: int, end_idx: int, weights: Sequence[float] | torch.Tensor):
+    if end_idx < start_idx:
+        return
+    num_layers = len(get_decoder_layers(model))
+    start_idx = max(0, int(start_idx))
+    end_idx = min(int(end_idx), num_layers - 1)
+    for layer_idx in range(start_idx, end_idx + 1):
+        set_layer_expert_weights(model, layer_idx, weights)
 
 
 def _normalize_key(key: str) -> str:

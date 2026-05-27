@@ -37,6 +37,7 @@ from opencompass.models.router_moe_shared import (
     patch_llama_with_hard_routed_lora,
     set_all_experts,
     set_layer_range_expert,
+    set_layer_range_expert_weights,
 )
 
 
@@ -60,6 +61,9 @@ class UnifiedMoECoreInternalRouterCompactCachedJoint:
         local_files_only: bool = False,
         debug_router_topk: int = 0,
         debug_router_max_prints: int = 0,
+        routing_mode: str = "hard",
+        routing_sharpness: float = 1.0,
+        routing_topk: Optional[int] = None,
     ):
         self.max_seq_len = int(max_seq_len)
         self.route_counter = Counter()
@@ -68,6 +72,15 @@ class UnifiedMoECoreInternalRouterCompactCachedJoint:
         self.debug_router_topk = max(0, int(debug_router_topk))
         self.debug_router_max_prints = max(0, int(debug_router_max_prints))
         self.debug_router_print_count = 0
+        self.routing_mode = str(routing_mode)
+        if self.routing_mode not in {"hard", "weighted_sum"}:
+            raise ValueError(f"Unknown routing_mode={self.routing_mode!r}; expected 'hard' or 'weighted_sum'.")
+        self.routing_sharpness = float(routing_sharpness)
+        if self.routing_sharpness <= 0.0:
+            raise ValueError("routing_sharpness must be positive.")
+        self.routing_topk = None if routing_topk is None else int(routing_topk)
+        if self.routing_topk is not None and self.routing_topk <= 0:
+            raise ValueError("routing_topk must be positive when set.")
         torch_dtype = torch.float16 if dtype == "float16" else torch.bfloat16
 
         cfg_path = os.path.join(router_ckpt_dir, "router_config.json")
@@ -115,7 +128,10 @@ class UnifiedMoECoreInternalRouterCompactCachedJoint:
             f"router_pooling={self.router_pooling}, "
             f"router_pooling_last_k={self.router_pooling_last_k}, "
             f"router_dim={self.router_dim}, "
-            f"router_max_len={self.router_max_len}",
+            f"router_max_len={self.router_max_len}, "
+            f"routing_mode={self.routing_mode}, "
+            f"routing_sharpness={self.routing_sharpness}, "
+            f"routing_topk={self.routing_topk}",
             flush=True,
         )
 
@@ -203,6 +219,8 @@ class UnifiedMoECoreInternalRouterCompactCachedJoint:
 
         self.cached_first_eid = None
         self.cached_mid_eid = None
+        self.cached_first_weights = None
+        self.cached_mid_weights = None
         self.cached_bert_prev = None
         self.cached_bert_last = None
         self.cached_bert_mask = None
@@ -210,6 +228,8 @@ class UnifiedMoECoreInternalRouterCompactCachedJoint:
     def _reset_runtime_cache(self):
         self.cached_first_eid = None
         self.cached_mid_eid = None
+        self.cached_first_weights = None
+        self.cached_mid_weights = None
         self.cached_bert_prev = None
         self.cached_bert_last = None
         self.cached_bert_mask = None
@@ -265,6 +285,8 @@ class UnifiedMoECoreInternalRouterCompactCachedJoint:
         pair_logits: torch.Tensor,
         dataset_name: Optional[str],
         prompt_preview: Optional[str],
+        first_weights: Optional[torch.Tensor] = None,
+        mid_weights: Optional[torch.Tensor] = None,
     ):
         if self.debug_router_topk <= 0 or self.debug_router_max_prints <= 0:
             return
@@ -284,7 +306,10 @@ class UnifiedMoECoreInternalRouterCompactCachedJoint:
             pieces.append(f"{pair_name}:logit={logit:.4f},prob={prob:.4f}")
         print(
             f"[ROUTING_DEBUG][dataset={dataset_name or 'unknown'}] "
-            f"topk_pairs={' | '.join(pieces)} prompt={preview}",
+            f"mode={self.routing_mode} topk_pairs={' | '.join(pieces)} "
+            f"first_weights={None if first_weights is None else first_weights.tolist()} "
+            f"mid_weights={None if mid_weights is None else mid_weights.tolist()} "
+            f"prompt={preview}",
             flush=True,
         )
         self.debug_router_print_count += 1
@@ -328,20 +353,39 @@ class UnifiedMoECoreInternalRouterCompactCachedJoint:
                 mask[..., pair_idx] = keep
             pair_logits = pair_logits.masked_fill(~mask, float("-inf"))
 
-        self._maybe_print_topk_pair_logits(
-            pair_logits=pair_logits,
-            dataset_name=dataset_name,
-            prompt_preview=prompt_preview,
-        )
-
         pred_pair = int(pair_logits.argmax(dim=-1).item())
         first_eid = (pred_pair // num_tasks) + 1
         mid_eid = (pred_pair % num_tasks) + 1
 
+        first_weights = None
+        mid_weights = None
+        routed_logits = pair_logits
+        if self.routing_mode == "weighted_sum":
+            routed_logits = pair_logits.float() * self.routing_sharpness
+            max_pairs = routed_logits.size(-1)
+            if self.routing_topk is not None and self.routing_topk < max_pairs:
+                topk_ids = routed_logits.topk(k=self.routing_topk, dim=-1).indices
+                keep_mask = torch.zeros_like(routed_logits, dtype=torch.bool)
+                keep_mask.scatter_(dim=-1, index=topk_ids, value=True)
+                routed_logits = routed_logits.masked_fill(~keep_mask, float("-inf"))
+            pair_prob = torch.softmax(routed_logits, dim=-1).view(num_tasks, num_tasks)
+            real_first_weights = pair_prob.sum(dim=1)
+            real_mid_weights = pair_prob.sum(dim=0)
+            first_weights = torch.cat([real_first_weights.new_zeros(1), real_first_weights], dim=0)
+            mid_weights = torch.cat([real_mid_weights.new_zeros(1), real_mid_weights], dim=0)
+
+        self._maybe_print_topk_pair_logits(
+            pair_logits=routed_logits,
+            dataset_name=dataset_name,
+            prompt_preview=prompt_preview,
+            first_weights=first_weights,
+            mid_weights=mid_weights,
+        )
+
         self.route_counter[f"first::{self.task_names[first_eid - 1]}"] += 1
         self.route_counter[f"mid::{self.task_names[mid_eid - 1]}"] += 1
         self.route_counter[f"pair::{self.task_names[first_eid - 1]}->{self.task_names[mid_eid - 1]}"] += 1
-        return first_eid, mid_eid
+        return first_eid, mid_eid, first_weights, mid_weights
 
     @torch.no_grad()
     def generate(self, prompts, max_new_tokens=None, gen_kwargs=None, **kwargs):
@@ -373,7 +417,7 @@ class UnifiedMoECoreInternalRouterCompactCachedJoint:
             first_vec = self._pool_prompt_vector(hidden_states[self.first_layer_idx], inp["attention_mask"])
             mid_vec = self._pool_prompt_vector(hidden_states[self.middle_layer_idx], inp["attention_mask"])
 
-            first_eid, mid_eid = self._route_pair_from_vecs(
+            first_eid, mid_eid, first_weights, mid_weights = self._route_pair_from_vecs(
                 first_vec,
                 mid_vec,
                 dataset_name=dataset_name,
@@ -381,19 +425,35 @@ class UnifiedMoECoreInternalRouterCompactCachedJoint:
             )
             self.cached_first_eid = first_eid
             self.cached_mid_eid = mid_eid
+            self.cached_first_weights = first_weights
+            self.cached_mid_weights = mid_weights
 
-            set_layer_range_expert(
-                self.model,
-                self.first_layer_idx,
-                self.middle_layer_idx - 1,
-                first_eid,
-            )
-            set_layer_range_expert(
-                self.model,
-                self.middle_layer_idx,
-                self.num_layers - 1,
-                mid_eid,
-            )
+            if self.routing_mode == "weighted_sum":
+                set_layer_range_expert_weights(
+                    self.model,
+                    self.first_layer_idx,
+                    self.middle_layer_idx - 1,
+                    first_weights,
+                )
+                set_layer_range_expert_weights(
+                    self.model,
+                    self.middle_layer_idx,
+                    self.num_layers - 1,
+                    mid_weights,
+                )
+            else:
+                set_layer_range_expert(
+                    self.model,
+                    self.first_layer_idx,
+                    self.middle_layer_idx - 1,
+                    first_eid,
+                )
+                set_layer_range_expert(
+                    self.model,
+                    self.middle_layer_idx,
+                    self.num_layers - 1,
+                    mid_eid,
+                )
 
             args = dict(gen_kwargs)
             if "max_new_tokens" not in args and max_new_tokens is not None:
