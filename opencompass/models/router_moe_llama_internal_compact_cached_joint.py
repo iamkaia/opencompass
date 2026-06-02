@@ -205,6 +205,8 @@ class RouterMoELlamaInternalCompactCachedJoint(HuggingFacewithChatTemplate):
         prompt: str,
         first_eid: Optional[int],
         mid_eid: Optional[int],
+        first_weights=None,
+        mid_weights=None,
     ):
         if not self.debug_router_record_path:
             return
@@ -226,8 +228,6 @@ class RouterMoELlamaInternalCompactCachedJoint(HuggingFacewithChatTemplate):
             "routing_sharpness": getattr(self.core, "routing_sharpness", 1.0),
             "routing_topk": getattr(self.core, "routing_topk", None),
         }
-        first_weights = getattr(self.core, "cached_first_weights", None)
-        mid_weights = getattr(self.core, "cached_mid_weights", None)
         if first_weights is not None:
             record["first_weights"] = first_weights.detach().cpu().tolist()[1:]
         if mid_weights is not None:
@@ -300,26 +300,33 @@ class RouterMoELlamaInternalCompactCachedJoint(HuggingFacewithChatTemplate):
             self._flush_dataset_routing_summary(previous_dataset_name)
         self._active_dataset_name = dataset_name
 
-        outputs = []
-        for prompt in prompt_strs:
-            one_out = self.core.generate(
-                [prompt],
-                gen_kwargs=gen_kwargs,
-                dataset_name=dataset_name,
-            )
-            if isinstance(one_out, list):
-                outputs.extend(one_out)
-            else:
-                outputs.append(one_out)
+        outputs = self.core.generate(
+            prompt_strs,
+            gen_kwargs=gen_kwargs,
+            dataset_name=dataset_name,
+        )
+        first_eids = getattr(self.core, "cached_first_eid", None)
+        mid_eids = getattr(self.core, "cached_mid_eid", None)
+        first_weights = getattr(self.core, "cached_first_weights", None)
+        mid_weights = getattr(self.core, "cached_mid_weights", None)
+        if first_eids is not None:
+            first_eids = first_eids.detach().cpu().tolist()
+        if mid_eids is not None:
+            mid_eids = mid_eids.detach().cpu().tolist()
+        for index, prompt in enumerate(prompt_strs):
+            first_eid = None if first_eids is None else first_eids[index]
+            mid_eid = None if mid_eids is None else mid_eids[index]
             self._append_routing_log(
                 dataset_name=dataset_name,
-                first_eid=getattr(self.core, "cached_first_eid", None),
-                mid_eid=getattr(self.core, "cached_mid_eid", None),
+                first_eid=first_eid,
+                mid_eid=mid_eid,
             )
             self._append_routing_record(
                 dataset_name=dataset_name,
                 prompt=prompt,
-                first_eid=getattr(self.core, "cached_first_eid", None),
-                mid_eid=getattr(self.core, "cached_mid_eid", None),
+                first_eid=first_eid,
+                mid_eid=mid_eid,
+                first_weights=None if first_weights is None else first_weights[index],
+                mid_weights=None if mid_weights is None else mid_weights[index],
             )
         return outputs

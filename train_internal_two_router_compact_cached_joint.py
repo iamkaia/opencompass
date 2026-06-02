@@ -465,9 +465,11 @@ class InternalTwoRouterCachedJointModel(nn.Module):
 
 
 def set_trainable(model, freeze_bert: bool = True):
-    """Train router heads while keeping the shared BERT encoder fixed."""
+    """Train router heads and optionally fine-tune the shared BERT encoder."""
     for p in model.parameters():
         p.requires_grad = False
+    for p in model.bert.parameters():
+        p.requires_grad = not freeze_bert
     for p in model.router_first.parameters():
         p.requires_grad = True
     for p in model.router_mid.parameters():
@@ -914,7 +916,12 @@ def main():
         "--freeze_bert",
         action="store_true",
         default=True,
-        help="Retained for command compatibility; the BERT encoder is always frozen.",
+        help="Keep the BERT encoder frozen.",
+    )
+    parser.add_argument(
+        "--train_bert",
+        action="store_true",
+        help="Fine-tune the BERT encoder together with the router heads.",
     )
     add_joint_loss_arguments(parser)
     parser.add_argument(
@@ -995,6 +1002,8 @@ def main():
     parser.add_argument("--wandb_group", type=str, default=None)
     parser.add_argument("--wandb_tags", type=str, default=None)
     args = parser.parse_args()
+    if args.train_bert:
+        args.freeze_bert = False
 
     os.makedirs(args.out_dir, exist_ok=True)
     feature_roots = parse_feature_roots(args.feature_root, args.feature_roots)
