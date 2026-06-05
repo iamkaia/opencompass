@@ -22,8 +22,8 @@ hidden_states[middle_layer_idx]
 '''
 import json
 import os
-from collections import Counter
-from typing import Dict, Optional
+from collections import Counter, defaultdict
+from typing import Dict, List, Optional, Sequence
 
 import torch
 import torch.nn as nn
@@ -73,8 +73,11 @@ class UnifiedMoECoreInternalRouterCompactCachedJoint:
         self.debug_router_max_prints = max(0, int(debug_router_max_prints))
         self.debug_router_print_count = 0
         self.routing_mode = str(routing_mode)
-        if self.routing_mode not in {"hard", "weighted_sum"}:
-            raise ValueError(f"Unknown routing_mode={self.routing_mode!r}; expected 'hard' or 'weighted_sum'.")
+        if self.routing_mode not in {"hard", "weighted_sum", "uniform"}:
+            raise ValueError(
+                f"Unknown routing_mode={self.routing_mode!r}; "
+                "expected 'hard', 'weighted_sum', or 'uniform'."
+            )
         self.routing_sharpness = float(routing_sharpness)
         if self.routing_sharpness <= 0.0:
             raise ValueError("routing_sharpness must be positive.")
@@ -235,10 +238,11 @@ class UnifiedMoECoreInternalRouterCompactCachedJoint:
         self.cached_bert_mask = None
         set_all_experts(self.model, NULL_EXPERT_ID)
 
-    def _encode_bert_memory(self, prompt: str):
+    def _encode_bert_memory(self, prompts: Sequence[str]):
         rt = self.router_tokenizer(
-            prompt,
+            list(prompts),
             return_tensors="pt",
+            padding=True,
             truncation=True,
             max_length=self.router_max_len,
         )
@@ -284,35 +288,39 @@ class UnifiedMoECoreInternalRouterCompactCachedJoint:
         self,
         pair_logits: torch.Tensor,
         dataset_name: Optional[str],
-        prompt_preview: Optional[str],
+        prompt_previews: Optional[Sequence[str]],
         first_weights: Optional[torch.Tensor] = None,
         mid_weights: Optional[torch.Tensor] = None,
     ):
         if self.debug_router_topk <= 0 or self.debug_router_max_prints <= 0:
-            return
-        if self.debug_router_print_count >= self.debug_router_max_prints:
             return
 
         topk = min(self.debug_router_topk, pair_logits.size(-1))
         probs = torch.softmax(pair_logits.float(), dim=-1)
         top_vals, top_idx = torch.topk(pair_logits.float(), k=topk, dim=-1)
         top_probs = torch.gather(probs, dim=-1, index=top_idx)
-        preview = (prompt_preview or "").replace("\n", "\\n")[:160]
-        pieces = []
-        for rank in range(topk):
-            pair_name = self._pair_idx_to_name(int(top_idx[0, rank].item()))
-            logit = float(top_vals[0, rank].item())
-            prob = float(top_probs[0, rank].item())
-            pieces.append(f"{pair_name}:logit={logit:.4f},prob={prob:.4f}")
-        print(
-            f"[ROUTING_DEBUG][dataset={dataset_name or 'unknown'}] "
-            f"mode={self.routing_mode} topk_pairs={' | '.join(pieces)} "
-            f"first_weights={None if first_weights is None else first_weights.tolist()} "
-            f"mid_weights={None if mid_weights is None else mid_weights.tolist()} "
-            f"prompt={preview}",
-            flush=True,
-        )
-        self.debug_router_print_count += 1
+        previews = list(prompt_previews or [""] * pair_logits.size(0))
+        for sample_idx in range(pair_logits.size(0)):
+            if self.debug_router_print_count >= self.debug_router_max_prints:
+                break
+            preview = previews[sample_idx].replace("\n", "\\n")[:160]
+            pieces = []
+            for rank in range(topk):
+                pair_name = self._pair_idx_to_name(int(top_idx[sample_idx, rank].item()))
+                logit = float(top_vals[sample_idx, rank].item())
+                prob = float(top_probs[sample_idx, rank].item())
+                pieces.append(f"{pair_name}:logit={logit:.4f},prob={prob:.4f}")
+            sample_first_weights = None if first_weights is None else first_weights[sample_idx].tolist()
+            sample_mid_weights = None if mid_weights is None else mid_weights[sample_idx].tolist()
+            print(
+                f"[ROUTING_DEBUG][dataset={dataset_name or 'unknown'}] "
+                f"mode={self.routing_mode} topk_pairs={' | '.join(pieces)} "
+                f"first_weights={sample_first_weights} "
+                f"mid_weights={sample_mid_weights} "
+                f"prompt={preview}",
+                flush=True,
+            )
+            self.debug_router_print_count += 1
 
     @torch.no_grad()
     def _route_pair_from_vecs(
@@ -320,7 +328,7 @@ class UnifiedMoECoreInternalRouterCompactCachedJoint:
         first_vec: torch.Tensor,
         mid_vec: torch.Tensor,
         dataset_name: Optional[str] = None,
-        prompt_preview: Optional[str] = None,
+        prompt_previews: Optional[Sequence[str]] = None,
     ):
         forced_first_eid = self._forced_task_to_eid(self.force_first_task)
         forced_mid_eid = self._forced_task_to_eid(self.force_mid_task)
@@ -353,14 +361,20 @@ class UnifiedMoECoreInternalRouterCompactCachedJoint:
                 mask[..., pair_idx] = keep
             pair_logits = pair_logits.masked_fill(~mask, float("-inf"))
 
-        pred_pair = int(pair_logits.argmax(dim=-1).item())
+        pred_pair = pair_logits.argmax(dim=-1)
         first_eid = (pred_pair // num_tasks) + 1
         mid_eid = (pred_pair % num_tasks) + 1
 
         first_weights = None
         mid_weights = None
         routed_logits = pair_logits
-        if self.routing_mode == "weighted_sum":
+        if self.routing_mode == "uniform":
+            first_weights = pair_logits.new_full((pair_logits.size(0), num_tasks + 1), 1.0 / num_tasks)
+            mid_weights = pair_logits.new_full((pair_logits.size(0), num_tasks + 1), 1.0 / num_tasks)
+            first_weights[:, 0] = 0.0
+            mid_weights[:, 0] = 0.0
+            routed_logits = pair_logits.new_zeros(pair_logits.shape)
+        elif self.routing_mode == "weighted_sum":
             routed_logits = pair_logits.float() * self.routing_sharpness
             max_pairs = routed_logits.size(-1)
             if self.routing_topk is not None and self.routing_topk < max_pairs:
@@ -368,24 +382,45 @@ class UnifiedMoECoreInternalRouterCompactCachedJoint:
                 keep_mask = torch.zeros_like(routed_logits, dtype=torch.bool)
                 keep_mask.scatter_(dim=-1, index=topk_ids, value=True)
                 routed_logits = routed_logits.masked_fill(~keep_mask, float("-inf"))
-            pair_prob = torch.softmax(routed_logits, dim=-1).view(num_tasks, num_tasks)
-            real_first_weights = pair_prob.sum(dim=1)
-            real_mid_weights = pair_prob.sum(dim=0)
-            first_weights = torch.cat([real_first_weights.new_zeros(1), real_first_weights], dim=0)
-            mid_weights = torch.cat([real_mid_weights.new_zeros(1), real_mid_weights], dim=0)
+            pair_prob = torch.softmax(routed_logits, dim=-1).view(-1, num_tasks, num_tasks)
+            real_first_weights = pair_prob.sum(dim=2)
+            real_mid_weights = pair_prob.sum(dim=1)
+            null_weights = real_first_weights.new_zeros(real_first_weights.size(0), 1)
+            first_weights = torch.cat([null_weights, real_first_weights], dim=1)
+            mid_weights = torch.cat([null_weights, real_mid_weights], dim=1)
 
         self._maybe_print_topk_pair_logits(
             pair_logits=routed_logits,
             dataset_name=dataset_name,
-            prompt_preview=prompt_preview,
+            prompt_previews=prompt_previews,
             first_weights=first_weights,
             mid_weights=mid_weights,
         )
 
-        self.route_counter[f"first::{self.task_names[first_eid - 1]}"] += 1
-        self.route_counter[f"mid::{self.task_names[mid_eid - 1]}"] += 1
-        self.route_counter[f"pair::{self.task_names[first_eid - 1]}->{self.task_names[mid_eid - 1]}"] += 1
+        for sample_first, sample_mid in zip(first_eid.detach().cpu().tolist(), mid_eid.detach().cpu().tolist()):
+            self.route_counter[f"first::{self.task_names[sample_first - 1]}"] += 1
+            self.route_counter[f"mid::{self.task_names[sample_mid - 1]}"] += 1
+            self.route_counter[f"pair::{self.task_names[sample_first - 1]}->{self.task_names[sample_mid - 1]}"] += 1
         return first_eid, mid_eid, first_weights, mid_weights
+
+    def _generation_args(self, gen_kwargs: Dict, max_new_tokens: Optional[int]) -> Dict:
+        args = dict(gen_kwargs)
+        if "max_new_tokens" not in args and max_new_tokens is not None:
+            args["max_new_tokens"] = int(max_new_tokens)
+        args.setdefault("eos_token_id", self.tokenizer.eos_token_id)
+        args.setdefault("pad_token_id", self.tokenizer.pad_token_id)
+        args["do_sample"] = False
+        args["temperature"] = 0.0
+        args["top_p"] = 1.0
+        args["num_beams"] = 1
+        return args
+
+    def _decode_outputs(self, output_ids: torch.Tensor, prompt_width: int) -> List[str]:
+        return self.tokenizer.batch_decode(
+            output_ids[:, prompt_width:],
+            skip_special_tokens=True,
+            clean_up_tokenization_spaces=True,
+        )
 
     @torch.no_grad()
     def generate(self, prompts, max_new_tokens=None, gen_kwargs=None, **kwargs):
@@ -394,85 +429,78 @@ class UnifiedMoECoreInternalRouterCompactCachedJoint:
             prompts = [prompts]
         if gen_kwargs is None:
             gen_kwargs = {}
+        if not prompts:
+            return []
 
-        outputs = []
-        for prompt in prompts:
-            self._reset_runtime_cache()
-            self._encode_bert_memory(prompt)
+        self._reset_runtime_cache()
+        self._encode_bert_memory(prompts)
+        inp = self.tokenizer(
+            prompts,
+            return_tensors="pt",
+            padding=True,
+            truncation=True,
+            max_length=self.max_seq_len,
+        ).to(self.model.device)
 
-            inp = self.tokenizer(
-                prompt,
-                return_tensors="pt",
-                truncation=True,
-                max_length=self.max_seq_len,
-            ).to(self.model.device)
+        prepass = self.model(
+            **inp,
+            use_cache=False,
+            output_hidden_states=True,
+            return_dict=True,
+        )
+        hidden_states = prepass.hidden_states
+        first_vec = self._pool_prompt_vector(hidden_states[self.first_layer_idx], inp["attention_mask"])
+        mid_vec = self._pool_prompt_vector(hidden_states[self.middle_layer_idx], inp["attention_mask"])
+        first_eid, mid_eid, first_weights, mid_weights = self._route_pair_from_vecs(
+            first_vec,
+            mid_vec,
+            dataset_name=dataset_name,
+            prompt_previews=prompts,
+        )
+        self.cached_first_eid = first_eid
+        self.cached_mid_eid = mid_eid
+        self.cached_first_weights = first_weights
+        self.cached_mid_weights = mid_weights
 
-            prepass = self.model(
-                **inp,
-                use_cache=False,
-                output_hidden_states=True,
-                return_dict=True,
+        args = self._generation_args(gen_kwargs, max_new_tokens)
+        prompt_width = inp["input_ids"].shape[1]
+        if self.routing_mode in {"weighted_sum", "uniform"}:
+            set_layer_range_expert_weights(
+                self.model,
+                self.first_layer_idx,
+                self.middle_layer_idx - 1,
+                first_weights,
             )
-            hidden_states = prepass.hidden_states
-            first_vec = self._pool_prompt_vector(hidden_states[self.first_layer_idx], inp["attention_mask"])
-            mid_vec = self._pool_prompt_vector(hidden_states[self.middle_layer_idx], inp["attention_mask"])
-
-            first_eid, mid_eid, first_weights, mid_weights = self._route_pair_from_vecs(
-                first_vec,
-                mid_vec,
-                dataset_name=dataset_name,
-                prompt_preview=prompt,
+            set_layer_range_expert_weights(
+                self.model,
+                self.middle_layer_idx,
+                self.num_layers - 1,
+                mid_weights,
             )
-            self.cached_first_eid = first_eid
-            self.cached_mid_eid = mid_eid
-            self.cached_first_weights = first_weights
-            self.cached_mid_weights = mid_weights
-
-            if self.routing_mode == "weighted_sum":
-                set_layer_range_expert_weights(
-                    self.model,
-                    self.first_layer_idx,
-                    self.middle_layer_idx - 1,
-                    first_weights,
-                )
-                set_layer_range_expert_weights(
-                    self.model,
-                    self.middle_layer_idx,
-                    self.num_layers - 1,
-                    mid_weights,
-                )
-            else:
-                set_layer_range_expert(
-                    self.model,
-                    self.first_layer_idx,
-                    self.middle_layer_idx - 1,
-                    first_eid,
-                )
-                set_layer_range_expert(
-                    self.model,
-                    self.middle_layer_idx,
-                    self.num_layers - 1,
-                    mid_eid,
-                )
-
-            args = dict(gen_kwargs)
-            if "max_new_tokens" not in args and max_new_tokens is not None:
-                args["max_new_tokens"] = int(max_new_tokens)
-            args.setdefault("eos_token_id", self.tokenizer.eos_token_id)
-            args.setdefault("pad_token_id", self.tokenizer.pad_token_id)
-            args["do_sample"] = False
-            args["temperature"] = 0.0
-            args["top_p"] = 1.0
-            args["num_beams"] = 1
-
             out = self.model.generate(**inp, **args)
-            prompt_len = inp["input_ids"].shape[1]
-            gen_ids = out[0][prompt_len:]
-            text = self.tokenizer.decode(
-                gen_ids,
-                skip_special_tokens=True,
-                clean_up_tokenization_spaces=True,
-            )
-            outputs.append(text)
+            return self._decode_outputs(out, prompt_width)
 
+        pair_groups = defaultdict(list)
+        for index, pair in enumerate(zip(first_eid.detach().cpu().tolist(), mid_eid.detach().cpu().tolist())):
+            pair_groups[pair].append(index)
+        outputs = [None] * len(prompts)
+        for (group_first_eid, group_mid_eid), indices in pair_groups.items():
+            set_layer_range_expert(
+                self.model,
+                self.first_layer_idx,
+                self.middle_layer_idx - 1,
+                group_first_eid,
+            )
+            set_layer_range_expert(
+                self.model,
+                self.middle_layer_idx,
+                self.num_layers - 1,
+                group_mid_eid,
+            )
+            group_idx = torch.tensor(indices, device=inp["input_ids"].device, dtype=torch.long)
+            group_inp = {key: value.index_select(0, group_idx) for key, value in inp.items()}
+            group_out = self.model.generate(**group_inp, **args)
+            group_text = self._decode_outputs(group_out, prompt_width)
+            for index, text in zip(indices, group_text):
+                outputs[index] = text
         return outputs

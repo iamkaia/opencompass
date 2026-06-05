@@ -68,6 +68,8 @@ class RouterMoELlamaInternalCompactCachedJoint(HuggingFacewithChatTemplate):
         force_mid_task: Optional[str] = None,
         debug_router_topk: int = 0,
         debug_router_max_prints: int = 0,
+        debug_router_prompt_on_dataset_change: bool = True,
+        debug_router_prompt_preview_chars: int = 320,
         debug_router_record_path: Optional[str] = None,
         routing_mode: str = "hard",
         routing_sharpness: float = 1.0,
@@ -116,6 +118,9 @@ class RouterMoELlamaInternalCompactCachedJoint(HuggingFacewithChatTemplate):
         )
         self._active_dataset_name = None
         self._printed_dataset_totals = {}
+        self._printed_dataset_prompt_debug = set()
+        self.debug_router_prompt_on_dataset_change = bool(debug_router_prompt_on_dataset_change)
+        self.debug_router_prompt_preview_chars = int(debug_router_prompt_preview_chars)
         self.debug_router_record_path = debug_router_record_path
         self._dataset_sample_counter = Counter()
         if self.debug_router_record_path:
@@ -198,6 +203,25 @@ class RouterMoELlamaInternalCompactCachedJoint(HuggingFacewithChatTemplate):
         if dataset_name not in self._dataset_pair_counter:
             self._dataset_pair_counter[dataset_name] = Counter()
         self._dataset_pair_counter[dataset_name][pair_key] += 1
+
+    def _maybe_print_dataset_prompt_debug(self, dataset_name: str, prompts: List[str]):
+        if not self.debug_router_prompt_on_dataset_change or not prompts:
+            return
+        if dataset_name in self._printed_dataset_prompt_debug:
+            return
+        self._printed_dataset_prompt_debug.add(dataset_name)
+        prompt = str(prompts[0])
+        preview = prompt.replace("\n", "\\n")
+        if len(preview) > self.debug_router_prompt_preview_chars:
+            preview = preview[: self.debug_router_prompt_preview_chars] + (
+                f"...<truncated {len(preview) - self.debug_router_prompt_preview_chars} chars>"
+            )
+        print(
+            f"[ROUTING_PROMPT][dataset={dataset_name}] before_router=true "
+            f"prompt_sha1={_prompt_hash(prompt)} prompt_len={len(prompt)} "
+            f"prompt_preview={preview}",
+            flush=True,
+        )
 
     def _append_routing_record(
         self,
@@ -299,6 +323,7 @@ class RouterMoELlamaInternalCompactCachedJoint(HuggingFacewithChatTemplate):
         if previous_dataset_name is not None and previous_dataset_name != dataset_name:
             self._flush_dataset_routing_summary(previous_dataset_name)
         self._active_dataset_name = dataset_name
+        self._maybe_print_dataset_prompt_debug(dataset_name, prompt_strs)
 
         outputs = self.core.generate(
             prompt_strs,

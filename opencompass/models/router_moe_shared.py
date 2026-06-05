@@ -43,14 +43,16 @@ class HardRoutedLoRALinear(nn.Module):
 
     def set_expert_weights(self, weights: Sequence[float] | torch.Tensor):
         weights = torch.as_tensor(weights, dtype=torch.float32)
-        if weights.ndim != 1 or weights.numel() != self.num_experts:
+        if weights.ndim not in (1, 2) or weights.shape[-1] != self.num_experts:
             raise ValueError(
-                f"Expected {self.num_experts} expert weights, got shape={tuple(weights.shape)}"
+                "Expected expert weights with shape "
+                f"[{self.num_experts}] or [batch_size, {self.num_experts}], "
+                f"got shape={tuple(weights.shape)}"
             )
         if bool((weights < 0).any().item()):
             raise ValueError("Expert weights must be non-negative.")
-        weight_sum = float(weights.sum().item())
-        if weight_sum <= 0.0:
+        weight_sum = weights.sum(dim=-1, keepdim=True)
+        if bool((weight_sum <= 0).any().item()):
             raise ValueError("Expert weights must contain positive mass.")
         self.active_weights = (weights / weight_sum).detach().clone()
 
@@ -58,13 +60,22 @@ class HardRoutedLoRALinear(nn.Module):
         y = self.base(x)
         if self.active_weights is not None:
             weights = self.active_weights.to(device=x.device, dtype=x.dtype)
+            if weights.ndim == 2 and weights.size(0) != x.size(0):
+                raise ValueError(
+                    f"Batch expert weights have batch_size={weights.size(0)}, "
+                    f"but input has batch_size={x.size(0)}."
+                )
             delta = torch.zeros_like(y)
             for eid in range(1, self.num_experts):
-                if float(weights[eid].item()) == 0.0:
+                expert_weight = weights[eid] if weights.ndim == 1 else weights[:, eid]
+                if not bool((expert_weight != 0).any().item()):
                     continue
                 A = self.A[eid].to(device=x.device, dtype=x.dtype)
                 B = self.B[eid].to(device=x.device, dtype=x.dtype)
-                delta = delta + weights[eid] * ((x @ A.t()) @ B.t())
+                expert_delta = (x @ A.t()) @ B.t()
+                if weights.ndim == 2:
+                    expert_weight = expert_weight.view(expert_weight.size(0), *([1] * (expert_delta.ndim - 1)))
+                delta = delta + expert_weight * expert_delta
             return y + self.scale * delta
         eid = int(self.active_expert)
         A = self.A[eid].to(device=x.device, dtype=x.dtype)
