@@ -43,7 +43,7 @@ infer_cfg = dict(
         ),
     ),
     retriever=dict(type=ZeroRetriever),
-    inferencer=dict(type=GenInferencer),
+    inferencer=dict(type=GenInferencer, max_out_len=64),
 )
 
 eval_cfg = dict(

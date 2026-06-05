@@ -31,7 +31,7 @@ infer_cfg = dict(
         )
     ),
     retriever=dict(type=ZeroRetriever),
-    inferencer=dict(type=GenInferencer), ####不能加max_out_len, model會只輸出奇怪的字
+    inferencer=dict(type=GenInferencer, max_out_len=64), ####不能加max_out_len, model會只輸出奇怪的字
 )
 
 ####用Acc evaluator, 前處理用sst2_postprocess回答整理成可比對 label
