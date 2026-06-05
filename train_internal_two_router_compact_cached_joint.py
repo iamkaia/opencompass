@@ -370,6 +370,35 @@ class CachedLossMatrixDataset(Dataset):
         }
 
 
+def preview_text(text: str, limit: int = 320) -> str:
+    text = str(text).replace("\n", "\\n")
+    if len(text) <= limit:
+        return text
+    return text[:limit] + f"...<truncated {len(text) - limit} chars>"
+
+
+def print_cache_prompt_examples(dataset, split: str, max_per_task: int, preview_chars: int):
+    if max_per_task <= 0:
+        return
+    counts: Dict[str, int] = {}
+    expected_tasks = list(getattr(dataset, "sample_task_names", []) or [])
+    for idx in range(len(dataset)):
+        item = dataset[idx]
+        task = str(item["task"])
+        if counts.get(task, 0) >= max_per_task:
+            continue
+        counts[task] = counts.get(task, 0) + 1
+        prompt = item.get("prompt_text", item.get("text", ""))
+        print(
+            f"[TRAIN_CACHE_PROMPT][split={split}][task={task}] "
+            f"item_id={item.get('item_id')} prompt_len={len(str(prompt))} "
+            f"prompt={preview_text(prompt, preview_chars)}",
+            flush=True,
+        )
+        if expected_tasks and all(counts.get(task_name, 0) >= max_per_task for task_name in expected_tasks):
+            break
+
+
 @dataclass
 class Batch:
     texts: List[str]
@@ -995,6 +1024,13 @@ def main():
         action="store_true",
         help="Load --load_from and only evaluate cached train/validation splits without updating weights.",
     )
+    parser.add_argument(
+        "--debug_cache_prompt_examples",
+        type=int,
+        default=1,
+        help="Print this many cached prompt examples per task for train and validation splits.",
+    )
+    parser.add_argument("--debug_cache_prompt_preview_chars", type=int, default=320)
     parser.add_argument("--wandb", action="store_true")
     parser.add_argument("--wandb_project", type=str, default="router_answer_supervision")
     parser.add_argument("--wandb_name", type=str, default=None)
@@ -1072,6 +1108,18 @@ def main():
         f"pair_loss_normalization={args.pair_loss_normalization} "
         f"best_metric={args.best_metric} "
         f"sample_feature_mode={args.sample_feature_mode}"
+    )
+    print_cache_prompt_examples(
+        train_ds,
+        split="train",
+        max_per_task=args.debug_cache_prompt_examples,
+        preview_chars=args.debug_cache_prompt_preview_chars,
+    )
+    print_cache_prompt_examples(
+        val_ds,
+        split="validation",
+        max_per_task=args.debug_cache_prompt_examples,
+        preview_chars=args.debug_cache_prompt_preview_chars,
     )
     train_cfg = vars(args).copy()
     train_cfg["resolved_feature_roots"] = feature_roots

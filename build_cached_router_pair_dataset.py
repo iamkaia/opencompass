@@ -52,6 +52,44 @@ def save_chunk(items: List[Dict], split_dir: str, chunk_idx: int, manifest_files
     manifest_files.append(filename)
 
 
+def preview_text(text: str, limit: int = 320) -> str:
+    text = str(text).replace("\n", "\\n")
+    if len(text) <= limit:
+        return text
+    return text[:limit] + f"...<truncated {len(text) - limit} chars>"
+
+
+def model_uses_qwen_chat_template(model_path: str) -> bool:
+    return "qwen" in str(model_path).lower()
+
+
+def normalize_chat_template_content(prompt: str, model_path: str) -> str:
+    text = str(prompt)
+    # OpenCompass PromptTemplate leaves a newline after the user round before
+    # Qwen's <|im_end|>. Cache the same text so train-time and eval-time
+    # routing see the same message boundary.
+    if model_uses_qwen_chat_template(model_path) and not text.endswith("\n"):
+        return text + "\n"
+    return text
+
+
+def apply_cache_prompt_template(prompt: str, tokenizer, mode: str, model_path: str) -> str:
+    if mode == "raw":
+        return str(prompt)
+    if mode != "chat_template":
+        raise ValueError(f"Unsupported cache_prompt_template={mode!r}")
+    if not hasattr(tokenizer, "apply_chat_template"):
+        raise ValueError(
+            "--cache_prompt_template chat_template requires a tokenizer with apply_chat_template"
+        )
+    content = normalize_chat_template_content(prompt, model_path)
+    return tokenizer.apply_chat_template(
+        [{"role": "user", "content": content}],
+        tokenize=False,
+        add_generation_prompt=True,
+    )
+
+
 ###建datasets的cache
 def process_split(
     model: JointAnswerSupervisionRouterModel,
@@ -69,6 +107,9 @@ def process_split(
     num_workers: int,
     chunk_size: int,
     feature_contract: Dict,
+    cache_prompt_template: str,
+    base_model_path: str,
+    print_cache_prompt_examples: bool,
 ):
     dataset, task_names = build_dataset(
         data_root=data_root,
@@ -96,6 +137,7 @@ def process_split(
     device = next(model.parameters()).device
     num_tasks = len(model.expert_names)
     total_items = 0
+    printed_prompt_tasks = set()
     total_batches = len(loader)
     progress = tqdm(
         loader,
@@ -131,9 +173,26 @@ def process_split(
         target 部分才算 loss
         '''
 
+        cache_prompt_texts = [
+            apply_cache_prompt_template(text, llm_tokenizer, cache_prompt_template, base_model_path)
+            for text in batch.texts
+        ]
+        if print_cache_prompt_examples:
+            for task_name, raw_text, cache_text in zip(batch.task_names, batch.texts, cache_prompt_texts):
+                if task_name in printed_prompt_tasks:
+                    continue
+                printed_prompt_tasks.add(task_name)
+                print(
+                    f"[CACHE_PROMPT][split={split}][task={task_name}] "
+                    f"template={cache_prompt_template} raw_len={len(str(raw_text))} "
+                    f"cache_len={len(str(cache_text))} "
+                    f"raw={preview_text(raw_text)} cache={preview_text(cache_text)}",
+                    flush=True,
+                )
+
         lm_batch = build_lm_batch(
             tokenizer=llm_tokenizer,
-            prompts=batch.texts,
+            prompts=cache_prompt_texts,
             targets=batch.targets,
             max_length=max_llm_len,
             add_eos_to_target=add_eos_to_target,
@@ -184,7 +243,7 @@ def process_split(
         task_ids_cpu = batch.task_ids.cpu()
 
         for idx in range(len(batch.texts)):
-            prompt_text = batch.texts[idx]
+            prompt_text = cache_prompt_texts[idx]
             chunk_items.append(
                 {
                     # Cache the same canonical prompt for both legacy `text`
@@ -195,6 +254,8 @@ def process_split(
                     "source_text": prompt_text,
                     "prompt_text": prompt_text,
                     "original_source_text": batch.source_texts[idx],
+                    "raw_prompt_text": batch.texts[idx],
+                    "cache_prompt_template": cache_prompt_template,
                     "target": batch.targets[idx],
                     "task": batch.task_names[idx],
                     "task_id": int(task_ids_cpu[idx].item()),
@@ -266,6 +327,10 @@ def process_split(
             "has_prediction_matrix": True,
             "score_mode": str(score_mode),
             "sst2_option_labels": "words",
+            "cache_prompt_template": cache_prompt_template,
+            "cache_chat_template_qwen_trailing_newline": model_uses_qwen_chat_template(
+                base_model_path
+            ),
             **feature_contract,
         },
         os.path.join(split_dir, "manifest.json"),
@@ -309,6 +374,21 @@ def main():
 
     parser.add_argument("--chunk_size", type=int, default=2048)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--cache_prompt_template",
+        type=str,
+        default="raw",
+        choices=["raw", "chat_template"],
+        help=(
+            "Prompt string used for cached LLM vectors and cached router BERT input. "
+            "Use chat_template to match OpenCompass runtime router prompts."
+        ),
+    )
+    parser.add_argument(
+        "--no_print_cache_prompt_examples",
+        action="store_true",
+        help="Disable one prompt preview per task while building cache.",
+    )
     ####有的時候不會所有expert都掛上去這樣可以嗎?
     parser.add_argument("--lora_iwslt", type=str, default='./saves/llama2-7b-chat-hf/lora/sft_iwslt')
     parser.add_argument("--lora_medmcqa", type=str, default='./saves/llama2-7b-chat-hf/lora/sft_medmcqa')
@@ -391,6 +471,10 @@ def main():
             "dtype": args.dtype,
             "score_mode": str(args.score_mode),
             "sst2_option_labels": "words",
+            "cache_prompt_template": args.cache_prompt_template,
+            "cache_chat_template_qwen_trailing_newline": model_uses_qwen_chat_template(
+                args.base_model_path
+            ),
             "chunk_size": args.chunk_size,
             "seed": args.seed,
         },
@@ -413,6 +497,9 @@ def main():
         num_workers=args.num_workers,
         chunk_size=args.chunk_size,
         feature_contract=feature_contract,
+        cache_prompt_template=args.cache_prompt_template,
+        base_model_path=args.base_model_path,
+        print_cache_prompt_examples=not args.no_print_cache_prompt_examples,
     )
     process_split(
         model=model,
@@ -430,6 +517,9 @@ def main():
         num_workers=args.num_workers,
         chunk_size=args.chunk_size,
         feature_contract=feature_contract,
+        cache_prompt_template=args.cache_prompt_template,
+        base_model_path=args.base_model_path,
+        print_cache_prompt_examples=not args.no_print_cache_prompt_examples,
     )
     print("[DONE] cached dataset build finished")
 
