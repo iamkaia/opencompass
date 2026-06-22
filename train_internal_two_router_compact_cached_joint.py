@@ -35,6 +35,13 @@ FEATURE_CONTRACT_KEYS = (
     "router_pooling_last_k",
     "llama_hidden_size",
 )
+MINIMIZE_BEST_METRICS = {
+    "loss",
+    "cache_oracle_matrix_kl",
+    "weighted_sum_marginal_mse",
+    "weighted_sum_first_mse",
+    "weighted_sum_mid_mse",
+}
 
 
 def save_json(obj: Dict, path: str):
@@ -98,6 +105,8 @@ def build_router_target_distribution(
     loss_normalization: str,
     correct_soft_ce_temperature: float,
     self_preserve_weight: float,
+    target_distribution_policy: str = "cache_oracle",
+    target_empty_fallback: str = "zero",
 ) -> Optional[torch.Tensor]:
     num_tasks = loss_matrix.size(2)
     flat_correct = correct_matrix.to(device=pair_logits.device, dtype=torch.float32).view(loss_matrix.size(0), -1)
@@ -105,15 +114,52 @@ def build_router_target_distribution(
     correct_available = correct_counts > 0
     zero_target = torch.zeros_like(flat_correct)
 
+    def empty_target() -> torch.Tensor:
+        fallback = str(target_empty_fallback)
+        if fallback == "zero":
+            return zero_target
+        if fallback == "uniform":
+            return torch.full_like(flat_correct, 1.0 / max(flat_correct.size(1), 1))
+        if fallback == "loss_softmax":
+            normalized_loss_matrix = normalize_pair_loss_matrix(
+                loss_matrix=loss_matrix,
+                method=loss_normalization,
+            )
+            normalized_flat_loss = normalized_loss_matrix.view(normalized_loss_matrix.size(0), -1)
+            temperature = max(float(correct_soft_ce_temperature), 1e-6)
+            return torch.softmax(-normalized_flat_loss / temperature, dim=-1)
+        raise ValueError(f"Unsupported target_empty_fallback={target_empty_fallback}")
+
+    def apply_target_policy(target: torch.Tensor) -> torch.Tensor:
+        policy = str(target_distribution_policy)
+        if policy == "cache_oracle":
+            return target
+        if policy != "self_task_if_available":
+            raise ValueError(f"Unsupported target_distribution_policy={target_distribution_policy}")
+        task_ids_device = task_ids.to(device=pair_logits.device, dtype=torch.long)
+        valid_self_task = (task_ids_device >= 0) & (task_ids_device < num_tasks)
+        self_pair_ids = task_ids_device.clamp(min=0, max=max(num_tasks - 1, 0)) * num_tasks + task_ids_device.clamp(
+            min=0, max=max(num_tasks - 1, 0)
+        )
+        self_target = torch.zeros_like(target)
+        self_target.scatter_(1, self_pair_ids.unsqueeze(1), 1.0)
+        return torch.where(valid_self_task.unsqueeze(1), self_target, target)
+
     if str(joint_loss) == "correct_soft_ce":
         target = torch.where(
             correct_available,
             flat_correct / correct_counts.clamp_min(1.0),
-            zero_target,
+            empty_target(),
         )
+        target = apply_target_policy(target)
         return target.view(loss_matrix.size(0), num_tasks, num_tasks)
 
-    if str(joint_loss) in {"correct_conf_ce", "correct_conf_ce_plus_margin", "self_preserving_correct_conf_ce"}:
+    if str(joint_loss) in {
+        "correct_conf_ce",
+        "correct_conf_ce_plus_margin",
+        "self_preserving_correct_conf_ce",
+        "cache_oracle_matrix_kl",
+    }:
         normalized_loss_matrix = normalize_pair_loss_matrix(
             loss_matrix=loss_matrix,
             method=loss_normalization,
@@ -121,14 +167,23 @@ def build_router_target_distribution(
         normalized_flat_loss = normalized_loss_matrix.view(normalized_loss_matrix.size(0), -1)
         temperature = max(float(correct_soft_ce_temperature), 1e-6)
         correct_conf_logits = -normalized_flat_loss / temperature
-        correct_conf_logits = correct_conf_logits.masked_fill(flat_correct <= 0, -1e9)
+        if str(joint_loss) == "cache_oracle_matrix_kl":
+            correct_conf_logits = torch.where(
+                correct_available,
+                correct_conf_logits.masked_fill(flat_correct <= 0, -1e9),
+                correct_conf_logits,
+            )
+        else:
+            correct_conf_logits = correct_conf_logits.masked_fill(flat_correct <= 0, -1e9)
         correct_conf_target = torch.softmax(correct_conf_logits, dim=-1)
-        correct_conf_target = torch.where(
-            correct_available,
-            correct_conf_target,
-            zero_target,
-        )
+        if str(joint_loss) != "cache_oracle_matrix_kl":
+            correct_conf_target = torch.where(
+                correct_available,
+                correct_conf_target,
+                empty_target(),
+            )
         if str(joint_loss) != "self_preserving_correct_conf_ce":
+            correct_conf_target = apply_target_policy(correct_conf_target)
             return correct_conf_target.view(loss_matrix.size(0), num_tasks, num_tasks)
 
         preserve_weight = min(max(float(self_preserve_weight), 0.0), 1.0)
@@ -149,9 +204,81 @@ def build_router_target_distribution(
             soft_self_target,
             correct_conf_target,
         )
+        self_preserving_target = apply_target_policy(self_preserving_target)
         return self_preserving_target.view(loss_matrix.size(0), num_tasks, num_tasks)
 
     return None
+
+
+def compute_cache_oracle_matrix_kl(
+    pair_logits: torch.Tensor,
+    router_target_matrix: Optional[torch.Tensor],
+) -> tuple[torch.Tensor, Dict[str, float]]:
+    zero_loss = pair_logits.sum() * 0.0
+    if router_target_matrix is None:
+        return zero_loss, {
+            "cache_oracle_matrix_kl": 0.0,
+            "cache_oracle_matrix_target_available_ratio": 0.0,
+        }
+
+    target_pair = router_target_matrix.to(device=pair_logits.device, dtype=torch.float32)
+    target = target_pair.view(target_pair.size(0), -1)
+    target_mass = target.sum(dim=-1, keepdim=True)
+    available = target_mass.squeeze(-1) > 0
+    target = target / target_mass.clamp_min(1e-12)
+    log_pair_prob = nn.functional.log_softmax(pair_logits, dim=-1)
+    if bool(available.any().item()):
+        kl = nn.functional.kl_div(log_pair_prob[available], target[available], reduction="batchmean")
+    else:
+        kl = zero_loss
+    metrics = {
+        "cache_oracle_matrix_kl": float(kl.detach().item()),
+        "cache_oracle_matrix_target_available_ratio": float(available.float().mean().item()),
+    }
+    return kl, metrics
+
+
+def compute_weighted_sum_marginal_mse(
+    pair_logits: torch.Tensor,
+    router_target_matrix: Optional[torch.Tensor],
+) -> tuple[torch.Tensor, Dict[str, float], Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]:
+    zero_loss = pair_logits.sum() * 0.0
+    if router_target_matrix is None:
+        return zero_loss, {
+            "weighted_sum_marginal_mse": 0.0,
+            "weighted_sum_first_mse": 0.0,
+            "weighted_sum_mid_mse": 0.0,
+            "weighted_sum_target_available_ratio": 0.0,
+        }, None, None, None, None
+
+    num_tasks = router_target_matrix.size(2)
+    pair_prob_matrix = torch.softmax(pair_logits, dim=-1).view(-1, num_tasks, num_tasks)
+    target_pair = router_target_matrix.to(device=pair_logits.device, dtype=torch.float32)
+    target_mass = target_pair.sum(dim=(1, 2), keepdim=True)
+    available = target_mass.squeeze(-1).squeeze(-1) > 0
+    target_pair = target_pair / target_mass.clamp_min(1e-12)
+
+    pred_first = pair_prob_matrix.sum(dim=2)
+    pred_mid = pair_prob_matrix.sum(dim=1)
+    target_first = target_pair.sum(dim=2)
+    target_mid = target_pair.sum(dim=1)
+
+    if bool(available.any().item()):
+        first_mse = nn.functional.mse_loss(pred_first[available], target_first[available])
+        mid_mse = nn.functional.mse_loss(pred_mid[available], target_mid[available])
+        marginal_mse = first_mse + mid_mse
+    else:
+        first_mse = zero_loss
+        mid_mse = zero_loss
+        marginal_mse = zero_loss
+
+    metrics = {
+        "weighted_sum_marginal_mse": float(marginal_mse.detach().item()),
+        "weighted_sum_first_mse": float(first_mse.detach().item()),
+        "weighted_sum_mid_mse": float(mid_mse.detach().item()),
+        "weighted_sum_target_available_ratio": float(available.float().mean().item()),
+    }
+    return marginal_mse, metrics, pred_first, pred_mid, target_first, target_mid
 
 
 def load_cache_feature_contract(root: str, manifest: Dict) -> Dict:
@@ -560,6 +687,10 @@ def evaluate(
     supervision_mode,
     correct_soft_ce_temperature,
     self_preserve_weight,
+    target_distribution_policy,
+    target_empty_fallback,
+    weighted_sum_marginal_mse_weight,
+    weighted_sum_aux_only,
     topk_weighted_temperatures,
     collect_route_records: bool = False,
 ):
@@ -622,13 +753,32 @@ def evaluate(
             loss_normalization=pair_loss_normalization,
             correct_soft_ce_temperature=correct_soft_ce_temperature,
             self_preserve_weight=self_preserve_weight,
+            target_distribution_policy=target_distribution_policy,
+            target_empty_fallback=target_empty_fallback,
         )
-        if supervision_mode == "self_pair_ce":
+        marginal_mse, marginal_metrics, pred_first_weights, pred_mid_weights, target_first_weights, target_mid_weights = (
+            compute_weighted_sum_marginal_mse(pair_logits, router_target_matrix)
+        )
+        metrics.update(marginal_metrics)
+        matrix_kl, matrix_kl_metrics = compute_cache_oracle_matrix_kl(pair_logits, router_target_matrix)
+        metrics.update(matrix_kl_metrics)
+        metrics["weighted_sum_marginal_mse_weight"] = float(weighted_sum_marginal_mse_weight)
+        metrics["weighted_sum_aux_only"] = float(bool(weighted_sum_aux_only))
+        if joint_loss == "cache_oracle_matrix_kl":
+            metrics["base_objective_loss"] = float(oracle_loss.detach().item())
+            loss = matrix_kl
+        elif supervision_mode == "self_pair_ce":
             loss, _ = compute_self_pair_ce(pair_logits, batch.task_ids.to(device), batch.loss_matrix.size(2))
             metrics["self_pair_ce"] = float(loss.detach().item())
             metrics["oracle_objective_loss"] = float(oracle_loss.detach().item())
         else:
             loss = oracle_loss
+        if bool(weighted_sum_aux_only):
+            metrics["base_objective_loss"] = float(loss.detach().item())
+            loss = marginal_mse
+        elif float(weighted_sum_marginal_mse_weight) > 0:
+            metrics["base_objective_loss"] = float(loss.detach().item())
+            loss = loss + float(weighted_sum_marginal_mse_weight) * marginal_mse
         pred_pair = pair_logits.argmax(dim=-1)
         num_tasks = batch.loss_matrix.size(2)
         pred_first = pred_pair // num_tasks
@@ -762,6 +912,10 @@ def evaluate(
         best_mid_cpu = best_mid.detach().cpu().tolist()
         pair_prob_matrix_cpu = pair_prob_matrix.detach().cpu()
         router_target_matrix_cpu = router_target_matrix.detach().cpu() if router_target_matrix is not None else None
+        pred_first_weights_cpu = pred_first_weights.detach().cpu() if pred_first_weights is not None else None
+        pred_mid_weights_cpu = pred_mid_weights.detach().cpu() if pred_mid_weights is not None else None
+        target_first_weights_cpu = target_first_weights.detach().cpu() if target_first_weights is not None else None
+        target_mid_weights_cpu = target_mid_weights.detach().cpu() if target_mid_weights is not None else None
         raw_flat_loss = batch.loss_matrix.view(batch.loss_matrix.size(0), -1)
         for idx, item_id in enumerate(batch.item_ids):
             pred_pair_name = f"{task_names[pred_first_cpu[idx]]}->{task_names[pred_mid_cpu[idx]]}"
@@ -818,6 +972,18 @@ def evaluate(
                     "router_target_matrix": (
                         router_target_matrix_cpu[idx].tolist() if router_target_matrix_cpu is not None else None
                     ),
+                    "pred_first_weights": (
+                        pred_first_weights_cpu[idx].tolist() if pred_first_weights_cpu is not None else None
+                    ),
+                    "pred_mid_weights": (
+                        pred_mid_weights_cpu[idx].tolist() if pred_mid_weights_cpu is not None else None
+                    ),
+                    "target_first_weights": (
+                        target_first_weights_cpu[idx].tolist() if target_first_weights_cpu is not None else None
+                    ),
+                    "target_mid_weights": (
+                        target_mid_weights_cpu[idx].tolist() if target_mid_weights_cpu is not None else None
+                    ),
                     "pred_answer": pred_answer,
                     "gold_answer": gold_answer,
                     "pred_option_probs": pred_option_probs,
@@ -855,6 +1021,10 @@ def save_ckpt(
     pseudo_ce_weight,
     correct_soft_ce_temperature,
     self_preserve_weight,
+    target_distribution_policy,
+    target_empty_fallback,
+    weighted_sum_marginal_mse_weight,
+    weighted_sum_aux_only,
     pair_loss_normalization,
     supervision_mode,
     best_metric,
@@ -893,12 +1063,20 @@ def save_ckpt(
             "llama_hidden_size": int(llama_hidden_size),
             "router_dim": int(router_dim),
             "feature_contract_version": 1,
-            "supervision_type": "cached_pair_ce_main",
+            "supervision_type": (
+                "cache_oracle_weighted_matrix_kl"
+                if str(joint_loss) == "cache_oracle_matrix_kl"
+                else "cached_pair_ce_main"
+            ),
             "supervision_mode": str(supervision_mode),
             "joint_loss": str(joint_loss),
             "pseudo_ce_weight": float(pseudo_ce_weight),
             "correct_soft_ce_temperature": float(correct_soft_ce_temperature),
             "self_preserve_weight": float(self_preserve_weight),
+            "target_distribution_policy": str(target_distribution_policy),
+            "target_empty_fallback": str(target_empty_fallback),
+            "weighted_sum_marginal_mse_weight": float(weighted_sum_marginal_mse_weight),
+            "weighted_sum_aux_only": bool(weighted_sum_aux_only),
             "pair_loss_normalization": str(pair_loss_normalization),
             "best_epoch": epoch,
             "best_metric": str(best_metric),
@@ -959,6 +1137,45 @@ def main():
         default="0.5,1.0",
         help="Comma-separated router-logit temperatures for top-k weighted option-prob voting metrics.",
     )
+    parser.add_argument(
+        "--weighted_sum_marginal_mse_weight",
+        type=float,
+        default=0.0,
+        help=(
+            "Auxiliary loss weight for matching weighted_sum first/mid marginal expert "
+            "weights derived from the pair target distribution. Set >0 to keep the "
+            "main pair objective and add first/mid marginal MSE."
+        ),
+    )
+    parser.add_argument(
+        "--weighted_sum_aux_only",
+        action="store_true",
+        help=(
+            "Use weighted_sum_marginal_mse as the training/eval loss directly, "
+            "without adding the main pair objective such as correct_conf_ce."
+        ),
+    )
+    parser.add_argument(
+        "--target_distribution_policy",
+        type=str,
+        default="cache_oracle",
+        choices=["cache_oracle", "self_task_if_available"],
+        help=(
+            "cache_oracle keeps the original loss/correctness-derived target. "
+            "self_task_if_available forces samples whose task exists on the expert "
+            "axis to task->task, and falls back to the original target otherwise."
+        ),
+    )
+    parser.add_argument(
+        "--target_empty_fallback",
+        type=str,
+        default="zero",
+        choices=["zero", "uniform", "loss_softmax"],
+        help=(
+            "Fallback target for correct_conf_ce-style samples without any correct pair. "
+            "Use uniform for runtime-weighted_sum-style training targets that must keep positive mass."
+        ),
+    )
     '''
     oracle_loss：使用 cache 裡的 loss_matrix 訓練。
     也就是讓 router 學「哪個 expert pair 實際 loss 比較低」。
@@ -999,9 +1216,13 @@ def main():
             "joint_acc",
             "first_acc",
             "mid_acc",
+            "cache_oracle_matrix_kl",
+            "weighted_sum_marginal_mse",
+            "weighted_sum_first_mse",
+            "weighted_sum_mid_mse",
             "loss",
         ],
-        help="Validation metric for checkpointing/early stopping. All choices are maximized except loss.",
+        help="Validation metric for checkpointing/early stopping. Loss/KL/MSE metrics are minimized; accuracy/score metrics are maximized.",
     )
     ####validation router score 連續幾個 epoch 沒進步就停。
     parser.add_argument("--early_stop_patience", type=int, default=2)
@@ -1105,6 +1326,8 @@ def main():
         f"pseudo_ce_weight={args.pseudo_ce_weight} pseudo_ce_margin={args.pseudo_ce_margin} "
         f"correct_soft_ce_temperature={args.correct_soft_ce_temperature} "
         f"self_preserve_weight={args.self_preserve_weight} "
+        f"target_distribution_policy={args.target_distribution_policy} "
+        f"target_empty_fallback={args.target_empty_fallback} "
         f"pair_loss_normalization={args.pair_loss_normalization} "
         f"best_metric={args.best_metric} "
         f"sample_feature_mode={args.sample_feature_mode}"
@@ -1204,6 +1427,10 @@ def main():
             supervision_mode=args.supervision_mode,
             correct_soft_ce_temperature=args.correct_soft_ce_temperature,
             self_preserve_weight=args.self_preserve_weight,
+            target_distribution_policy=args.target_distribution_policy,
+            target_empty_fallback=args.target_empty_fallback,
+            weighted_sum_marginal_mse_weight=args.weighted_sum_marginal_mse_weight,
+            weighted_sum_aux_only=args.weighted_sum_aux_only,
             topk_weighted_temperatures=topk_weighted_temperatures,
             collect_route_records=args.save_route_records,
         )
@@ -1238,6 +1465,10 @@ def main():
             supervision_mode=args.supervision_mode,
             correct_soft_ce_temperature=args.correct_soft_ce_temperature,
             self_preserve_weight=args.self_preserve_weight,
+            target_distribution_policy=args.target_distribution_policy,
+            target_empty_fallback=args.target_empty_fallback,
+            weighted_sum_marginal_mse_weight=args.weighted_sum_marginal_mse_weight,
+            weighted_sum_aux_only=args.weighted_sum_aux_only,
             topk_weighted_temperatures=topk_weighted_temperatures,
             collect_route_records=args.save_route_records,
         )
@@ -1270,7 +1501,8 @@ def main():
     warmup_steps = int(total_steps * args.warmup_ratio)
     scheduler = get_linear_schedule_with_warmup(optimizer, warmup_steps, total_steps)
 
-    best_metric_value = float("inf") if args.best_metric == "loss" else float("-inf")
+    minimize_best_metric = args.best_metric in MINIMIZE_BEST_METRICS
+    best_metric_value = float("inf") if minimize_best_metric else float("-inf")
     best_router_score = float("-inf")
     best_epoch = -1
     no_improve_epochs = 0
@@ -1327,13 +1559,43 @@ def main():
                 correct_soft_ce_temperature=args.correct_soft_ce_temperature,
                 self_preserve_weight=args.self_preserve_weight,
             )
+            router_target_matrix = build_router_target_distribution(
+                pair_logits=pair_logits,
+                loss_matrix=batch.loss_matrix.to(device),
+                correct_matrix=batch.correct_matrix.to(device),
+                task_ids=batch.task_ids.to(device),
+                joint_loss=args.joint_loss,
+                loss_normalization=args.pair_loss_normalization,
+                correct_soft_ce_temperature=args.correct_soft_ce_temperature,
+                self_preserve_weight=args.self_preserve_weight,
+                target_distribution_policy=args.target_distribution_policy,
+                target_empty_fallback=args.target_empty_fallback,
+            )
+            marginal_mse, marginal_metrics, _, _, _, _ = compute_weighted_sum_marginal_mse(
+                pair_logits,
+                router_target_matrix,
+            )
+            metrics.update(marginal_metrics)
+            matrix_kl, matrix_kl_metrics = compute_cache_oracle_matrix_kl(pair_logits, router_target_matrix)
+            metrics.update(matrix_kl_metrics)
+            metrics["weighted_sum_marginal_mse_weight"] = float(args.weighted_sum_marginal_mse_weight)
+            metrics["weighted_sum_aux_only"] = float(bool(args.weighted_sum_aux_only))
             ####--supervision_mode self_pair_ce, loss=自己的task
-            if args.supervision_mode == "self_pair_ce":
+            if args.joint_loss == "cache_oracle_matrix_kl":
+                metrics["base_objective_loss"] = float(oracle_loss.detach().item())
+                loss = matrix_kl
+            elif args.supervision_mode == "self_pair_ce":
                 loss, _ = compute_self_pair_ce(pair_logits, batch.task_ids.to(device), batch.loss_matrix.size(2))
                 metrics["self_pair_ce"] = float(loss.detach().item())
                 metrics["oracle_objective_loss"] = float(oracle_loss.detach().item())
             else:
                 loss = oracle_loss
+            if bool(args.weighted_sum_aux_only):
+                metrics["base_objective_loss"] = float(loss.detach().item())
+                loss = marginal_mse
+            elif float(args.weighted_sum_marginal_mse_weight) > 0:
+                metrics["base_objective_loss"] = float(loss.detach().item())
+                loss = loss + float(args.weighted_sum_marginal_mse_weight) * marginal_mse
 
             if epoch == 1 and step == 1:
                 print("pair_logits[0] =", pair_logits[0].detach().cpu())
@@ -1401,6 +1663,7 @@ def main():
                 print(
                     f"[TRAIN] epoch={epoch} step={step}/{len(train_loader)} "
                     f"loss={avg_loss:.4f} pair_ce={avg_metrics['main_pair_ce']:.4f} expected={avg_metrics['expected_loss']:.4f} "
+                    f"wsmse={avg_metrics.get('weighted_sum_marginal_mse', 0.0):.6f} "
                     f"best_pair={avg_metrics['best_pair_loss']:.4f} "
                     f"router_score={avg_metrics['router_argmax_score']:.2f} "
                     f"self_score={avg_metrics['fixed_self_score']:.2f} "
@@ -1477,11 +1740,16 @@ def main():
             supervision_mode=args.supervision_mode,
             correct_soft_ce_temperature=args.correct_soft_ce_temperature,
             self_preserve_weight=args.self_preserve_weight,
+            target_distribution_policy=args.target_distribution_policy,
+            target_empty_fallback=args.target_empty_fallback,
+            weighted_sum_marginal_mse_weight=args.weighted_sum_marginal_mse_weight,
+            weighted_sum_aux_only=args.weighted_sum_aux_only,
             topk_weighted_temperatures=topk_weighted_temperatures,
             collect_route_records=args.save_route_records,
         )
         print(
             f"[VAL] epoch={epoch} loss={val_metrics['loss']:.4f} "
+            f"wsmse={val_metrics.get('weighted_sum_marginal_mse', 0.0):.6f} "
             f"router_score={val_metrics['router_argmax_score']:.2f} "
             f"self_score={val_metrics['fixed_self_score']:.2f} "
             f"oracle_score={val_metrics['oracle_best_pair_score']:.2f} "
@@ -1528,11 +1796,16 @@ def main():
                 supervision_mode=args.supervision_mode,
                 correct_soft_ce_temperature=args.correct_soft_ce_temperature,
                 self_preserve_weight=args.self_preserve_weight,
+                target_distribution_policy=args.target_distribution_policy,
+                target_empty_fallback=args.target_empty_fallback,
+                weighted_sum_marginal_mse_weight=args.weighted_sum_marginal_mse_weight,
+                weighted_sum_aux_only=args.weighted_sum_aux_only,
                 topk_weighted_temperatures=topk_weighted_temperatures,
                 collect_route_records=args.save_route_records,
             )
             print(
                 f"[TRAIN-EVAL] epoch={epoch} loss={train_eval_metrics['loss']:.4f} "
+                f"wsmse={train_eval_metrics.get('weighted_sum_marginal_mse', 0.0):.6f} "
                 f"router_score={train_eval_metrics['router_argmax_score']:.2f} "
                 f"self_score={train_eval_metrics['fixed_self_score']:.2f} "
                 f"oracle_score={train_eval_metrics['oracle_best_pair_score']:.2f} "
@@ -1615,7 +1888,7 @@ def main():
                 "val/oracle_self_pair_acc": val_metrics["oracle_self_pair_acc"],
                 "val/best_metric_value": current_best_metric
                 if best_epoch < 0
-                else (min(best_metric_value, current_best_metric) if args.best_metric == "loss" else max(best_metric_value, current_best_metric)),
+                else (min(best_metric_value, current_best_metric) if minimize_best_metric else max(best_metric_value, current_best_metric)),
                 "val/best_router_argmax_score": max(best_router_score, val_metrics["router_argmax_score"]),
             }
             for temperature in topk_weighted_temperatures:
@@ -1659,7 +1932,7 @@ def main():
                     flatten_routing_summary(train_eval_metrics["routing_summary"], prefix="train_eval_route")
                 )
             wandb_run.log(wandb_payload, step=global_step)
-        if args.best_metric == "loss":
+        if minimize_best_metric:
             improved = current_best_metric < (best_metric_value - args.early_stop_min_delta)
         else:
             improved = current_best_metric > (best_metric_value + args.early_stop_min_delta)
@@ -1680,6 +1953,10 @@ def main():
                 pseudo_ce_weight=args.pseudo_ce_weight,
                 correct_soft_ce_temperature=args.correct_soft_ce_temperature,
                 self_preserve_weight=args.self_preserve_weight,
+                target_distribution_policy=args.target_distribution_policy,
+                target_empty_fallback=args.target_empty_fallback,
+                weighted_sum_marginal_mse_weight=args.weighted_sum_marginal_mse_weight,
+                weighted_sum_aux_only=args.weighted_sum_aux_only,
                 pair_loss_normalization=args.pair_loss_normalization,
                 supervision_mode=args.supervision_mode,
                 best_metric=args.best_metric,

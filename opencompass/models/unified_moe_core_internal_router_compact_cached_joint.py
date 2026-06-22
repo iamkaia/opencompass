@@ -22,6 +22,7 @@ hidden_states[middle_layer_idx]
 '''
 import json
 import os
+import hashlib
 from collections import Counter, defaultdict
 from typing import Dict, List, Optional, Sequence
 
@@ -64,6 +65,9 @@ class UnifiedMoECoreInternalRouterCompactCachedJoint:
         routing_mode: str = "hard",
         routing_sharpness: float = 1.0,
         routing_topk: Optional[int] = None,
+        share_first_weights_all_layers: bool = False,
+        oracle_weight_path: Optional[str] = None,
+        static_weight_path: Optional[str] = None,
     ):
         self.max_seq_len = int(max_seq_len)
         self.route_counter = Counter()
@@ -73,10 +77,18 @@ class UnifiedMoECoreInternalRouterCompactCachedJoint:
         self.debug_router_max_prints = max(0, int(debug_router_max_prints))
         self.debug_router_print_count = 0
         self.routing_mode = str(routing_mode)
-        if self.routing_mode not in {"hard", "weighted_sum", "uniform"}:
+        if self.routing_mode not in {
+            "hard",
+            "weighted_sum",
+            "uniform",
+            "static_weighted_sum",
+            "cache_oracle_weighted_sum",
+            "cache_oracle_hard",
+        }:
             raise ValueError(
                 f"Unknown routing_mode={self.routing_mode!r}; "
-                "expected 'hard', 'weighted_sum', or 'uniform'."
+                "expected 'hard', 'weighted_sum', 'uniform', "
+                "'static_weighted_sum', 'cache_oracle_weighted_sum', or 'cache_oracle_hard'."
             )
         self.routing_sharpness = float(routing_sharpness)
         if self.routing_sharpness <= 0.0:
@@ -84,6 +96,17 @@ class UnifiedMoECoreInternalRouterCompactCachedJoint:
         self.routing_topk = None if routing_topk is None else int(routing_topk)
         if self.routing_topk is not None and self.routing_topk <= 0:
             raise ValueError("routing_topk must be positive when set.")
+        self.share_first_weights_all_layers = bool(share_first_weights_all_layers)
+        self.oracle_weight_path = oracle_weight_path
+        self.oracle_weight_by_hash = self._load_oracle_weight_table(oracle_weight_path)
+        if self.routing_mode.startswith("cache_oracle_") and not self.oracle_weight_by_hash:
+            raise ValueError(
+                f"routing_mode={self.routing_mode!r} requires a non-empty oracle_weight_path."
+            )
+        self.static_weight_path = static_weight_path
+        self.static_weight_by_dataset = self._load_static_weight_table(static_weight_path)
+        if self.routing_mode == "static_weighted_sum" and not self.static_weight_by_dataset:
+            raise ValueError("routing_mode='static_weighted_sum' requires a non-empty static_weight_path.")
         torch_dtype = torch.float16 if dtype == "float16" else torch.bfloat16
 
         cfg_path = os.path.join(router_ckpt_dir, "router_config.json")
@@ -134,7 +157,9 @@ class UnifiedMoECoreInternalRouterCompactCachedJoint:
             f"router_max_len={self.router_max_len}, "
             f"routing_mode={self.routing_mode}, "
             f"routing_sharpness={self.routing_sharpness}, "
-            f"routing_topk={self.routing_topk}",
+            f"routing_topk={self.routing_topk}, "
+            f"share_first_weights_all_layers={self.share_first_weights_all_layers}, "
+            f"oracle_weight_path={self.oracle_weight_path}",
             flush=True,
         )
 
@@ -227,6 +252,134 @@ class UnifiedMoECoreInternalRouterCompactCachedJoint:
         self.cached_bert_prev = None
         self.cached_bert_last = None
         self.cached_bert_mask = None
+
+    @staticmethod
+    def _prompt_hash(prompt: str) -> str:
+        return hashlib.sha1(str(prompt).encode("utf-8")).hexdigest()
+
+    def _load_oracle_weight_table(self, path: Optional[str]) -> Dict[str, Dict]:
+        if not path:
+            return {}
+        table = {}
+        with open(path, "r", encoding="utf-8") as f:
+            for line_no, line in enumerate(f, start=1):
+                line = line.strip()
+                if not line:
+                    continue
+                rec = json.loads(line)
+                prompt_sha1 = rec.get("prompt_sha1")
+                if not prompt_sha1:
+                    raise ValueError(f"Missing prompt_sha1 in {path}:{line_no}")
+                table[str(prompt_sha1)] = rec
+        return table
+
+    def _load_static_weight_table(self, path: Optional[str]) -> Dict[str, Dict]:
+        if not path:
+            return {}
+        with open(path, "r", encoding="utf-8") as f:
+            obj = json.load(f)
+        table = obj.get("weights_by_dataset", obj)
+        if not isinstance(table, dict):
+            raise ValueError(f"Invalid static weight table in {path}: expected a JSON object.")
+        out = {}
+        for name, rec in table.items():
+            if not isinstance(rec, dict):
+                raise ValueError(f"Invalid static weight record for {name!r}: expected an object.")
+            first_w = rec.get("first_weights")
+            mid_w = rec.get("mid_weights")
+            if first_w is None or mid_w is None:
+                raise ValueError(f"Static weight record for {name!r} is missing first_weights/mid_weights.")
+            out[str(name)] = {
+                "first_weights": [float(x) for x in first_w],
+                "mid_weights": [float(x) for x in mid_w],
+            }
+        return out
+
+    def _static_weight_record_for_dataset(self, dataset_name: Optional[str]) -> Dict:
+        candidates = []
+        if dataset_name:
+            name = str(dataset_name)
+            candidates.extend([name, name.lower()])
+            lowered = name.lower()
+            for suffix in ("_router_train", "_gen", "_main_gen", "_gen_sft_prompt"):
+                if lowered.endswith(suffix):
+                    candidates.append(lowered[: -len(suffix)])
+            if lowered.startswith("superglue_"):
+                candidates.append(lowered[len("superglue_") :])
+            if lowered in {"boolq"}:
+                candidates.extend(["BoolQ", "SuperGLUE_BoolQ_gen"])
+            if lowered in {"rte"}:
+                candidates.extend(["RTE", "SuperGLUE_RTE_gen"])
+        candidates.append("default")
+        for key in candidates:
+            rec = self.static_weight_by_dataset.get(key)
+            if rec is not None:
+                return rec
+        available = ", ".join(sorted(self.static_weight_by_dataset)[:20])
+        raise KeyError(
+            f"No static weights for dataset_name={dataset_name!r} in static_weight_path={self.static_weight_path}. "
+            f"Available examples: {available}"
+        )
+
+    def _static_routes_for_batch(self, batch_size: int, dataset_name: Optional[str], device: torch.device):
+        rec = self._static_weight_record_for_dataset(dataset_name)
+        first = torch.tensor([float(x) for x in rec["first_weights"]], device=device, dtype=torch.float32)
+        mid = torch.tensor([float(x) for x in rec["mid_weights"]], device=device, dtype=torch.float32)
+        if first.numel() != len(self.task_names) or mid.numel() != len(self.task_names):
+            raise ValueError(
+                f"Static weights for dataset_name={dataset_name!r} have shape "
+                f"first={tuple(first.shape)} mid={tuple(mid.shape)}, expected {len(self.task_names)}."
+            )
+        first = first / first.sum().clamp_min(1e-12)
+        mid = mid / mid.sum().clamp_min(1e-12)
+        first_eid = int(first.argmax().item()) + 1
+        mid_eid = int(mid.argmax().item()) + 1
+        first_weights = torch.cat([first.new_zeros(1), first]).unsqueeze(0).expand(batch_size, -1).contiguous()
+        mid_weights = torch.cat([mid.new_zeros(1), mid]).unsqueeze(0).expand(batch_size, -1).contiguous()
+        return (
+            torch.full((batch_size,), first_eid, device=device, dtype=torch.long),
+            torch.full((batch_size,), mid_eid, device=device, dtype=torch.long),
+            first_weights,
+            mid_weights,
+        )
+
+    def _oracle_routes_from_prompts(self, prompts: Sequence[str], device: torch.device):
+        first_eids = []
+        mid_eids = []
+        first_weights = []
+        mid_weights = []
+        missing = []
+        for prompt in prompts:
+            prompt_sha1 = self._prompt_hash(prompt)
+            rec = self.oracle_weight_by_hash.get(prompt_sha1)
+            if rec is None:
+                missing.append(prompt_sha1)
+                continue
+            if "first_eid" in rec and "mid_eid" in rec:
+                first_eids.append(int(rec["first_eid"]))
+                mid_eids.append(int(rec["mid_eid"]))
+            else:
+                first_task = rec.get("first_task")
+                mid_task = rec.get("mid_task")
+                first_eids.append(self.task_to_eid[str(first_task)])
+                mid_eids.append(self.task_to_eid[str(mid_task)])
+            first_w = rec.get("first_weights")
+            mid_w = rec.get("mid_weights")
+            if first_w is None or mid_w is None:
+                raise ValueError(f"Oracle record {prompt_sha1} is missing first_weights/mid_weights.")
+            first_weights.append([0.0] + [float(x) for x in first_w])
+            mid_weights.append([0.0] + [float(x) for x in mid_w])
+        if missing:
+            preview = ", ".join(missing[:3])
+            raise KeyError(
+                f"Missing {len(missing)} prompt hashes in oracle_weight_path={self.oracle_weight_path}: {preview}"
+            )
+        return (
+            torch.tensor(first_eids, device=device, dtype=torch.long),
+            torch.tensor(mid_eids, device=device, dtype=torch.long),
+            torch.tensor(first_weights, device=device, dtype=torch.float32),
+            torch.tensor(mid_weights, device=device, dtype=torch.float32),
+        )
 
     def _reset_runtime_cache(self):
         self.cached_first_eid = None
@@ -330,6 +483,40 @@ class UnifiedMoECoreInternalRouterCompactCachedJoint:
         dataset_name: Optional[str] = None,
         prompt_previews: Optional[Sequence[str]] = None,
     ):
+        if self.routing_mode == "static_weighted_sum":
+            first_eid, mid_eid, first_weights, mid_weights = self._static_routes_for_batch(
+                first_vec.size(0),
+                dataset_name,
+                first_vec.device,
+            )
+            self._maybe_print_topk_pair_logits(
+                pair_logits=torch.zeros(first_vec.size(0), len(self.task_names) * len(self.task_names), device=first_vec.device),
+                dataset_name=dataset_name,
+                prompt_previews=prompt_previews,
+                first_weights=first_weights,
+                mid_weights=mid_weights,
+            )
+            for sample_first, sample_mid in zip(first_eid.detach().cpu().tolist(), mid_eid.detach().cpu().tolist()):
+                self.route_counter[f"first::{self.task_names[sample_first - 1]}"] += 1
+                self.route_counter[f"mid::{self.task_names[sample_mid - 1]}"] += 1
+                self.route_counter[f"pair::{self.task_names[sample_first - 1]}->{self.task_names[sample_mid - 1]}"] += 1
+            return first_eid, mid_eid, first_weights, mid_weights
+
+        if self.routing_mode.startswith("cache_oracle_"):
+            if prompt_previews is None:
+                raise ValueError("cache_oracle routing requires prompt_previews for lookup.")
+            first_eid, mid_eid, first_weights, mid_weights = self._oracle_routes_from_prompts(
+                prompt_previews,
+                first_vec.device,
+            )
+            for sample_first, sample_mid in zip(first_eid.detach().cpu().tolist(), mid_eid.detach().cpu().tolist()):
+                self.route_counter[f"first::{self.task_names[sample_first - 1]}"] += 1
+                self.route_counter[f"mid::{self.task_names[sample_mid - 1]}"] += 1
+                self.route_counter[f"pair::{self.task_names[sample_first - 1]}->{self.task_names[sample_mid - 1]}"] += 1
+            if self.routing_mode == "cache_oracle_hard":
+                return first_eid, mid_eid, None, None
+            return first_eid, mid_eid, first_weights, mid_weights
+
         forced_first_eid = self._forced_task_to_eid(self.force_first_task)
         forced_mid_eid = self._forced_task_to_eid(self.force_mid_task)
         num_tasks = len(self.task_names)
@@ -388,6 +575,9 @@ class UnifiedMoECoreInternalRouterCompactCachedJoint:
             null_weights = real_first_weights.new_zeros(real_first_weights.size(0), 1)
             first_weights = torch.cat([null_weights, real_first_weights], dim=1)
             mid_weights = torch.cat([null_weights, real_mid_weights], dim=1)
+
+        if self.share_first_weights_all_layers and first_weights is not None:
+            mid_weights = first_weights
 
         self._maybe_print_topk_pair_logits(
             pair_logits=routed_logits,
@@ -457,6 +647,13 @@ class UnifiedMoECoreInternalRouterCompactCachedJoint:
             dataset_name=dataset_name,
             prompt_previews=prompts,
         )
+        if self.share_first_weights_all_layers:
+            if first_weights is None:
+                raise ValueError(
+                    "share_first_weights_all_layers requires a weighted routing mode "
+                    "that produces first_weights."
+                )
+            mid_weights = first_weights
         self.cached_first_eid = first_eid
         self.cached_mid_eid = mid_eid
         self.cached_first_weights = first_weights
@@ -464,7 +661,16 @@ class UnifiedMoECoreInternalRouterCompactCachedJoint:
 
         args = self._generation_args(gen_kwargs, max_new_tokens)
         prompt_width = inp["input_ids"].shape[1]
-        if self.routing_mode in {"weighted_sum", "uniform"}:
+        if self.routing_mode in {"weighted_sum", "uniform", "static_weighted_sum", "cache_oracle_weighted_sum"}:
+            if self.share_first_weights_all_layers:
+                set_layer_range_expert_weights(
+                    self.model,
+                    self.first_layer_idx,
+                    self.num_layers - 1,
+                    first_weights,
+                )
+                out = self.model.generate(**inp, **args)
+                return self._decode_outputs(out, prompt_width)
             set_layer_range_expert_weights(
                 self.model,
                 self.first_layer_idx,

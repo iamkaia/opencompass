@@ -74,6 +74,9 @@ class RouterMoELlamaInternalCompactCachedJoint(HuggingFacewithChatTemplate):
         routing_mode: str = "hard",
         routing_sharpness: float = 1.0,
         routing_topk: Optional[int] = None,
+        share_first_weights_all_layers: bool = False,
+        oracle_weight_path: Optional[str] = None,
+        static_weight_path: Optional[str] = None,
         **kwargs,
     ):
         if hf_offline:
@@ -115,6 +118,9 @@ class RouterMoELlamaInternalCompactCachedJoint(HuggingFacewithChatTemplate):
             routing_mode=routing_mode,
             routing_sharpness=routing_sharpness,
             routing_topk=routing_topk,
+            share_first_weights_all_layers=share_first_weights_all_layers,
+            oracle_weight_path=oracle_weight_path,
+            static_weight_path=static_weight_path,
         )
         self._active_dataset_name = None
         self._printed_dataset_totals = {}
@@ -251,6 +257,9 @@ class RouterMoELlamaInternalCompactCachedJoint(HuggingFacewithChatTemplate):
             "routing_mode": getattr(self.core, "routing_mode", "hard"),
             "routing_sharpness": getattr(self.core, "routing_sharpness", 1.0),
             "routing_topk": getattr(self.core, "routing_topk", None),
+            "share_first_weights_all_layers": getattr(
+                self.core, "share_first_weights_all_layers", False
+            ),
         }
         if first_weights is not None:
             record["first_weights"] = first_weights.detach().cpu().tolist()[1:]

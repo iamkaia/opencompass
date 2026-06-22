@@ -5,6 +5,47 @@ from typing import Dict, List, Optional, Sequence
 import torch
 import torch.nn as nn
 
+'''
+ce_pair
+  直接找 loss_matrix 最小的 pair 當 hard label。
+  router 要把 argmax 對到這個 pair。
+
+expected_loss
+  router softmax 後得到每個 pair 的機率。
+  loss = sum(pair_prob * normalized_loss_matrix)。
+  也就是希望 router 分配高機率給低 cost pair。
+
+ce_pair_plus_expected
+  ce_pair + pseudo_ce_weight * expected_loss。
+  hard target + 期望 cost 輔助項。
+
+correct_soft_ce
+  只看 correct_matrix 裡答對的 pair。
+  如果有多個答對 pair，就平均分 target probability。
+  router 學「選到任一答對 pair」。
+
+correct_conf_ce
+  只看答對的 pair，但不是平均。
+  在答對 pair 裡，loss_matrix 越低 target probability 越高。
+  這是你最近最常用的。
+
+self_preserving_correct_conf_ce
+  如果 task 自己的 self pair，例如 sst2->sst2，是答對的，
+  就保留一部分 target mass 給 self pair。
+  剩下再照 correct_conf_ce 分配。
+  用來避免 router 太容易遠離自己的 expert。
+
+correct_max_margin
+  不是 CE target，而是 margin loss。
+  希望最好的 correct pair logit 比最好的 wrong pair logit 高。
+
+correct_conf_ce_plus_margin
+  correct_conf_ce + pseudo_ce_weight * correct_max_margin。
+
+cache_oracle_matrix_kl
+  在 router_pair_common 裡只是讓 argparse 接受這個名字。
+  真正 KL loss 是在 train_internal_two_router_compact_cached_joint.py 裡算。
+'''
 
 JOINT_LOSS_CHOICES = (
     "ce_pair",
@@ -12,6 +53,7 @@ JOINT_LOSS_CHOICES = (
     "ce_pair_plus_expected",
     "correct_soft_ce",
     "correct_conf_ce",
+    "cache_oracle_matrix_kl",
     "self_preserving_correct_conf_ce",
     "correct_max_margin",
     "correct_conf_ce_plus_margin",
@@ -232,6 +274,13 @@ def compute_pair_losses(
             if correct_matrix is None:
                 raise ValueError("correct_conf_ce requires correct_matrix")
             total_loss = correct_conf_ce
+        elif joint_loss == "cache_oracle_matrix_kl":
+            if correct_matrix is None:
+                raise ValueError("cache_oracle_matrix_kl requires correct_matrix")
+            # The full matrix KL objective is built in the cached-joint trainer,
+            # because it needs the router target matrix used for weighted_sum
+            # marginal metrics. Keep this branch argparse-compatible here.
+            total_loss = zero_loss
         elif joint_loss == "self_preserving_correct_conf_ce":
             if correct_matrix is None:
                 raise ValueError("self_preserving_correct_conf_ce requires correct_matrix")
