@@ -499,6 +499,97 @@ class JointAnswerSupervisionRouterModel(nn.Module):
             )
         raise ValueError(f"Unknown score_mode: {score_mode}")
 
+    @torch.no_grad()
+    def score_all_single_experts(
+        self,
+        prompt_input_ids: torch.Tensor,
+        prompt_attention_mask: torch.Tensor,
+        targets: Sequence[str],
+        source_texts: Sequence[str],
+        task_names: Sequence[str],
+        llm_tokenizer,
+        score_mode: str = "official_eval_aligned_generation",
+        input_ids: Optional[torch.Tensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        labels: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Score T candidates where one LoRA expert is active on every layer."""
+        score_mode = str(score_mode)
+        if score_mode not in {"official_generation_only", "official_eval_aligned_generation"}:
+            raise ValueError(f"Unknown score_mode: {score_mode}")
+        batch_size = prompt_input_ids.size(0)
+        device = prompt_input_ids.device
+        num_experts = len(self.expert_names)
+        loss_vector = torch.empty(batch_size, num_experts, dtype=torch.float32, device=device)
+        correct_vector = torch.zeros(batch_size, num_experts, dtype=torch.bool, device=device)
+        prediction_vectors: List[List[str]] = [["" for _ in range(num_experts)] for _ in range(batch_size)]
+
+        if score_mode == "official_generation_only":
+            generation_indices = list(range(batch_size))
+            first_token_indices = []
+        else:
+            generation_indices = [
+                idx for idx, task_name in enumerate(task_names) if _task_uses_generation_evaluator(task_name)
+            ]
+            first_token_indices = [
+                idx for idx, task_name in enumerate(task_names) if not _task_uses_generation_evaluator(task_name)
+            ]
+        generation_index_tensor = (
+            torch.tensor(generation_indices, dtype=torch.long, device=device) if generation_indices else None
+        )
+        first_token_index_tensor = (
+            torch.tensor(first_token_indices, dtype=torch.long, device=device) if first_token_indices else None
+        )
+
+        for expert_idx, expert_name in enumerate(self.expert_names):
+            set_all_experts(self.model, self.task_to_expert_id[expert_name])
+            candidate_loss = torch.empty(batch_size, dtype=torch.float32, device=device)
+            if first_token_index_tensor is not None:
+                ids = prompt_input_ids.index_select(0, first_token_index_tensor)
+                mask = prompt_attention_mask.index_select(0, first_token_index_tensor)
+                logits = self.model(input_ids=ids, attention_mask=mask, use_cache=False, return_dict=True).logits
+                subset_tasks = [task_names[idx] for idx in first_token_indices]
+                subset_targets = [targets[idx] for idx in first_token_indices]
+                losses, correct, predictions = compute_first_token_target_scores(
+                    logits=logits,
+                    prompt_attention_mask=mask,
+                    targets=subset_targets,
+                    task_names=subset_tasks,
+                    tokenizer=llm_tokenizer,
+                )
+                candidate_loss.index_copy_(0, first_token_index_tensor, losses.to(device=device, dtype=torch.float32))
+                correct_vector[:, expert_idx].index_copy_(
+                    0, first_token_index_tensor, correct.to(device=device, dtype=torch.bool)
+                )
+                for local_idx, sample_idx in enumerate(first_token_indices):
+                    prediction_vectors[sample_idx][expert_idx] = str(predictions[local_idx])
+            if generation_index_tensor is not None:
+                subset_tasks = [task_names[idx] for idx in generation_indices]
+                predictions = self.generate_under_current_pair(
+                    prompt_input_ids=prompt_input_ids.index_select(0, generation_index_tensor),
+                    prompt_attention_mask=prompt_attention_mask.index_select(0, generation_index_tensor),
+                    tokenizer=llm_tokenizer,
+                    task_names=subset_tasks,
+                )
+                subset_targets = [targets[idx] for idx in generation_indices]
+                subset_sources = [source_texts[idx] for idx in generation_indices]
+                losses = compute_generated_dataset_scores(
+                    predictions=predictions,
+                    targets=subset_targets,
+                    task_names=subset_tasks,
+                    source_texts=subset_sources,
+                ).to(device=device, dtype=torch.float32)
+                candidate_loss.index_copy_(0, generation_index_tensor, losses)
+                correct_vector[:, expert_idx].index_copy_(0, generation_index_tensor, losses <= 1e-6)
+                for local_idx, sample_idx in enumerate(generation_indices):
+                    prediction_vectors[sample_idx][expert_idx] = str(predictions[local_idx])
+            loss_vector[:, expert_idx] = candidate_loss
+
+        set_all_experts(self.model, NULL_EXPERT_ID)
+        self.last_route_correct_vector = correct_vector
+        self.last_route_prediction_vectors = prediction_vectors
+        return loss_vector
+
     ####先配置每個 sample、每個 (first expert, mid expert) pair 的計分結果：
     ####loss_matrix[B, T, T] 存 cost，correct_matrix[B, T, T] 存是否答對，
     ####prediction_matrices[B][T][T] 存該 pair 的預測文字，稍後逐 pair 填入。

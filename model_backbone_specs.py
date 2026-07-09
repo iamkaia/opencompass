@@ -50,6 +50,7 @@ BACKBONE_SPECS: Dict[str, BackboneSpec] = {
 
 FAMILY_ALIASES = {
     "qwen": "qwen2",
+    "qwen3_5_text": "qwen3",
 }
 
 

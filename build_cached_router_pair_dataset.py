@@ -83,11 +83,20 @@ def apply_cache_prompt_template(prompt: str, tokenizer, mode: str, model_path: s
             "--cache_prompt_template chat_template requires a tokenizer with apply_chat_template"
         )
     content = normalize_chat_template_content(prompt, model_path)
-    return tokenizer.apply_chat_template(
-        [{"role": "user", "content": content}],
-        tokenize=False,
-        add_generation_prompt=True,
-    )
+    messages = [{"role": "user", "content": content}]
+    try:
+        return tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
+            enable_thinking=False,
+        )
+    except TypeError:
+        return tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
+        )
 
 
 ###建datasets的cache
@@ -110,6 +119,7 @@ def process_split(
     cache_prompt_template: str,
     base_model_path: str,
     print_cache_prompt_examples: bool,
+    route_space: str,
 ):
     dataset, task_names = build_dataset(
         data_root=data_root,
@@ -208,7 +218,7 @@ def process_split(
                 input_ids=prompt_input_ids,
                 attention_mask=prompt_attention_mask,
             )
-            loss_matrix = model.score_all_route_pairs(
+            score_kwargs = dict(
                 prompt_input_ids=prompt_input_ids,
                 prompt_attention_mask=prompt_attention_mask,
                 input_ids=input_ids,
@@ -220,32 +230,33 @@ def process_split(
                 llm_tokenizer=llm_tokenizer,
                 score_mode=score_mode,
             )
-            correct_matrix = getattr(model, "last_route_correct_matrix", None)
-            prediction_matrices = getattr(model, "last_route_prediction_matrices", None)
+            if route_space == "single_all_layers":
+                route_loss = model.score_all_single_experts(**score_kwargs)
+                route_correct = getattr(model, "last_route_correct_vector", None)
+                route_predictions = getattr(model, "last_route_prediction_vectors", None)
+            else:
+                route_loss = model.score_all_route_pairs(**score_kwargs)
+                route_correct = getattr(model, "last_route_correct_matrix", None)
+                route_predictions = getattr(model, "last_route_prediction_matrices", None)
 
-        flat_loss = loss_matrix.view(loss_matrix.size(0), -1)
-        best_pair = flat_loss.argmin(dim=-1)
-        best_first = best_pair // num_tasks
-        best_mid = best_pair % num_tasks
+        flat_loss = route_loss.view(route_loss.size(0), -1)
+        best_route = flat_loss.argmin(dim=-1)
 
         ####為甚麼都要給cpu?
         first_vec_cpu = first_vec.to(dtype=torch.float16).cpu()
         mid_vec_cpu = mid_vec.to(dtype=torch.float16).cpu()
-        loss_matrix_cpu = loss_matrix.to(dtype=torch.float32).cpu()
-        correct_matrix_cpu = (
-            correct_matrix.to(dtype=torch.bool).cpu()
-            if correct_matrix is not None
-            else torch.zeros_like(loss_matrix, dtype=torch.bool).cpu()
+        route_loss_cpu = route_loss.to(dtype=torch.float32).cpu()
+        route_correct_cpu = (
+            route_correct.to(dtype=torch.bool).cpu()
+            if route_correct is not None
+            else torch.zeros_like(route_loss, dtype=torch.bool).cpu()
         )
-        best_pair_cpu = best_pair.cpu()
-        best_first_cpu = best_first.cpu()
-        best_mid_cpu = best_mid.cpu()
+        best_route_cpu = best_route.cpu()
         task_ids_cpu = batch.task_ids.cpu()
 
         for idx in range(len(batch.texts)):
             prompt_text = cache_prompt_texts[idx]
-            chunk_items.append(
-                {
+            item = {
                     # Cache the same canonical prompt for both legacy `text`
                     # readers and newer `prompt_text` readers so cached BERT
                     # inputs and cached LLM prompt vectors are guaranteed to
@@ -261,18 +272,25 @@ def process_split(
                     "task_id": int(task_ids_cpu[idx].item()),
                     "first_vec": first_vec_cpu[idx].clone(),
                     "mid_vec": mid_vec_cpu[idx].clone(),
-                    "loss_matrix": loss_matrix_cpu[idx].clone(),
-                    "correct_matrix": correct_matrix_cpu[idx].clone(),
-                    "prediction_matrix": (
-                        prediction_matrices[idx]
-                        if prediction_matrices is not None
-                        else None
-                    ),
-                    "pair_label": int(best_pair_cpu[idx].item()),
-                    "first_label": int(best_first_cpu[idx].item()),
-                    "mid_label": int(best_mid_cpu[idx].item()),
                 }
-            )
+            if route_space == "single_all_layers":
+                item.update(
+                    loss_vector=route_loss_cpu[idx].clone(),
+                    correct_vector=route_correct_cpu[idx].clone(),
+                    prediction_vector=(route_predictions[idx] if route_predictions is not None else None),
+                    expert_label=int(best_route_cpu[idx].item()),
+                )
+            else:
+                best_pair = int(best_route_cpu[idx].item())
+                item.update(
+                    loss_matrix=route_loss_cpu[idx].clone(),
+                    correct_matrix=route_correct_cpu[idx].clone(),
+                    prediction_matrix=(route_predictions[idx] if route_predictions is not None else None),
+                    pair_label=best_pair,
+                    first_label=best_pair // num_tasks,
+                    mid_label=best_pair % num_tasks,
+                )
+            chunk_items.append(item)
             total_items += 1
 
         if len(chunk_items) >= chunk_size:
@@ -321,10 +339,17 @@ def process_split(
             "task_names": task_names,
             "expert_names": list(model.expert_names),
             "num_tasks": len(model.expert_names),
-            "supervision_type": "cached_loss_matrix",
-            "has_correct_matrix": True,
+            "supervision_type": (
+                "cached_single_all_layers_loss_vector"
+                if route_space == "single_all_layers"
+                else "cached_loss_matrix"
+            ),
+            "route_space": route_space,
+            "has_correct_matrix": route_space == "pair",
+            "has_correct_vector": route_space == "single_all_layers",
             "has_option_prob_matrix": False,
-            "has_prediction_matrix": True,
+            "has_prediction_matrix": route_space == "pair",
+            "has_prediction_vector": route_space == "single_all_layers",
             "score_mode": str(score_mode),
             "sst2_option_labels": "words",
             "cache_prompt_template": cache_prompt_template,
@@ -347,6 +372,12 @@ def main():
     parser.add_argument("--task_names", type=str, default=None)
     ####建 cache 時枚舉哪些 expert
     parser.add_argument("--expert_names", type=str, default=None)
+    parser.add_argument(
+        "--route_space",
+        choices=["pair", "single_all_layers"],
+        default="pair",
+        help="pair scores every first/mid expert pair; single_all_layers scores each expert on all decoder layers.",
+    )
     parser.add_argument("--base_model_path", type=str, required=True)
     parser.add_argument("--router_bert_init", type=str, default ="./task_classifier_ckpt")
     parser.add_argument("--batch_size", type=int, default=8)
@@ -459,6 +490,7 @@ def main():
             "feature_root": args.feature_root,
             "task_names": requested_tasks or expert_names,
             "expert_names": expert_names,
+            "route_space": args.route_space,
             "base_model_path": args.base_model_path,
             "router_bert_init": args.router_bert_init,
             "max_llm_len": args.max_llm_len,
@@ -500,6 +532,7 @@ def main():
         cache_prompt_template=args.cache_prompt_template,
         base_model_path=args.base_model_path,
         print_cache_prompt_examples=not args.no_print_cache_prompt_examples,
+        route_space=args.route_space,
     )
     process_split(
         model=model,
@@ -520,6 +553,7 @@ def main():
         cache_prompt_template=args.cache_prompt_template,
         base_model_path=args.base_model_path,
         print_cache_prompt_examples=not args.no_print_cache_prompt_examples,
+        route_space=args.route_space,
     )
     print("[DONE] cached dataset build finished")
 
