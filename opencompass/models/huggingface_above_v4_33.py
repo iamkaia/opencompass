@@ -14,6 +14,12 @@ from opencompass.utils.prompt import PromptList
 PromptType = Union[PromptList, str]
 
 
+def _batch_encode(tokenizer, inputs, **kwargs):
+    if hasattr(tokenizer, 'batch_encode_plus'):
+        return tokenizer.batch_encode_plus(inputs, **kwargs)
+    return tokenizer(inputs, **kwargs)
+
+
 def _get_stopping_criteria(stop_words, tokenizer, batch_size):
     from transformers import StoppingCriteria, StoppingCriteriaList
 
@@ -110,6 +116,17 @@ def _format_with_fast_chat_template(inputs: List[str], name: str='vicuna'):
         template.append_message(template.roles[1], None)
         outputs.append(template.get_prompt())
     return outputs
+
+
+def _apply_no_thinking_chat_template(tokenizer, messages, **kwargs):
+    try:
+        return tokenizer.apply_chat_template(
+            messages,
+            enable_thinking=False,
+            **kwargs,
+        )
+    except TypeError:
+        return tokenizer.apply_chat_template(messages, **kwargs)
 
 
 def _get_meta_template(meta_template):
@@ -274,7 +291,7 @@ class HuggingFacewithChatTemplate(BaseModel):
         self.tokenizer.padding_side = 'right'
         self.tokenizer.truncation_side = 'right'
 
-        tokens = self.tokenizer.batch_encode_plus(messages, **tokenize_kwargs)
+        tokens = _batch_encode(self.tokenizer, messages, **tokenize_kwargs)
 
         tokens = {k: v.to(self.model.device) for k, v in tokens.items()}
         outputs = self.model(**tokens)[0]
@@ -449,16 +466,19 @@ class HuggingFacewithChatTemplate(BaseModel):
             messages = _format_with_fast_chat_template(
                 messages, self.fastchat_template
             )
-            tokens = self.tokenizer.batch_encode_plus(messages, **tokenize_kwargs)
+            tokens = _batch_encode(self.tokenizer, messages, **tokenize_kwargs)
         else:
             messages = [
-                self.tokenizer.apply_chat_template(
-                    m, add_generation_prompt=True, tokenize=False
+                _apply_no_thinking_chat_template(
+                    self.tokenizer,
+                    m,
+                    add_generation_prompt=True,
+                    tokenize=False,
                 )
                 for m in messages
             ]
             tokenize_kwargs["add_special_tokens"] = False
-            tokens = self.tokenizer.batch_encode_plus(messages, **tokenize_kwargs)
+            tokens = _batch_encode(self.tokenizer, messages, **tokenize_kwargs)
 
         tokens = {k: v.to(self.model.device) for k, v in tokens.items()}
 
@@ -493,6 +513,7 @@ class HuggingFacewithChatTemplate(BaseModel):
 
         if max_out_len is not None:
             generation_kwargs["max_new_tokens"] = int(max_out_len)
+            generation_kwargs.pop("max_length", None)
 
         if min_out_len is not None:
             generation_kwargs["min_new_tokens"] = int(min_out_len)
@@ -532,7 +553,12 @@ class HuggingFacewithChatTemplate(BaseModel):
 
     def get_token_len(self, prompt: str) -> int:
         m = _convert_chat_messages([prompt])[0]
-        t = self.tokenizer.apply_chat_template(m, add_generation_prompt=True, return_dict=True)
+        t = _apply_no_thinking_chat_template(
+            self.tokenizer,
+            m,
+            add_generation_prompt=True,
+            return_dict=True,
+        )
         return len(t['input_ids'])
 
 def  _convert_base_messages(inputs):
@@ -606,7 +632,7 @@ class HuggingFaceBaseModel(HuggingFacewithChatTemplate):
                 input_ids = torch.cat([input_ids[:, : self.max_seq_len // 2], input_ids[:, - self.max_seq_len // 2:]], dim=-1)
             tokens = {'input_ids': input_ids, }
         else:
-            tokens = self.tokenizer.batch_encode_plus(messages, **tokenize_kwargs)
+            tokens = _batch_encode(self.tokenizer, messages, **tokenize_kwargs)
 
         tokens = {k: v.to(self.model.device) for k, v in tokens.items()}
 
@@ -668,7 +694,7 @@ class HuggingFaceBaseModel(HuggingFacewithChatTemplate):
                 input_ids = torch.cat([input_ids[:, : self.max_seq_len // 2], input_ids[:, - self.max_seq_len // 2:]], dim=-1)
             tokens = {'input_ids': input_ids, }
         else:
-            tokens = self.tokenizer.batch_encode_plus(messages, **tokenize_kwargs)
+            tokens = _batch_encode(self.tokenizer, messages, **tokenize_kwargs)
 
         tokens = {k: v.to(self.model.device) for k, v in tokens.items()}
         outputs = self.model(**tokens)[0]

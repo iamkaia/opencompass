@@ -27,6 +27,7 @@ from .huggingface import HuggingFaceCausalLM  # noqa: F401
 from .huggingface import HuggingFaceChatGLM3  # noqa: F401
 from .huggingface_above_v4_33 import HuggingFaceBaseModel  # noqa: F401
 from .huggingface_above_v4_33 import HuggingFacewithChatTemplate  # noqa: F401
+from .huggingface_mistral3 import HuggingFaceMistral3  # noqa: F401
 from .hunyuan_api import Hunyuan  # noqa: F401
 from .intern_model import InternLM  # noqa: F401
 from .interntrain import InternTrain  # noqa: F401

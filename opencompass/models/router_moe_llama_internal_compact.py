@@ -42,6 +42,22 @@ def _dataset_name_from_context(
     return "unknown"
 
 
+def _apply_no_thinking_chat_template(tokenizer, messages):
+    try:
+        return tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
+            enable_thinking=False,
+        )
+    except TypeError:
+        return tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+
+
 @MODELS.register_module()
 class RouterMoELlamaInternalCompact(HuggingFacewithChatTemplate):
     is_api = False
@@ -102,11 +118,7 @@ class RouterMoELlamaInternalCompact(HuggingFacewithChatTemplate):
             if "messages" in x:
                 msgs = x["messages"]
                 if hasattr(self.tokenizer, "apply_chat_template"):
-                    return self.tokenizer.apply_chat_template(
-                        msgs,
-                        tokenize=False,
-                        add_generation_prompt=True,
-                    )
+                    return _apply_no_thinking_chat_template(self.tokenizer, msgs)
                 return "\n".join(
                     [f"{m.get('role', 'user')}: {m.get('content', '')}" for m in msgs]
                 )
@@ -128,11 +140,7 @@ class RouterMoELlamaInternalCompact(HuggingFacewithChatTemplate):
                         content = m.get("prompt", "")
                     msgs.append({"role": role, "content": content})
 
-                return self.tokenizer.apply_chat_template(
-                    msgs,
-                    tokenize=False,
-                    add_generation_prompt=True,
-                )
+                return _apply_no_thinking_chat_template(self.tokenizer, msgs)
 
             parts = []
             for m in x:

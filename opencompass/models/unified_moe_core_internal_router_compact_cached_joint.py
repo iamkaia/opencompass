@@ -126,6 +126,11 @@ class UnifiedMoECoreInternalRouterCompactCachedJoint:
         self.router_pooling = str(cfg.get("router_pooling", "last_token"))
         self.router_pooling_last_k = int(cfg.get("router_pooling_last_k", 4))
         self.router_dim = int(cfg.get("router_dim", router_dim))
+        self.router_architecture = str(cfg.get("router_architecture", "pair_joint"))
+        if self.router_architecture not in {"pair_joint", "single_all_layers"}:
+            raise ValueError(f"Unsupported router_architecture={self.router_architecture!r}")
+        if self.router_architecture == "single_all_layers":
+            self.share_first_weights_all_layers = True
         self.sample_feature_mode = str(cfg.get("sample_feature_mode", "none"))
         self.sample_feature_dim = int(cfg.get("sample_feature_dim", 0))
         if self.sample_feature_mode != "none" or self.sample_feature_dim != 0:
@@ -154,6 +159,7 @@ class UnifiedMoECoreInternalRouterCompactCachedJoint:
             f"router_pooling={self.router_pooling}, "
             f"router_pooling_last_k={self.router_pooling_last_k}, "
             f"router_dim={self.router_dim}, "
+            f"router_architecture={self.router_architecture}, "
             f"router_max_len={self.router_max_len}, "
             f"routing_mode={self.routing_mode}, "
             f"routing_sharpness={self.routing_sharpness}, "
@@ -215,35 +221,52 @@ class UnifiedMoECoreInternalRouterCompactCachedJoint:
         bert_hidden = self.bert_encoder.encoder.config.hidden_size
         llama_hidden = self.model.config.hidden_size
         self.router_first = CompactRouterFeatureEncoder(llama_hidden, bert_hidden, self.router_dim)
-        self.router_mid = CompactRouterFeatureEncoder(llama_hidden, bert_hidden, self.router_dim)
-        self.pair_classifier = nn.Sequential(
-            nn.LayerNorm(self.router_dim * 4),
-            nn.Linear(self.router_dim * 4, self.router_dim * 2),
-            nn.GELU(),
-            nn.Linear(self.router_dim * 2, len(self.task_names) * len(self.task_names)),
-        )
+        if self.router_architecture == "single_all_layers":
+            self.router_mid = None
+            self.pair_classifier = None
+            self.first_classifier = nn.Sequential(
+                nn.LayerNorm(self.router_dim * 2),
+                nn.Linear(self.router_dim * 2, self.router_dim),
+                nn.GELU(),
+                nn.Linear(self.router_dim, len(self.task_names)),
+            )
+        else:
+            self.router_mid = CompactRouterFeatureEncoder(llama_hidden, bert_hidden, self.router_dim)
+            self.pair_classifier = nn.Sequential(
+                nn.LayerNorm(self.router_dim * 4),
+                nn.Linear(self.router_dim * 4, self.router_dim * 2),
+                nn.GELU(),
+                nn.Linear(self.router_dim * 2, len(self.task_names) * len(self.task_names)),
+            )
+            self.first_classifier = None
 
         state_path = os.path.join(router_ckpt_dir, "router_heads.pt")
         if not os.path.exists(state_path):
             raise FileNotFoundError(f"Missing router heads checkpoint: {state_path}")
         state = torch.load(state_path, map_location="cpu")
         first_state = state.get("router_first") or state.get("pair_first_encoder")
-        mid_state = state.get("router_mid") or state.get("pair_mid_encoder")
-        if first_state is None or mid_state is None:
-            raise KeyError(
-                "router_heads.pt must contain either router_first/router_mid "
-                "or pair_first_encoder/pair_mid_encoder."
-            )
+        if first_state is None:
+            raise KeyError("router_heads.pt is missing router_first")
         self.router_first.load_state_dict(first_state)
-        self.router_mid.load_state_dict(mid_state)
-        self.pair_classifier.load_state_dict(state["pair_classifier"])
+        if self.router_architecture == "single_all_layers":
+            self.first_classifier.load_state_dict(state["first_classifier"])
+        else:
+            mid_state = state.get("router_mid") or state.get("pair_mid_encoder")
+            if mid_state is None:
+                raise KeyError("pair_joint checkpoint is missing router_mid")
+            self.router_mid.load_state_dict(mid_state)
+            self.pair_classifier.load_state_dict(state["pair_classifier"])
         self.bert_encoder.load_state_dict(state["bert_encoder"], strict=False)
 
         self.router_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.bert_encoder.to(self.router_device).eval()
         self.router_first.to(self.router_device).eval()
-        self.router_mid.to(self.router_device).eval()
-        self.pair_classifier.to(self.router_device).eval()
+        if self.router_mid is not None:
+            self.router_mid.to(self.router_device).eval()
+        if self.pair_classifier is not None:
+            self.pair_classifier.to(self.router_device).eval()
+        if self.first_classifier is not None:
+            self.first_classifier.to(self.router_device).eval()
 
         self.cached_first_eid = None
         self.cached_mid_eid = None
@@ -527,6 +550,38 @@ class UnifiedMoECoreInternalRouterCompactCachedJoint:
             bert_last=self.cached_bert_last,
             bert_attention_mask=self.cached_bert_mask,
         )
+        if self.router_architecture == "single_all_layers":
+            if self.routing_mode != "weighted_sum":
+                raise ValueError("single_all_layers checkpoints require routing_mode='weighted_sum'")
+            expert_logits = self.first_classifier(first_feat).float() * self.routing_sharpness
+            if forced_first_eid is not None:
+                keep = torch.zeros_like(expert_logits, dtype=torch.bool)
+                keep[:, forced_first_eid - 1] = True
+                expert_logits = expert_logits.masked_fill(~keep, float("-inf"))
+            if self.routing_topk is not None and self.routing_topk < num_tasks:
+                topk_ids = expert_logits.topk(k=self.routing_topk, dim=-1).indices
+                keep = torch.zeros_like(expert_logits, dtype=torch.bool)
+                keep.scatter_(1, topk_ids, True)
+                expert_logits = expert_logits.masked_fill(~keep, float("-inf"))
+            real_weights = torch.softmax(expert_logits, dim=-1)
+            first_weights = torch.cat([real_weights.new_zeros(real_weights.size(0), 1), real_weights], dim=1)
+            first_eid = expert_logits.argmax(dim=-1) + 1
+            mid_eid = first_eid
+            debug_logits = expert_logits.new_full(
+                (expert_logits.size(0), num_tasks * num_tasks), float("-inf")
+            )
+            diagonal = torch.arange(num_tasks, device=expert_logits.device) * (num_tasks + 1)
+            debug_logits[:, diagonal] = expert_logits
+            self._maybe_print_topk_pair_logits(
+                debug_logits, dataset_name, prompt_previews, first_weights, first_weights
+            )
+            for eid in first_eid.detach().cpu().tolist():
+                task = self.task_names[eid - 1]
+                self.route_counter[f"first::{task}"] += 1
+                self.route_counter[f"mid::{task}"] += 1
+                self.route_counter[f"pair::{task}->{task}"] += 1
+            return first_eid, mid_eid, first_weights, first_weights
+
         mid_feat = self.router_mid(
             llama_vec=mid_vec,
             bert_prev=self.cached_bert_prev,
@@ -640,7 +695,10 @@ class UnifiedMoECoreInternalRouterCompactCachedJoint:
         )
         hidden_states = prepass.hidden_states
         first_vec = self._pool_prompt_vector(hidden_states[self.first_layer_idx], inp["attention_mask"])
-        mid_vec = self._pool_prompt_vector(hidden_states[self.middle_layer_idx], inp["attention_mask"])
+        if self.router_architecture == "single_all_layers":
+            mid_vec = first_vec
+        else:
+            mid_vec = self._pool_prompt_vector(hidden_states[self.middle_layer_idx], inp["attention_mask"])
         first_eid, mid_eid, first_weights, mid_weights = self._route_pair_from_vecs(
             first_vec,
             mid_vec,

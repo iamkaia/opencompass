@@ -27,9 +27,9 @@ models = [
         batch_size=32,
         max_seq_len=2048,
         max_out_len=64,
-        debug_router_record_path="T0525_opencompass_router_records_qwen3_mrs_3expert_sst2words.jsonl",
-        debug_router_topk=3,
-        debug_router_max_prints=20,
+        debug_router_record_path=None,
+        debug_router_topk=0,
+        debug_router_max_prints=0,
         run_cfg=dict(num_gpus=1),
     )
 ]

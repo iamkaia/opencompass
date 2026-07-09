@@ -111,6 +111,9 @@ class OpenICLInferTask(BaseTask):
         # set inferencer's default value according to model's config'
         inferencer_cfg = self.infer_cfg['inferencer']
         inferencer_cfg['model'] = self.model
+        max_out_len_override = os.environ.get('T0704_MAX_OUT_LEN', '').strip()
+        if max_out_len_override:
+            inferencer_cfg['max_out_len'] = int(max_out_len_override)
         self._set_default_value(inferencer_cfg, 'max_out_len',
                                 self.max_out_len)
         self._set_default_value(inferencer_cfg, 'min_out_len',

@@ -318,3 +318,17 @@ def sst2_postprocess(text: str):
 
     return ''
 
+
+@TEXT_POSTPROCESSORS.register_module('router_train_answer_postprocess')
+def router_train_answer_postprocess(text: str):
+    p = normalize(text)
+    labels = re.findall(r"\b(positive|negative)\b", p)
+    if labels:
+        return labels[-1]
+    match = re.search(r"\b([A-D])\b", str(text).strip().upper())
+    if match:
+        return match.group(1)
+    match = re.search(r"([A-D])", str(text).strip().upper())
+    if match:
+        return match.group(1)
+    return ''

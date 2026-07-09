@@ -41,6 +41,22 @@ def _prompt_hash(text: str) -> str:
     return hashlib.sha1(str(text).encode("utf-8")).hexdigest()
 
 
+def _apply_no_thinking_chat_template(tokenizer, messages):
+    try:
+        return tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
+            enable_thinking=False,
+        )
+    except TypeError:
+        return tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+
+
 @MODELS.register_module()
 class RouterMoELlamaInternalCompactCachedJoint(HuggingFacewithChatTemplate):
     is_api = False
@@ -75,6 +91,7 @@ class RouterMoELlamaInternalCompactCachedJoint(HuggingFacewithChatTemplate):
         routing_sharpness: float = 1.0,
         routing_topk: Optional[int] = None,
         share_first_weights_all_layers: bool = False,
+        use_chat_template: bool = True,
         oracle_weight_path: Optional[str] = None,
         static_weight_path: Optional[str] = None,
         **kwargs,
@@ -128,6 +145,7 @@ class RouterMoELlamaInternalCompactCachedJoint(HuggingFacewithChatTemplate):
         self.debug_router_prompt_on_dataset_change = bool(debug_router_prompt_on_dataset_change)
         self.debug_router_prompt_preview_chars = int(debug_router_prompt_preview_chars)
         self.debug_router_record_path = debug_router_record_path
+        self.use_chat_template = bool(use_chat_template)
         self._dataset_sample_counter = Counter()
         if self.debug_router_record_path:
             record_dir = os.path.dirname(os.path.abspath(self.debug_router_record_path))
@@ -144,15 +162,11 @@ class RouterMoELlamaInternalCompactCachedJoint(HuggingFacewithChatTemplate):
                     return x[k]
             if "messages" in x:
                 msgs = x["messages"]
-                if hasattr(self.tokenizer, "apply_chat_template"):
-                    return self.tokenizer.apply_chat_template(
-                        msgs,
-                        tokenize=False,
-                        add_generation_prompt=True,
-                    )
+                if self.use_chat_template and hasattr(self.tokenizer, "apply_chat_template"):
+                    return _apply_no_thinking_chat_template(self.tokenizer, msgs)
                 return "\n".join([f"{m.get('role', 'user')}: {m.get('content', '')}" for m in msgs])
         if isinstance(x, (list, tuple)) and x and isinstance(x[0], dict):
-            if hasattr(self.tokenizer, "apply_chat_template"):
+            if self.use_chat_template and hasattr(self.tokenizer, "apply_chat_template"):
                 msgs = []
                 for m in x:
                     role = m.get("role", "user")
@@ -166,11 +180,7 @@ class RouterMoELlamaInternalCompactCachedJoint(HuggingFacewithChatTemplate):
                     if content is None:
                         content = m.get("prompt", "")
                     msgs.append({"role": role, "content": content})
-                return self.tokenizer.apply_chat_template(
-                    msgs,
-                    tokenize=False,
-                    add_generation_prompt=True,
-                )
+                return _apply_no_thinking_chat_template(self.tokenizer, msgs)
             parts = []
             for m in x:
                 role = m.get("role", "user")
@@ -180,6 +190,13 @@ class RouterMoELlamaInternalCompactCachedJoint(HuggingFacewithChatTemplate):
                 parts.append(f"{role}: {txt}")
             return "\n".join(parts)
         raise TypeError(f"Unsupported input type for prompt: {type(x)}; value={repr(x)[:300]}")
+
+    def get_token_len(self, prompt: str) -> int:
+        if self.use_chat_template:
+            return super().get_token_len(prompt)
+        prompt_text = self._to_prompt_str(prompt)
+        tokenized = self.tokenizer(prompt_text, add_special_tokens=True)
+        return len(tokenized["input_ids"])
 
     def _resolve_run_dir(self, output_json_filepath: Optional[str]) -> str:
         if output_json_filepath:

@@ -10,6 +10,11 @@ from model_backbone_specs import get_decoder_layers
 
 NULL_EXPERT_ID = 0
 
+ATTN_PROJ_NAMES = {
+    "self_attn": ("q_proj", "k_proj", "v_proj", "o_proj"),
+    "linear_attn": ("in_proj_qkv", "in_proj_a", "in_proj_b", "in_proj_z", "out_proj"),
+}
+
 
 class HardRoutedLoRALinear(nn.Module):
     def __init__(self, base_linear: nn.Linear, num_experts: int, r: int = 8, alpha: int = 16):
@@ -94,11 +99,14 @@ def patch_causal_lm_with_hard_routed_lora(model, num_experts: int, r: int = 8, a
             if isinstance(base, nn.Linear):
                 setattr(mlp, name, HardRoutedLoRALinear(base, num_experts=num_experts, r=r, alpha=alpha))
 
-        attn = layer.self_attn
-        for name in ["q_proj", "k_proj", "v_proj", "o_proj"]:
-            base = getattr(attn, name)
-            if isinstance(base, nn.Linear):
-                setattr(attn, name, HardRoutedLoRALinear(base, num_experts=num_experts, r=r, alpha=alpha))
+        for attn_name, proj_names in ATTN_PROJ_NAMES.items():
+            attn = getattr(layer, attn_name, None)
+            if attn is None:
+                continue
+            for name in proj_names:
+                base = getattr(attn, name, None)
+                if isinstance(base, nn.Linear):
+                    setattr(attn, name, HardRoutedLoRALinear(base, num_experts=num_experts, r=r, alpha=alpha))
     return model
 
 
@@ -127,10 +135,14 @@ def set_layer_expert(model, layer_idx: int, eid: int):
         if isinstance(mod, HardRoutedLoRALinear):
             mod.set_expert(eid)
 
-    for name in ["q_proj", "k_proj", "v_proj", "o_proj"]:
-        mod = getattr(layer.self_attn, name)
-        if isinstance(mod, HardRoutedLoRALinear):
-            mod.set_expert(eid)
+    for attn_name, proj_names in ATTN_PROJ_NAMES.items():
+        attn = getattr(layer, attn_name, None)
+        if attn is None:
+            continue
+        for name in proj_names:
+            mod = getattr(attn, name, None)
+            if isinstance(mod, HardRoutedLoRALinear):
+                mod.set_expert(eid)
 
 
 def set_layer_expert_weights(model, layer_idx: int, weights: Sequence[float] | torch.Tensor):
@@ -141,10 +153,14 @@ def set_layer_expert_weights(model, layer_idx: int, weights: Sequence[float] | t
         if isinstance(mod, HardRoutedLoRALinear):
             mod.set_expert_weights(weights)
 
-    for name in ["q_proj", "k_proj", "v_proj", "o_proj"]:
-        mod = getattr(layer.self_attn, name)
-        if isinstance(mod, HardRoutedLoRALinear):
-            mod.set_expert_weights(weights)
+    for attn_name, proj_names in ATTN_PROJ_NAMES.items():
+        attn = getattr(layer, attn_name, None)
+        if attn is None:
+            continue
+        for name in proj_names:
+            mod = getattr(attn, name, None)
+            if isinstance(mod, HardRoutedLoRALinear):
+                mod.set_expert_weights(weights)
 
 ####控制哪些 layer 現在吃哪個 expert
 def set_layer_range_expert(model, start_idx: int, end_idx: int, eid: int):
@@ -172,6 +188,8 @@ def _normalize_key(key: str) -> str:
         return key[key.index("model.layers."):]
     if "base_model.model.model.layers." in key:
         return key[key.index("model.layers."):]
+    if "language_model.layers." in key:
+        return "model." + key[key.index("language_model.layers.") + len("language_model."):]
     return key
 
 ####把某個 task 的 adapter 權重載進 expert slot
@@ -193,8 +211,11 @@ def load_lora_into_expert(model, adapter_dir: str, expert_id: int):
             if isinstance(mod, HardRoutedLoRALinear):
                 _copy(mod, f"model.layers.{layer_idx}.mlp.{proj}.lora_A.weight", f"model.layers.{layer_idx}.mlp.{proj}.lora_B.weight")
 
-        attn = layer.self_attn
-        for proj in ["q_proj", "k_proj", "v_proj", "o_proj"]:
-            mod = getattr(attn, proj)
-            if isinstance(mod, HardRoutedLoRALinear):
-                _copy(mod, f"model.layers.{layer_idx}.self_attn.{proj}.lora_A.weight", f"model.layers.{layer_idx}.self_attn.{proj}.lora_B.weight")
+        for attn_name, proj_names in ATTN_PROJ_NAMES.items():
+            attn = getattr(layer, attn_name, None)
+            if attn is None:
+                continue
+            for proj in proj_names:
+                mod = getattr(attn, proj, None)
+                if isinstance(mod, HardRoutedLoRALinear):
+                    _copy(mod, f"model.layers.{layer_idx}.{attn_name}.{proj}.lora_A.weight", f"model.layers.{layer_idx}.{attn_name}.{proj}.lora_B.weight")

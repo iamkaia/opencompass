@@ -16,6 +16,22 @@ def _ensure_dir(p: str):
         os.makedirs(p, exist_ok=True)
 
 
+def _apply_no_thinking_chat_template(tokenizer, messages):
+    try:
+        return tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
+            enable_thinking=False,
+        )
+    except TypeError:
+        return tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+
+
 @MODELS.register_module()
 class RouterMoELlama(HuggingFacewithChatTemplate):
     """
@@ -83,9 +99,7 @@ class RouterMoELlama(HuggingFacewithChatTemplate):
             if "messages" in x:
                 msgs = x["messages"]
                 if hasattr(self.tokenizer, "apply_chat_template"):
-                    return self.tokenizer.apply_chat_template(
-                        msgs, tokenize=False, add_generation_prompt=True
-                    )
+                    return _apply_no_thinking_chat_template(self.tokenizer, msgs)
                 return "\n".join(
                     [f"{m.get('role', 'user')}: {m.get('content', '')}" for m in msgs]
                 )
@@ -107,9 +121,7 @@ class RouterMoELlama(HuggingFacewithChatTemplate):
                         content = m.get("prompt", "")
                     msgs.append({"role": role, "content": content})
 
-                return self.tokenizer.apply_chat_template(
-                    msgs, tokenize=False, add_generation_prompt=True
-                )
+                return _apply_no_thinking_chat_template(self.tokenizer, msgs)
 
             parts = []
             for m in x:
@@ -164,4 +176,3 @@ class RouterMoELlama(HuggingFacewithChatTemplate):
             pass
 
         return outputs
-

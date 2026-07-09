@@ -403,6 +403,7 @@ class HuggingFace(BaseModel):
 
         if min_out_len is not None:
             kwargs['min_new_tokens'] = min_out_len
+        kwargs.pop('max_length', None)
 
         # To accommodate the PeftModel, parameters should be passed in
         # key-value format for generate.
