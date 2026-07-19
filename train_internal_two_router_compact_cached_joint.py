@@ -1112,6 +1112,7 @@ def main():
     parser.add_argument("--warmup_ratio", type=float, default=0.05)
     parser.add_argument("--max_bert_len", type=int, default=512)
     parser.add_argument("--router_dim", type=int, default=512)
+    ###Question: 你看一下這邊的parser是什麼東西？
     parser.add_argument(
         "--sample_feature_mode",
         type=str,
@@ -1381,6 +1382,7 @@ def main():
     )
 
     bert_tokenizer = AutoTokenizer.from_pretrained(args.bert_init)
+    #### Question: 為什麼這邊又有一個llama_hidden_size了這是什麼東西？
     llama_hidden_size = int(train_ds[0]["first_vec"].numel())
     expected_llama_hidden_size = train_ds.feature_contract.get("llama_hidden_size")
     if expected_llama_hidden_size is not None and llama_hidden_size != expected_llama_hidden_size:
@@ -1410,6 +1412,7 @@ def main():
             model.bert.load_state_dict(state["bert_encoder"], strict=False)
         print(f"[LOAD] loaded from {args.load_from}")
 
+    #### 如果你只有要跑eval的話就跑這裡
     if args.eval_only:
         if args.load_from is None:
             raise ValueError("--eval_only requires --load_from")
