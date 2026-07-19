@@ -63,12 +63,21 @@ class CompactCrossAttentionRouter(nn.Module):
         return self.classifier(feat)
 
 ###新版 joint router 用的 feature encoder，不直接做分類，只抽 feature
+###看notion的解釋
+'''
+CompactRouterFeatureEncoder:
+  LLM prompt vector [B, H_llm]
+  + BERT token memory [B, 2T, H_bert]
+  -> cross-attention
+  -> router feature [B, 2D]
+'''
 class CompactRouterFeatureEncoder(nn.Module):
     def __init__(self, llama_hidden_size: int, bert_hidden_size: int, router_dim: int):
         super().__init__()
-        self.q_proj = nn.Linear(llama_hidden_size, router_dim)
-        self.k_proj = nn.Linear(bert_hidden_size, router_dim)
-        self.v_proj = nn.Linear(bert_hidden_size, router_dim)
+        ###Question: 這邊的qkv的意思是什麼？
+        self.q_proj = nn.Linear(llama_hidden_size, router_dim) ###query
+        self.k_proj = nn.Linear(bert_hidden_size, router_dim) ###key
+        self.v_proj = nn.Linear(bert_hidden_size, router_dim) ###value
         self.out_norm = nn.LayerNorm(router_dim * 2)
 
     def forward(self, llama_vec, bert_prev, bert_last, bert_attention_mask=None):
@@ -113,6 +122,8 @@ class PromptVectorExtractor(nn.Module):
         self.cached_mid = None
         self._install_hooks()
 
+    ###這裡的 .detach() 很重要：它表示這些 hidden states 只是拿來當 router feature，不讓梯度回傳去訓練 base LLM。
+    ###Question: 這句話是什麼意思？
     def _install_hooks(self):
         def first_pre_hook(module, args):
             self.cached_first = args[0].detach()
@@ -123,6 +134,7 @@ class PromptVectorExtractor(nn.Module):
             return None
 
         layers = get_decoder_layers(self.model, spec=self.backbone_spec)
+        ### LLM forward 跑到那兩層時，hook 會自動把進入該層 attention 前的 hidden states 存起來
         get_pre_attn_norm(layers[self.first_layer_idx], self.backbone_spec).register_forward_pre_hook(first_pre_hook)
         get_pre_attn_norm(layers[self.middle_layer_idx], self.backbone_spec).register_forward_pre_hook(mid_pre_hook)
 
@@ -153,6 +165,31 @@ class PromptVectorExtractor(nn.Module):
             outputs.append(hidden_states[batch_idx, start:valid_len].mean(dim=0))
         return torch.stack(outputs, dim=0)
 
+    '''
+    抓到的 hidden states 原本 shape 大概是：
+
+    [batch_size, seq_len, hidden_size]
+
+    但 router 不直接吃整串 token，所以它會 pooling 成：
+
+    [batch_size, hidden_size]
+
+    pooling 有三種：
+
+    last_token
+    mean
+    lastk_mean
+
+    分別是：
+
+    - last_token：取每筆 prompt 最後一個有效 token 的 hidden state。
+    - mean：對所有有效 token 平均。
+    - lastk_mean：對最後 k 個有效 token 平均。
+
+    所以最後回傳：
+
+    first_vec, mid_vec
+    '''
     def gather_pooled(self, hidden_states: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
         if self.pooling == "last_token":
             return self.gather_last_valid(hidden_states, attention_mask)

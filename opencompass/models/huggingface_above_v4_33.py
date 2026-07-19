@@ -182,6 +182,7 @@ class HuggingFacewithChatTemplate(BaseModel):
                  pad_token_id: Optional[int] = None,
                  fastchat_template: Optional[str] = None,
                  stop_words: Optional[str] = [],
+                 disable_auto_stop_words: bool = False,
                  mode: str = 'none',
                  **other_kwargs):
 
@@ -195,7 +196,8 @@ class HuggingFacewithChatTemplate(BaseModel):
             self._load_model(path=path, kwargs=model_kwargs, peft_path=peft_path, peft_kwargs=peft_kwargs)
         self.generation_kwargs = generation_kwargs
         self.fastchat_template = fastchat_template
-        self.stop_words = list(set(stop_words + self._get_potential_stop_words(path)))
+        potential_stop_words = [] if disable_auto_stop_words else self._get_potential_stop_words(path)
+        self.stop_words = list(set(stop_words + potential_stop_words))
         assert mode in ['none', 'mid']
         self.mode = mode
         self.logger.info(f'using stop words: {self.stop_words}')
@@ -646,6 +648,10 @@ class HuggingFaceBaseModel(HuggingFacewithChatTemplate):
         if min_out_len is not None:
             generation_kwargs['min_new_tokens'] = min_out_len
         generation_kwargs['pad_token_id'] = self.tokenizer.pad_token_id
+        generation_kwargs.pop('max_length', None)
+        generation_kwargs.pop('gt_task', None)
+        generation_kwargs.pop('output_json_filepath', None)
+        generation_kwargs.pop('output_json_filename', None)
 
         # step-2: conduct model forward to generate output
         outputs = self.model.generate(**tokens, **generation_kwargs)

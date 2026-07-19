@@ -551,6 +551,24 @@ class UnifiedMoECoreInternalRouterCompactCachedJoint:
             bert_attention_mask=self.cached_bert_mask,
         )
         if self.router_architecture == "single_all_layers":
+            if self.routing_mode == "uniform":
+                real_weights = first_vec.new_full(
+                    (first_vec.size(0), num_tasks),
+                    1.0 / num_tasks,
+                )
+                first_weights = torch.cat(
+                    [real_weights.new_zeros(real_weights.size(0), 1), real_weights],
+                    dim=1,
+                )
+                first_eid = torch.ones(first_vec.size(0), dtype=torch.long, device=first_vec.device)
+                mid_eid = first_eid
+                debug_logits = first_vec.new_zeros(first_vec.size(0), num_tasks * num_tasks)
+                self._maybe_print_topk_pair_logits(
+                    debug_logits, dataset_name, prompt_previews, first_weights, first_weights
+                )
+                for _ in first_eid.detach().cpu().tolist():
+                    self.route_counter["pair::uniform->uniform"] += 1
+                return first_eid, mid_eid, first_weights, first_weights
             if self.routing_mode != "weighted_sum":
                 raise ValueError("single_all_layers checkpoints require routing_mode='weighted_sum'")
             expert_logits = self.first_classifier(first_feat).float() * self.routing_sharpness
