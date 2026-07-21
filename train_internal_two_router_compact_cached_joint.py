@@ -44,6 +44,43 @@ MINIMIZE_BEST_METRICS = {
 }
 
 
+def apply_pair_constraint_to_logits(pair_logits: torch.Tensor, num_tasks: int, pair_constraint: str) -> torch.Tensor:
+    if pair_constraint == "none":
+        return pair_logits
+    if pair_constraint != "diagonal":
+        raise ValueError(f"Unsupported pair_constraint={pair_constraint!r}")
+    diag = torch.arange(int(num_tasks), device=pair_logits.device) * (int(num_tasks) + 1)
+    keep = torch.zeros(int(num_tasks) * int(num_tasks), dtype=torch.bool, device=pair_logits.device)
+    keep[diag] = True
+    return pair_logits.masked_fill(~keep.unsqueeze(0), -1e9)
+
+
+def apply_pair_constraint_to_matrix(matrix: torch.Tensor, pair_constraint: str, fill_value) -> torch.Tensor:
+    if pair_constraint == "none":
+        return matrix
+    if pair_constraint != "diagonal":
+        raise ValueError(f"Unsupported pair_constraint={pair_constraint!r}")
+    num_tasks = matrix.size(-1)
+    keep = torch.eye(num_tasks, dtype=torch.bool, device=matrix.device).unsqueeze(0)
+    return torch.where(keep, matrix, torch.full_like(matrix, fill_value))
+
+
+def apply_pair_constraint_to_target_matrix(
+    target: Optional[torch.Tensor],
+    pair_constraint: str,
+) -> Optional[torch.Tensor]:
+    if target is None or pair_constraint == "none":
+        return target
+    if pair_constraint != "diagonal":
+        raise ValueError(f"Unsupported pair_constraint={pair_constraint!r}")
+    num_tasks = target.size(-1)
+    keep = torch.eye(num_tasks, dtype=torch.bool, device=target.device).unsqueeze(0)
+    masked = torch.where(keep, target, torch.zeros_like(target))
+    mass = masked.sum(dim=(1, 2), keepdim=True)
+    fallback = keep.to(dtype=target.dtype).expand_as(target) / float(num_tasks)
+    return torch.where(mass > 0, masked / mass.clamp_min(1e-12), fallback)
+
+
 def save_json(obj: Dict, path: str):
     with open(path, "w", encoding="utf-8") as f:
         json.dump(obj, f, ensure_ascii=False, indent=2)
@@ -692,6 +729,7 @@ def evaluate(
     weighted_sum_marginal_mse_weight,
     weighted_sum_aux_only,
     topk_weighted_temperatures,
+    pair_constraint: str = "none",
     collect_route_records: bool = False,
 ):
     model.eval()
@@ -727,10 +765,22 @@ def evaluate(
             first_vec=batch.first_vec.to(device),
             mid_vec=batch.mid_vec.to(device),
         )
+        num_tasks = batch.loss_matrix.size(2)
+        pair_logits = apply_pair_constraint_to_logits(pair_logits, num_tasks, pair_constraint)
+        loss_matrix_device = apply_pair_constraint_to_matrix(
+            batch.loss_matrix.to(device),
+            pair_constraint,
+            fill_value=1e9,
+        )
+        correct_matrix_device = apply_pair_constraint_to_matrix(
+            batch.correct_matrix.to(device),
+            pair_constraint,
+            fill_value=False,
+        )
         oracle_loss, metrics, best_first, best_mid, flat_best = compute_pair_losses(
             pair_logits=pair_logits,
-            loss_matrix=batch.loss_matrix.to(device),
-            correct_matrix=batch.correct_matrix.to(device),
+            loss_matrix=loss_matrix_device,
+            correct_matrix=correct_matrix_device,
             task_ids=batch.task_ids.to(device),
             joint_loss=joint_loss,
             pseudo_ce_weight=pseudo_ce_weight,
@@ -746,8 +796,8 @@ def evaluate(
         )
         router_target_matrix = build_router_target_distribution(
             pair_logits=pair_logits,
-            loss_matrix=batch.loss_matrix.to(device),
-            correct_matrix=batch.correct_matrix.to(device),
+            loss_matrix=loss_matrix_device,
+            correct_matrix=correct_matrix_device,
             task_ids=batch.task_ids.to(device),
             joint_loss=joint_loss,
             loss_normalization=pair_loss_normalization,
@@ -756,6 +806,7 @@ def evaluate(
             target_distribution_policy=target_distribution_policy,
             target_empty_fallback=target_empty_fallback,
         )
+        router_target_matrix = apply_pair_constraint_to_target_matrix(router_target_matrix, pair_constraint)
         marginal_mse, marginal_metrics, pred_first_weights, pred_mid_weights, target_first_weights, target_mid_weights = (
             compute_weighted_sum_marginal_mse(pair_logits, router_target_matrix)
         )
@@ -780,18 +831,15 @@ def evaluate(
             metrics["base_objective_loss"] = float(loss.detach().item())
             loss = loss + float(weighted_sum_marginal_mse_weight) * marginal_mse
         pred_pair = pair_logits.argmax(dim=-1)
-        num_tasks = batch.loss_matrix.size(2)
         pred_first = pred_pair // num_tasks
         pred_mid = pred_pair % num_tasks
         batch_stats = compute_routing_accuracy_stats(pred_first, pred_mid, best_first, best_mid, batch.task_ids)
-        loss_matrix_device = batch.loss_matrix.to(device)
         score_stats = compute_route_score_stats(
             loss_matrix_device,
             pred_pair,
             batch.task_ids,
             loss_normalization=pair_loss_normalization,
         )
-        correct_matrix_device = batch.correct_matrix.to(device)
         correct_available = batch.correct_available.to(device)
         batch_idx = torch.arange(batch.task_ids.size(0), device=device)
         pred_correct = correct_matrix_device[batch_idx, pred_first, pred_mid]
@@ -1026,6 +1074,7 @@ def save_ckpt(
     weighted_sum_marginal_mse_weight,
     weighted_sum_aux_only,
     pair_loss_normalization,
+    pair_constraint,
     supervision_mode,
     best_metric,
     best_metric_value,
@@ -1078,6 +1127,7 @@ def save_ckpt(
             "weighted_sum_marginal_mse_weight": float(weighted_sum_marginal_mse_weight),
             "weighted_sum_aux_only": bool(weighted_sum_aux_only),
             "pair_loss_normalization": str(pair_loss_normalization),
+            "pair_constraint": str(pair_constraint),
             "best_epoch": epoch,
             "best_metric": str(best_metric),
             "best_metric_value": float(best_metric_value),
@@ -1155,6 +1205,13 @@ def main():
             "Use weighted_sum_marginal_mse as the training/eval loss directly, "
             "without adding the main pair objective such as correct_conf_ce."
         ),
+    )
+    parser.add_argument(
+        "--pair_constraint",
+        type=str,
+        default="none",
+        choices=["none", "diagonal"],
+        help="Constrain pair logits/targets. diagonal allows only expert_i->expert_i pairs.",
     )
     parser.add_argument(
         "--target_distribution_policy",
@@ -1435,6 +1492,7 @@ def main():
             weighted_sum_marginal_mse_weight=args.weighted_sum_marginal_mse_weight,
             weighted_sum_aux_only=args.weighted_sum_aux_only,
             topk_weighted_temperatures=topk_weighted_temperatures,
+            pair_constraint=args.pair_constraint,
             collect_route_records=args.save_route_records,
         )
         print(
@@ -1473,6 +1531,7 @@ def main():
             weighted_sum_marginal_mse_weight=args.weighted_sum_marginal_mse_weight,
             weighted_sum_aux_only=args.weighted_sum_aux_only,
             topk_weighted_temperatures=topk_weighted_temperatures,
+            pair_constraint=args.pair_constraint,
             collect_route_records=args.save_route_records,
         )
         print(
@@ -1548,12 +1607,24 @@ def main():
                 first_vec=batch.first_vec.to(device),
                 mid_vec=batch.mid_vec.to(device),
             )
+            num_tasks = batch.loss_matrix.size(2)
+            pair_logits = apply_pair_constraint_to_logits(pair_logits, num_tasks, args.pair_constraint)
+            loss_matrix_device = apply_pair_constraint_to_matrix(
+                batch.loss_matrix.to(device),
+                args.pair_constraint,
+                fill_value=1e9,
+            )
+            correct_matrix_device = apply_pair_constraint_to_matrix(
+                batch.correct_matrix.to(device),
+                args.pair_constraint,
+                fill_value=False,
+            )
             ###if --supervision_mode oracle_loss, loss=orcale_loss
             ###compute_pair_losses 應該只是算loss的方向而已
             oracle_loss, metrics, best_first, best_mid, flat_best = compute_pair_losses(
                 pair_logits=pair_logits,
-                loss_matrix=batch.loss_matrix.to(device),
-                correct_matrix=batch.correct_matrix.to(device),
+                loss_matrix=loss_matrix_device,
+                correct_matrix=correct_matrix_device,
                 task_ids=batch.task_ids.to(device),
                 joint_loss=args.joint_loss,
                 pseudo_ce_weight=args.pseudo_ce_weight,
@@ -1564,8 +1635,8 @@ def main():
             )
             router_target_matrix = build_router_target_distribution(
                 pair_logits=pair_logits,
-                loss_matrix=batch.loss_matrix.to(device),
-                correct_matrix=batch.correct_matrix.to(device),
+                loss_matrix=loss_matrix_device,
+                correct_matrix=correct_matrix_device,
                 task_ids=batch.task_ids.to(device),
                 joint_loss=args.joint_loss,
                 loss_normalization=args.pair_loss_normalization,
@@ -1574,6 +1645,7 @@ def main():
                 target_distribution_policy=args.target_distribution_policy,
                 target_empty_fallback=args.target_empty_fallback,
             )
+            router_target_matrix = apply_pair_constraint_to_target_matrix(router_target_matrix, args.pair_constraint)
             marginal_mse, marginal_metrics, _, _, _, _ = compute_weighted_sum_marginal_mse(
                 pair_logits,
                 router_target_matrix,
@@ -1604,7 +1676,6 @@ def main():
                 print("pair_logits[0] =", pair_logits[0].detach().cpu())
                 print("pair_prob[0] =", torch.softmax(pair_logits[0], dim=-1).detach().cpu())
                 print("loss_matrix[0] =", batch.loss_matrix[0])
-                num_tasks = batch.loss_matrix.size(2)
                 pair_prob = torch.softmax(pair_logits, dim=-1).view(-1, num_tasks, num_tasks)
                 print("router_prob_matrix[0] =", pair_prob[0].detach().cpu())
                 print("loss_matrix[0] =", batch.loss_matrix[0].detach().cpu())
@@ -1616,7 +1687,6 @@ def main():
             scheduler.step()
 
             pred_pair = pair_logits.argmax(dim=-1)
-            num_tasks = batch.loss_matrix.size(2)
             pred_first = pred_pair // num_tasks
             pred_mid = pred_pair % num_tasks
             batch_stats = compute_routing_accuracy_stats(pred_first, pred_mid, best_first, best_mid, batch.task_ids)
@@ -1748,6 +1818,7 @@ def main():
             weighted_sum_marginal_mse_weight=args.weighted_sum_marginal_mse_weight,
             weighted_sum_aux_only=args.weighted_sum_aux_only,
             topk_weighted_temperatures=topk_weighted_temperatures,
+            pair_constraint=args.pair_constraint,
             collect_route_records=args.save_route_records,
         )
         print(
@@ -1804,6 +1875,7 @@ def main():
                 weighted_sum_marginal_mse_weight=args.weighted_sum_marginal_mse_weight,
                 weighted_sum_aux_only=args.weighted_sum_aux_only,
                 topk_weighted_temperatures=topk_weighted_temperatures,
+                pair_constraint=args.pair_constraint,
                 collect_route_records=args.save_route_records,
             )
             print(
@@ -1961,6 +2033,7 @@ def main():
                 weighted_sum_marginal_mse_weight=args.weighted_sum_marginal_mse_weight,
                 weighted_sum_aux_only=args.weighted_sum_aux_only,
                 pair_loss_normalization=args.pair_loss_normalization,
+                pair_constraint=args.pair_constraint,
                 supervision_mode=args.supervision_mode,
                 best_metric=args.best_metric,
                 best_metric_value=best_metric_value,

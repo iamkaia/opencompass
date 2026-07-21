@@ -65,6 +65,7 @@ class UnifiedMoECoreInternalRouterCompactCachedJoint:
         routing_mode: str = "hard",
         routing_sharpness: float = 1.0,
         routing_topk: Optional[int] = None,
+        pair_constraint: Optional[str] = None,
         share_first_weights_all_layers: bool = False,
         oracle_weight_path: Optional[str] = None,
         static_weight_path: Optional[str] = None,
@@ -126,6 +127,9 @@ class UnifiedMoECoreInternalRouterCompactCachedJoint:
         self.router_pooling = str(cfg.get("router_pooling", "last_token"))
         self.router_pooling_last_k = int(cfg.get("router_pooling_last_k", 4))
         self.router_dim = int(cfg.get("router_dim", router_dim))
+        self.pair_constraint = str(pair_constraint or cfg.get("pair_constraint", "none"))
+        if self.pair_constraint not in {"none", "diagonal"}:
+            raise ValueError(f"Unsupported pair_constraint={self.pair_constraint!r}")
         self.router_architecture = str(cfg.get("router_architecture", "pair_joint"))
         if self.router_architecture not in {"pair_joint", "single_all_layers"}:
             raise ValueError(f"Unsupported router_architecture={self.router_architecture!r}")
@@ -460,6 +464,17 @@ class UnifiedMoECoreInternalRouterCompactCachedJoint:
         mid_idx = int(pair_idx) % num_tasks
         return f"{self.task_names[first_idx]}->{self.task_names[mid_idx]}"
 
+    def _apply_pair_constraint(self, pair_logits: torch.Tensor) -> torch.Tensor:
+        if self.pair_constraint == "none":
+            return pair_logits
+        if self.pair_constraint != "diagonal":
+            raise ValueError(f"Unsupported pair_constraint={self.pair_constraint!r}")
+        num_tasks = len(self.task_names)
+        diag = torch.arange(num_tasks, device=pair_logits.device) * (num_tasks + 1)
+        keep = torch.zeros(num_tasks * num_tasks, dtype=torch.bool, device=pair_logits.device)
+        keep[diag] = True
+        return pair_logits.masked_fill(~keep.unsqueeze(0), float("-inf"))
+
     def _maybe_print_topk_pair_logits(
         self,
         pair_logits: torch.Tensor,
@@ -607,6 +622,7 @@ class UnifiedMoECoreInternalRouterCompactCachedJoint:
             bert_attention_mask=self.cached_bert_mask,
         )
         pair_logits = self.pair_classifier(torch.cat([first_feat, mid_feat], dim=-1))
+        pair_logits = self._apply_pair_constraint(pair_logits)
 
         if forced_first_eid is not None or forced_mid_eid is not None:
             mask = torch.ones_like(pair_logits, dtype=torch.bool)

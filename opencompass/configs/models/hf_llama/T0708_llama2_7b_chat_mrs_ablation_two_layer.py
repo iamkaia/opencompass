@@ -14,6 +14,7 @@ routing_mode = os.environ.get("T0531_ROUTING_MODE", "weighted_sum")
 routing_sharpness = float(os.environ.get("T0531_ROUTING_SHARPNESS", "3.0"))
 routing_topk_raw = os.environ.get("T0531_ROUTING_TOPK", "").strip()
 routing_topk = int(routing_topk_raw) if routing_topk_raw else None
+pair_constraint = os.environ.get("T0531_PAIR_CONSTRAINT", "").strip() or None
 max_out_len = int(os.environ.get("T0704_MAX_OUT_LEN", "64"))
 middle_layer_idx = int(os.environ.get("MIDDLE_LAYER_IDX", "16"))
 record_tag = os.environ.get("T0531_ROUTER_RECORD_TAG", "").strip()
@@ -48,6 +49,7 @@ models = [
         routing_mode=routing_mode,
         routing_sharpness=routing_sharpness,
         routing_topk=routing_topk,
+        pair_constraint=pair_constraint,
         share_first_weights_all_layers=False,
         debug_router_record_path=router_record_path,
         debug_router_topk=3,
@@ -55,4 +57,3 @@ models = [
         run_cfg=dict(num_gpus=1),
     )
 ]
-

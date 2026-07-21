@@ -9,21 +9,21 @@ export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
 PY="/home/u9472191/.conda/envs/opencompass/bin/python"
 
 declare -A MODEL_CONFIGS=(
-    [mrs]="moe_lora_internal_compact_cachedjoint_0525_mrs_3expert_sst2words.py"
-    [boolq]="moe_lora_internal_compact_cachedjoint_0525_4sum_boolq_mrs_3expert_sst2words.py"
-    [rte]="moe_lora_internal_compact_cachedjoint_0525_4sum_rte_mrs_3expert_sst2words.py"
-    [siqa]="moe_lora_internal_compact_cachedjoint_0525_4sum_siqa_mrs_3expert_sst2words.py"
-    [piqa]="moe_lora_internal_compact_cachedjoint_0525_4sum_piqa_mrs_3expert_sst2words.py"
+    [mrs]="moe_lora_internal_compact_cachedjoint_0525_mrs_3expert_sst2words_weighted_sum.py"
+    [boolq]="moe_lora_internal_compact_cachedjoint_0525_4sum_boolq_mrs_3expert_sst2words_weighted_sum.py"
+    [rte]="moe_lora_internal_compact_cachedjoint_0525_4sum_rte_mrs_3expert_sst2words_weighted_sum.py"
+    [siqa]="moe_lora_internal_compact_cachedjoint_0525_4sum_siqa_mrs_3expert_sst2words_weighted_sum.py"
+    [piqa]="moe_lora_internal_compact_cachedjoint_0525_4sum_piqa_mrs_3expert_sst2words_weighted_sum.py"
 )
 
 usage() {
-    echo "usage: CUDA_VISIBLE_DEVICES=0 bash tools/run_T0525_qwen3_opencompass_sst2words.sh {all|mrs|boolq|rte|siqa|piqa}"
+    echo "usage: CUDA_VISIBLE_DEVICES=0 bash tools/run_T0525_qwen3_opencompass_sst2words_weighted_sum.sh {mrs|boolq|rte|siqa|piqa}"
 }
 
 run_eval() {
     local router_key="$1"
     local model_config="${MODEL_CONFIGS[$router_key]:-}"
-    local log_file="T0525_run_opencompass_qwen3_${router_key}_mrs_3expert_sst2words_$(date +"%Y%m%d_%H%M%S").log"
+    local log_file="T0526_run_opencompass_qwen3_${router_key}_mrs_3expert_sst2words_weighted_sum_64token_afterspeedup_$(date +"%Y%m%d_%H%M%S").log"
     local -a datasets
 
     if [[ -z "$model_config" ]]; then
@@ -62,12 +62,4 @@ if [[ $# -ne 1 ]]; then
     exit 2
 fi
 
-if [[ "$1" == "all" ]]; then
-    run_eval mrs
-    run_eval boolq
-    run_eval rte
-    run_eval siqa
-    run_eval piqa
-else
-    run_eval "$1"
-fi
+run_eval "$1"

@@ -7,7 +7,7 @@ from opencompass.models.router_moe_llama_internal_compact_cached_joint import (
 
 router_ckpt_dir = os.environ.get(
     "T0531_MRS_ROUTER_CKPT",
-    "./router_T0704_qwen35_mrs_only_two_layer",
+    "./router_T0720_qwen_mrs_only_two_layer",
 )
 router_bert_init = os.environ.get("T0531_ROUTER_BERT_INIT", "./task_classifier_ckpt")
 routing_mode = os.environ.get("T0531_ROUTING_MODE", "weighted_sum")
@@ -16,26 +16,30 @@ routing_topk_raw = os.environ.get("T0531_ROUTING_TOPK", "").strip()
 routing_topk = int(routing_topk_raw) if routing_topk_raw else None
 pair_constraint = os.environ.get("T0531_PAIR_CONSTRAINT", "").strip() or None
 max_out_len = int(os.environ.get("T0704_MAX_OUT_LEN", "64"))
-middle_layer_idx = int(os.environ.get("MIDDLE_LAYER_IDX", "18"))
+middle_layer_idx = int(os.environ.get("MIDDLE_LAYER_IDX", "21"))
 record_tag = os.environ.get("T0531_ROUTER_RECORD_TAG", "").strip()
 record_tag_part = f"{record_tag}_" if record_tag else ""
+router_record_prefix = os.environ.get("T0720_ROUTER_RECORD_PREFIX", "qwen")
 router_record_path = os.environ.get(
     "T0601_ROUTER_RECORD_PATH",
-    f"T0704_opencompass_router_records_qwen35_two_layer_"
+    f"T0720_opencompass_router_records_{router_record_prefix}_two_layer_"
     f"{record_tag_part}{routing_mode}.jsonl",
 )
+model_path = os.environ.get("BASE_MODEL", "Qwen/Qwen3.5-4B")
+lora_root = os.environ.get("LORA_ROOT", "./saves/Qwen/Qwen3.5-4B/lora")
+
 
 models = [
     dict(
         type=RouterMoELlamaInternalCompactCachedJoint,
         abbr=f"{os.path.basename(os.path.normpath(router_ckpt_dir))}_{routing_mode}",
-        path="Qwen/Qwen3.5-4B",
+        path=model_path,
         router_ckpt_dir=router_ckpt_dir,
         router_bert_init=router_bert_init,
         lora_paths=dict(
-            medmcqa="./saves/Qwen/Qwen3.5-4B/lora/sft_medmcqa",
-            race="./saves/Qwen/Qwen3.5-4B/lora/sft_race",
-            sst2="./saves/Qwen/Qwen3.5-4B/lora/sft_sst2",
+            medmcqa=f"{lora_root}/sft_medmcqa",
+            race=f"{lora_root}/sft_race",
+            sst2=f"{lora_root}/sft_sst2",
         ),
         dtype="float16",
         r=8,

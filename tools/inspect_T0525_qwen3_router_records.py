@@ -1,3 +1,5 @@
+#!/usr/bin/env python
+
 import argparse
 import json
 from pathlib import Path
@@ -29,6 +31,54 @@ def format_top(matrix: Sequence[Sequence[float]], topk: int) -> str:
         f"{pair_name(pair_id)}={prob:.4f}"
         for pair_id, prob in ranked_matrix(matrix)[:topk]
     )
+
+
+def target_pair(record: Dict) -> str:
+    return pair_name(ranked_matrix(record["router_target_matrix"])[0][0])
+
+
+def expert_overlap_summary(records: Sequence[Dict], reference_name: str) -> str:
+    if reference_name == "gold_pair":
+        reference_pairs = [record["gold_pair"] for record in records]
+    elif reference_name == "target_pair":
+        reference_pairs = [target_pair(record) for record in records]
+    else:
+        raise ValueError(f"unsupported reference_name: {reference_name}")
+
+    pred_pairs = [record["pred_pair"] for record in records]
+    parsed = [
+        (pred_pair.split("->"), reference_pair.split("->"))
+        for pred_pair, reference_pair in zip(pred_pairs, reference_pairs)
+    ]
+    exact = sum(pred_pair == reference_pair for pred_pair, reference_pair in zip(pred_pairs, reference_pairs))
+    same_first = sum(pred[0] == reference[0] for pred, reference in parsed)
+    same_mid = sum(pred[1] == reference[1] for pred, reference in parsed)
+    shared_any = sum(bool(set(pred) & set(reference)) for pred, reference in parsed)
+    total = max(len(records), 1)
+    return (
+        f"vs_{reference_name}: exact_pair={exact}/{len(records)}={exact / total:.4f} "
+        f"same_first={same_first / total:.4f} same_mid={same_mid / total:.4f} "
+        f"shared_any_expert={shared_any / total:.4f}"
+    )
+
+
+def topk_pair_overlap_summary(records: Sequence[Dict], topk: int = 3) -> str:
+    overlap_counts = []
+    for record in records:
+        pred_topk = {pair_id for pair_id, _value in ranked_matrix(record["pair_prob_matrix"])[:topk]}
+        target_topk = {pair_id for pair_id, _value in ranked_matrix(record["router_target_matrix"])[:topk]}
+        overlap_counts.append(len(pred_topk & target_topk))
+
+    total = max(len(records), 1)
+    threshold_counts = [
+        sum(overlap >= threshold for overlap in overlap_counts)
+        for threshold in range(1, topk + 1)
+    ]
+    threshold_text = " ".join(
+        f"at_least_{threshold}={count}/{len(records)}={count / total:.4f}"
+        for threshold, count in enumerate(threshold_counts, start=1)
+    )
+    return f"router_pred_top{topk}_vs_target_top{topk}_pair_overlap: {threshold_text}"
 
 
 def self_pair_details(record: Dict) -> str:
@@ -72,6 +122,9 @@ def print_summary(records: Sequence[Dict]) -> None:
         "self_expert_selected="
         f"{self_selected}/{len(selected)}={self_selected / max(len(selected), 1):.4f}"
     )
+    print(expert_overlap_summary(records, "gold_pair"))
+    print(expert_overlap_summary(records, "target_pair"))
+    print(topk_pair_overlap_summary(records))
     for task in sorted(set(record["task"] for record in records)):
         task_rows = [record for record in records if record["task"] == task]
         task_correct = sum(bool(record["pred_correct"]) for record in task_rows)
@@ -84,6 +137,9 @@ def print_summary(records: Sequence[Dict]) -> None:
             )
         else:
             print(f"task={task} n={len(task_rows)} pred_correct={task_correct / len(task_rows):.4f}")
+        print(f"  {expert_overlap_summary(task_rows, 'gold_pair')}")
+        print(f"  {expert_overlap_summary(task_rows, 'target_pair')}")
+        print(f"  {topk_pair_overlap_summary(task_rows)}")
 
 
 def main() -> None:
