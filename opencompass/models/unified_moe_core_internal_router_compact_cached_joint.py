@@ -584,8 +584,6 @@ class UnifiedMoECoreInternalRouterCompactCachedJoint:
                 for _ in first_eid.detach().cpu().tolist():
                     self.route_counter["pair::uniform->uniform"] += 1
                 return first_eid, mid_eid, first_weights, first_weights
-            if self.routing_mode != "weighted_sum":
-                raise ValueError("single_all_layers checkpoints require routing_mode='weighted_sum'")
             expert_logits = self.first_classifier(first_feat).float() * self.routing_sharpness
             if forced_first_eid is not None:
                 keep = torch.zeros_like(expert_logits, dtype=torch.bool)
@@ -596,10 +594,16 @@ class UnifiedMoECoreInternalRouterCompactCachedJoint:
                 keep = torch.zeros_like(expert_logits, dtype=torch.bool)
                 keep.scatter_(1, topk_ids, True)
                 expert_logits = expert_logits.masked_fill(~keep, float("-inf"))
-            real_weights = torch.softmax(expert_logits, dim=-1)
-            first_weights = torch.cat([real_weights.new_zeros(real_weights.size(0), 1), real_weights], dim=1)
             first_eid = expert_logits.argmax(dim=-1) + 1
             mid_eid = first_eid
+            if self.routing_mode == "hard":
+                real_weights = torch.zeros_like(expert_logits)
+                real_weights.scatter_(1, first_eid.unsqueeze(1) - 1, 1.0)
+            elif self.routing_mode == "weighted_sum":
+                real_weights = torch.softmax(expert_logits, dim=-1)
+            else:
+                raise ValueError("single_all_layers checkpoints require routing_mode='hard' or 'weighted_sum'")
+            first_weights = torch.cat([real_weights.new_zeros(real_weights.size(0), 1), real_weights], dim=1)
             debug_logits = expert_logits.new_full(
                 (expert_logits.size(0), num_tasks * num_tasks), float("-inf")
             )

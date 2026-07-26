@@ -275,6 +275,7 @@ class JointAnswerSupervisionRouterModel(nn.Module):
         ####建立 expert name 到 index 的 mapping：注意這裡是 router output index，不是 LoRA expert id。所以要注意對齊
         self.expert2id = {task: idx for idx, task in enumerate(self.expert_names)}
         print(self.expert2id)
+        #### 所以目前應該都是float16, 之後就可以用bfloat16補一下看看
         torch_dtype = torch.float16 if dtype == "float16" else torch.bfloat16
         self.model = AutoModelForCausalLM.from_pretrained(
             base_model_path,
@@ -289,7 +290,7 @@ class JointAnswerSupervisionRouterModel(nn.Module):
         self.backbone_spec = infer_backbone_spec(self.model)
 
         ####把 LLM 改造成 hard-routed LoRA 模型
-        ####之後如果要改成weighted_sum可能就是要改這裡
+        ####之後改成weighted_sum是只有在算loss的時候，而不是在建cached的時候，就是改loss而已
         self.model = patch_llama_with_hard_routed_lora(
             self.model,
             num_experts=1 + len(self.expert_names),
@@ -331,10 +332,14 @@ class JointAnswerSupervisionRouterModel(nn.Module):
                 raise KeyError(f"Missing LoRA path for task: {task}")
             ####把這個 task 的 LoRA adapter 權重塞進指定 expert slot。
             ####目前是 hard routing：每個 slot 載入一個固定 LoRA。
-            ####若要 weighted-sum routing，這裡與實際套用 adapter 的 forward 路徑都要改，
-            ####因為模型必須能同時依權重混合多個 LoRA，而不是只選單一 slot。
+            '''
             load_lora_into_expert(self.model, lora_paths[task], self.task_to_expert_id[task])
 
+            把每個 task 的 LoRA adapter 載進對應 expert slot
+            '''
+            load_lora_into_expert(self.model, lora_paths[task], self.task_to_expert_id[task])
+        
+        ###從 LLM 指定 layer 抓 first_vec / mid_vec, 就是hidden states
         self.vector_extractor = PromptVectorExtractor(
             model=self.model,
             first_layer_idx=self.first_layer_idx,
@@ -343,6 +348,7 @@ class JointAnswerSupervisionRouterModel(nn.Module):
             pooling_last_k=router_pooling_last_k,
         )
 
+        ###Question: 這個llama跟bert的hidden size會是什麼東西？我應該會看到什麼東西？
         self.bert = BertExternalEncoder(router_bert_init)
         bert_hidden_size = self.bert.encoder.config.hidden_size
         ####名稱雖然叫 llama_hidden_size，實際意義是目前 base LLM 的 hidden size。
@@ -351,6 +357,7 @@ class JointAnswerSupervisionRouterModel(nn.Module):
         llama_hidden_size = self.model.config.hidden_size
 
         self.num_pairs = len(self.expert_names) * len(self.expert_names)
+        ###抽出router_feature
         self.router_first = CompactRouterFeatureEncoder(
             llama_hidden_size=llama_hidden_size,
             bert_hidden_size=bert_hidden_size,

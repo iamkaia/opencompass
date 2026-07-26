@@ -1,4 +1,5 @@
 # extract_llama_vectors_chunked.py
+### old training path
 import argparse
 import json
 import os

@@ -252,8 +252,8 @@ def save_checkpoint(model, args, dataset, llm_hidden, epoch, metrics):
             "loss_normalization": args.loss_normalization,
             "target_empty_fallback": args.target_empty_fallback,
             "best_epoch": epoch,
-            "best_metric": "weighted_sum_mse",
-            "best_metric_value": metrics["weighted_sum_mse"],
+            "best_metric": args.best_metric,
+            "best_metric_value": metrics[args.best_metric],
         },
         os.path.join(args.out_dir, "router_config.json"),
     )
@@ -281,6 +281,7 @@ def main():
     parser.add_argument("--target_empty_fallback", choices=["zero", "uniform", "loss_softmax"], default="uniform")
     parser.add_argument("--expert_ce_weight", type=float, default=0.0)
     parser.add_argument("--weighted_sum_mse_weight", type=float, default=1.0)
+    parser.add_argument("--best_metric", choices=["loss", "weighted_sum_mse", "expert_ce"], default="weighted_sum_mse")
     parser.add_argument("--early_stop_patience", type=int, default=2)
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
@@ -343,7 +344,7 @@ def main():
             f"val_entropy={val_metrics['weight_entropy']:.4f}",
             flush=True,
         )
-        score = val_metrics["weighted_sum_mse"]
+        score = val_metrics[args.best_metric]
         if score < best - 1e-4:
             best = score
             best_epoch = epoch
@@ -357,7 +358,11 @@ def main():
             stale += 1
             if stale >= args.early_stop_patience:
                 break
-    print(f"[DONE] out={args.out_dir} best_epoch={best_epoch} best_val_mse={best:.6f}", flush=True)
+    print(
+        f"[DONE] out={args.out_dir} best_epoch={best_epoch} "
+        f"best_{args.best_metric}={best:.6f}",
+        flush=True,
+    )
 
 
 if __name__ == "__main__":
