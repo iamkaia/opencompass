@@ -18,6 +18,7 @@ from router_answer_supervision_core import (
     discover_expert_names,
     save_json,
 )
+from model_backbone_specs import get_hidden_size
 
 
 def parse_csv_arg(raw: Optional[str]) -> Optional[List[str]]:
@@ -614,7 +615,7 @@ def main():
         "middle_layer_idx": int(args.middle_layer_idx),
         "router_pooling": str(args.router_pooling),
         "router_pooling_last_k": int(args.router_pooling_last_k),
-        "llama_hidden_size": int(model.model.config.hidden_size),
+        "llama_hidden_size": get_hidden_size(model.model),
     }
     '''
     寫 root-level cache_config.json，記錄整批 cache 的來源與建置設定，例如 data_root、feature_root、task/expert names、route_space、base model、max length、layer index、dtype、score
@@ -634,7 +635,7 @@ def main():
             "middle_layer_idx": args.middle_layer_idx,
             "router_pooling": args.router_pooling,
             "router_pooling_last_k": args.router_pooling_last_k,
-            "llama_hidden_size": int(model.model.config.hidden_size),
+            "llama_hidden_size": get_hidden_size(model.model),
             "feature_contract_version": 1,
             "dtype": args.dtype,
             "score_mode": str(args.score_mode),

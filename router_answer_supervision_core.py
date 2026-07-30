@@ -25,7 +25,12 @@ except Exception:
 from opencompass.utils.text_postprocessors import (
     general_postprocess,
 )
-from model_backbone_specs import get_decoder_layers, get_pre_attn_norm, infer_backbone_spec
+from model_backbone_specs import (
+    get_decoder_layers,
+    get_hidden_size,
+    get_pre_attn_norm,
+    infer_backbone_spec,
+)
 from opencompass.models.router_moe_components import (
     BertExternalEncoder,
     CompactRouterFeatureEncoder,
@@ -352,9 +357,9 @@ class JointAnswerSupervisionRouterModel(nn.Module):
         self.bert = BertExternalEncoder(router_bert_init)
         bert_hidden_size = self.bert.encoder.config.hidden_size
         ####名稱雖然叫 llama_hidden_size，實際意義是目前 base LLM 的 hidden size。
-        ####換成 Qwen 時會讀 Qwen config.hidden_size；前提是 backbone spec 與
+        ####換成 Qwen/Gemma 時會讀目前模型的 hidden size；前提是 backbone spec 與
         ####hard-routed LoRA patch 支援該模型結構，不能只靠這一行保證相容。
-        llama_hidden_size = self.model.config.hidden_size
+        llama_hidden_size = get_hidden_size(self.model)
 
         self.num_pairs = len(self.expert_names) * len(self.expert_names)
         ###抽出router_feature
@@ -2156,7 +2161,7 @@ def main():
                     "joint_loss": args.joint_loss,
                     "router_pooling": args.router_pooling,
                     "router_pooling_last_k": args.router_pooling_last_k,
-                    "llama_hidden_size": int(model.model.config.hidden_size),
+                    "llama_hidden_size": get_hidden_size(model.model),
                     "router_dim": int(args.router_dim),
                     "sample_feature_mode": "none",
                     "sample_feature_dim": 0,

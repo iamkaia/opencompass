@@ -29,7 +29,7 @@ from typing import Dict, List, Optional, Sequence
 import torch
 import torch.nn as nn
 from transformers import AutoModelForCausalLM, AutoTokenizer
-from model_backbone_specs import get_decoder_layers, infer_backbone_spec
+from model_backbone_specs import get_decoder_layers, get_hidden_size, infer_backbone_spec
 
 from opencompass.models.router_moe_components import BertExternalEncoder, CompactRouterFeatureEncoder
 from opencompass.models.router_moe_shared import (
@@ -196,11 +196,12 @@ class UnifiedMoECoreInternalRouterCompactCachedJoint:
 
         self.backbone_spec = infer_backbone_spec(self.model)
         self.num_layers = len(get_decoder_layers(self.model, spec=self.backbone_spec))
+        model_hidden_size = get_hidden_size(self.model)
         expected_llama_hidden = cfg.get("llama_hidden_size")
-        if expected_llama_hidden is not None and int(expected_llama_hidden) != int(self.model.config.hidden_size):
+        if expected_llama_hidden is not None and int(expected_llama_hidden) != model_hidden_size:
             raise ValueError(
                 f"Router checkpoint expects llama_hidden_size={expected_llama_hidden}, "
-                f"but runtime base model provides hidden_size={self.model.config.hidden_size}."
+                f"but runtime base model provides hidden_size={model_hidden_size}."
             )
         self.model = patch_llama_with_hard_routed_lora(
             self.model,
@@ -223,7 +224,7 @@ class UnifiedMoECoreInternalRouterCompactCachedJoint:
         self.bert_encoder = BertExternalEncoder(encoder_dir)
 
         bert_hidden = self.bert_encoder.encoder.config.hidden_size
-        llama_hidden = self.model.config.hidden_size
+        llama_hidden = model_hidden_size
         self.router_first = CompactRouterFeatureEncoder(llama_hidden, bert_hidden, self.router_dim)
         if self.router_architecture == "single_all_layers":
             self.router_mid = None

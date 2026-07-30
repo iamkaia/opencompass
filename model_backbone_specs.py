@@ -31,6 +31,16 @@ BACKBONE_SPECS: Dict[str, BackboneSpec] = {
         layers_attr_path=("model", "layers"),
         pre_attn_norm_name="input_layernorm",
     ),
+    "gemma4": BackboneSpec(
+        family="gemma4",
+        layers_attr_path=("model", "language_model", "layers"),
+        pre_attn_norm_name="input_layernorm",
+    ),
+    "gemma4_text": BackboneSpec(
+        family="gemma4_text",
+        layers_attr_path=("model", "layers"),
+        pre_attn_norm_name="input_layernorm",
+    ),
     "qwen2": BackboneSpec(
         family="qwen2",
         layers_attr_path=("model", "layers"),
@@ -85,3 +95,18 @@ def set_decoder_layer(model: Any, layer_idx: int, new_layer: Any, spec: Backbone
 
 def get_pre_attn_norm(layer: Any, spec: BackboneSpec) -> Any:
     return getattr(layer, spec.pre_attn_norm_name)
+
+
+def get_hidden_size(model_or_config: Any) -> int:
+    config = getattr(model_or_config, "config", model_or_config)
+    hidden_size = getattr(config, "hidden_size", None)
+    if hidden_size is not None:
+        return int(hidden_size)
+    text_config = getattr(config, "text_config", None)
+    hidden_size = getattr(text_config, "hidden_size", None)
+    if hidden_size is not None:
+        return int(hidden_size)
+    language_model = getattr(model_or_config, "language_model", None)
+    if language_model is not None:
+        return get_hidden_size(language_model)
+    raise AttributeError(f"Cannot infer hidden_size from {type(model_or_config).__name__}")
