@@ -66,7 +66,7 @@ def normalize_option_label(text: str, options: str) -> str:
 
 def router_option_labels(task_name: str) -> Optional[List[str]]:
     task_name = str(task_name).lower()
-    if task_name in {"race", "medmcqa", "hellaswag"}:
+    if task_name in {"race", "medmcqa", "hellaswag", "arc_c", "openbookqa"}:
         return ["A", "B", "C", "D"]
     if task_name in {"piqa", "copa", "boolq", "rte"}:
         return ["A", "B"]
